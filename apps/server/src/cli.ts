@@ -251,8 +251,7 @@ if (cmd === "version" || cmd === "-v" || cmd === "--version") {
     const agent = join(import.meta.dir, "../../../tests/fixtures/acp/fake-agent.ts");
     process.env.OPENBOT_ACP_COMMAND = `${process.execPath} ${agent}`;
   }
-  const origin = `http://${advertiseHost(host)}:${port}`;
-  const created = createApp({ home, port, publicOrigin: origin, devLogin: true });
+  const created = createApp({ home, port, devLogin: true });
   const server = Bun.serve({
     port,
     hostname: host,
@@ -260,9 +259,10 @@ if (cmd === "version" || cmd === "-v" || cmd === "--version") {
     websocket: (created as { websocket: unknown }).websocket as never,
   });
   created.ctx.port = server.port;
+  const reachable = `http://${advertiseHost(host)}:${server.port}`;
+  created.ctx.publicOrigin = reachable;
   created.ctx.engine.reapOrphans();
   created.ctx.engine.kick();
-  const reachable = `http://${advertiseHost(host)}:${server.port}`;
   const url = `${reachable}/auth/local?login=demo`;
   const expose = bindNote(host);
   console.log(

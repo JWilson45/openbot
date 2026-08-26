@@ -177,6 +177,10 @@ server {
     server_name desk.example.com;
     # ssl_certificate / ssl_certificate_key — your certs
 
+    location /mcp/v1 {
+        return 404;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8787;
         proxy_http_version 1.1;

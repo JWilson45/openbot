@@ -297,7 +297,49 @@ describe("openbot org CLI", () => {
     const fqdn = await runOpenbot(["org", "init", "--home", home, "--slug", "acme.example.com"]);
     expect(fqdn.code).not.toBe(0);
   });
+
+  test("openbot demo does not persist listen origin over org.json", async () => {
+    const home = tempHome();
+    writeFileSync(
+      join(home, "org.json"),
+      JSON.stringify({ slug: "acme", name: "Acme", publicOrigin: "https://acme.example.com" }),
+    );
+    const spawned: Record<string, string | undefined> = { ...process.env };
+    delete spawned.OPENBOT_PUBLIC_ORIGIN;
+    delete spawned.OPENBOT_ORG_ID;
+    delete spawned.OPENBOT_ORG_SLUG;
+    const proc = Bun.spawn({
+      cmd: [process.execPath, cli, "demo", "--fake", "--home", home, "--port", "0"],
+      stdout: "pipe",
+      stderr: "pipe",
+      env: spawned,
+    });
+    try {
+      const stdout = proc.stdout ? await readUntil(proc.stdout, "openbot demo") : "";
+      expect(stdout).toContain("openbot demo");
+      const db = OpenbotDb.open(join(home, "openbot.sqlite"));
+      const row = currentOrgMeta(db);
+      expect(row?.public_origin).toBe("https://acme.example.com");
+      expect(row?.slug).toBe("acme");
+      db.close();
+    } finally {
+      proc.kill();
+      await proc.exited;
+    }
+  });
 });
+
+async function readUntil(stream: ReadableStream<Uint8Array>, needle: string): Promise<string> {
+  const reader = stream.getReader();
+  let text = "";
+  const start = Date.now();
+  while (Date.now() - start < 10_000) {
+    const { done, value } = await reader.read();
+    if (value) text += new TextDecoder().decode(value);
+    if (text.includes(needle) || done) return text;
+  }
+  return text;
+}
 
 describe("fed info rate limit helper", () => {
   test("31st request in a minute is denied; X-Forwarded-For only from loopback", () => {
