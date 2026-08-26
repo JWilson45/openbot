@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS bots (
   created_at integer NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS bots_active_name ON bots(account_id, name) WHERE status = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS bots_one_active_gateway ON bots(account_id) WHERE status = 'active' AND IFNULL(role, 'desk') = 'gateway';
 
 CREATE TABLE IF NOT EXISTS compute_instances (
   id text PRIMARY KEY,
@@ -259,6 +260,9 @@ export class OpenbotDb {
     );
     this.raw.exec(
       "CREATE UNIQUE INDEX IF NOT EXISTS bots_active_name ON bots(account_id, name) WHERE status = 'active'",
+    );
+    this.raw.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS bots_one_active_gateway ON bots(account_id) WHERE status = 'active' AND IFNULL(role, 'desk') = 'gateway'",
     );
     this.raw.exec(
       "CREATE UNIQUE INDEX IF NOT EXISTS threads_one_human_per_bot ON threads(bot_id) WHERE kind = 'human'",

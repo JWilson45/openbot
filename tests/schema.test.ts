@@ -34,6 +34,8 @@ test("schema applies on a fresh sqlite file", () => {
   expect(botCols).toContain("role");
   const roleCol = db.all<{ name: string; dflt_value: unknown }>("PRAGMA table_info(bots)").find((c) => c.name === "role");
   expect(String(roleCol?.dflt_value)).toContain("desk");
+  const indexes = db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index'").map((i) => i.name);
+  expect(indexes).toContain("bots_one_active_gateway");
   expect(db.all<{ name: string }>("PRAGMA table_info(threads)").map((c) => c.name)).toContain("kind");
   const apiKeyCols = db.all<{ name: string }>("PRAGMA table_info(api_keys)").map((c) => c.name);
   for (const col of [

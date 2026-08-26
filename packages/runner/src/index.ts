@@ -56,6 +56,14 @@ export type BrowserHandle = {
 
 export type PermissionHandler = (req: LiveWorkEvent) => Promise<{ allow: boolean }>;
 
+/** Gateway spike: deny execute/shell. Not isolation; ACP-native bash can still exist. */
+export function denyGatewayExec(ev: LiveWorkEvent): Promise<{ allow: boolean }> {
+  const toolCall = ev.payload.toolCall as { kind?: string } | undefined;
+  const kind = String(toolCall?.kind ?? "").toLowerCase();
+  if (kind === "execute" || kind === "shell") return Promise.resolve({ allow: false });
+  return Promise.resolve({ allow: false });
+}
+
 export class LocalHostRunner implements ComputeContract, ComputeDriver {
   harness: "down" | "starting" | "idle" | "in_turn" | "crashed" = "down";
   acp: AcpClient | null = null;
@@ -392,11 +400,13 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     const existing = this.acps.get(req.botId);
     const role = req.role === "gateway" ? "gateway" : "desk";
     const idleTtlMs = req.idleTtlMs ?? (role === "gateway" ? gatewayAcpIdleTtlMs() : acpIdleTtlMs());
+    const permissionHandler = role === "gateway" ? denyGatewayExec : undefined;
     if (this.matchesHarness(req.botId, model, reasoningEffort)) {
       const client = existing!.client;
       existing!.idleTtlMs = idleTtlMs;
       existing!.role = role;
       client.permissionMode = req.permissionMode;
+      client.permissionHandler = permissionHandler;
       this.acp = client;
       this.acpSessionId = client.sessionId;
       this.harness = "idle";
@@ -431,6 +441,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
         model,
         reasoningEffort,
         permissionMode: req.permissionMode,
+        permissionHandler,
         onEvent: (ev) => this.onLiveWork?.({ ...ev, botId: req.botId }, req.botId),
       });
       this.acps.set(req.botId, { client, botId: req.botId, idleTtlMs, role });

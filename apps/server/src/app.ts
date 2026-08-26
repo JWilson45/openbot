@@ -1474,7 +1474,7 @@ function botPresence(ctx: AppContext, botId: string): { key: string; label: stri
 
 function activityForAccount(ctx: AppContext, accountId: string) {
   const bots = ctx.db.all<{ id: string; name: string }>(
-    "SELECT id, name FROM bots WHERE account_id = ? AND status = 'active' ORDER BY created_at",
+    "SELECT id, name FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'desk' ORDER BY created_at",
     [accountId],
   );
   return bots.map((b) => {
@@ -1543,10 +1543,6 @@ function activityForAccount(ctx: AppContext, accountId: string) {
 
 function healthPayload(ctx: AppContext, accountId: string) {
   const runner = ctx.engine.runners.get(accountId);
-  const bots = ctx.db.all<{ id: string }>(
-    "SELECT id FROM bots WHERE account_id = ? AND status = 'active'",
-    [accountId],
-  );
   return {
     driver: "localhost",
     state: runner?.harness === "crashed" ? "unhealthy" : "running",

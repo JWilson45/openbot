@@ -259,10 +259,14 @@ describe("org HTTP", () => {
     const prev = process.env.OPENBOT_FEDERATION;
     process.env.OPENBOT_FEDERATION = "0";
     try {
-      const info = await fetch(`${origin}/fed/v1/info`).then((r) => r.json()) as {
+      const info = (await fetch(`${origin}/fed/v1/info`).then((r) => r.json())) as {
         caps: { federation: string };
       };
       expect(info.caps.federation).toBe("off");
+      const org = (await fetch(`${origin}/v1/org`, { headers }).then((r) => r.json())) as {
+        federationEnabled: boolean;
+      };
+      expect(org.federationEnabled).toBe(false);
     } finally {
       if (prev === undefined) delete process.env.OPENBOT_FEDERATION;
       else process.env.OPENBOT_FEDERATION = prev;

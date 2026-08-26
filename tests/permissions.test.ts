@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { denyGatewayExec } from "@openbot/runner";
 import { fakeAgentCommand, tempHome } from "./helpers.ts";
 import { loginCookie, startTestServer } from "../apps/server/src/test-helpers.ts";
 
@@ -90,6 +91,68 @@ describe("ACP session/request_permission", () => {
     expect(catchup.events.some((e) => e.kind === "permission_request")).toBe(true);
     expect(catchup.events.length).toBeGreaterThan(0);
 
+    server.stop(true);
+  });
+
+  test("denyGatewayExec rejects execute/shell", async () => {
+    expect(
+      await denyGatewayExec({
+        kind: "permission_request",
+        payload: { toolCall: { kind: "execute", title: "run a command" } },
+      }),
+    ).toEqual({ allow: false });
+    expect(
+      await denyGatewayExec({
+        kind: "permission_request",
+        payload: { toolCall: { kind: "shell" } },
+      }),
+    ).toEqual({ allow: false });
+  });
+
+  test("Gateway auto-denies exec without waiting for the human", async () => {
+    const home = tempHome();
+    process.env.OPENBOT_ACP_COMMAND = fakeAgentCommand();
+    const { ctx, server, origin } = startTestServer({ home });
+    const { cookie, session } = loginCookie({ ctx }, "alice");
+    const headers = { cookie, "content-type": "application/json" };
+    await fetch(`${origin}/v1/org`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ federationEnabled: true }),
+    });
+    const listed = (await fetch(`${origin}/v1/bots`, { headers }).then((r) => r.json())) as {
+      gateway: { id: string };
+    };
+    const gwId = listed.gateway.id;
+    const thread = (await fetch(`${origin}/v1/threads?botId=${gwId}`, { headers }).then((r) => r.json())) as {
+      thread: { id: string };
+    };
+    const posted = await fetch(`${origin}/v1/threads/${thread.thread.id}/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ body: "[[permission]] [[send:gateway-denied-exec]]" }),
+    });
+    expect(posted.status).toBe(202);
+    const { turnId } = (await posted.json()) as { turnId: string };
+    const start = Date.now();
+    while (Date.now() - start < 10_000) {
+      const t = ctx.db.get<{ status: string }>(
+        "SELECT status FROM turns WHERE id = ?",
+        [turnId],
+      );
+      if (t?.status === "completed") break;
+      await Bun.sleep(40);
+    }
+    expect(ctx.engine.runnerFor(session.accountId).acpFor(gwId)?.permissionHandler).toBe(denyGatewayExec);
+    const msgs = ctx.db.all<{ origin: string; body: string }>(
+      "SELECT origin, body FROM messages WHERE thread_id = ? ORDER BY created_at",
+      [thread.thread.id],
+    );
+    expect(msgs.some((m) => m.origin === "send_message" && m.body === "gateway-denied-exec")).toBe(true);
+    const events = (await fetch(`${origin}/v1/turns/${turnId}/live-work`, { headers }).then((r) =>
+      r.json(),
+    )) as { events: Array<{ kind: string }> };
+    expect(events.events.some((e) => e.kind === "permission_request")).toBe(true);
     server.stop(true);
   });
 });

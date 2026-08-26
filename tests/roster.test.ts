@@ -143,6 +143,10 @@ describe("roster", () => {
     expect(listed.gateway).toBeTruthy();
     expect(listed.gateway!.enabled).toBe(false);
     const gwId = listed.gateway!.id;
+    const activity = (await fetch(`${origin}/v1/activity`, { headers }).then((r) => r.json())) as {
+      bots: Array<{ id: string }>;
+    };
+    expect(activity.bots.some((b) => b.id === gwId)).toBe(false);
     const row = ctx.db.get<{ role: string; permission_mode: string }>("SELECT role, permission_mode FROM bots WHERE id = ?", [
       gwId,
     ]);

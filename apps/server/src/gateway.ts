@@ -70,33 +70,41 @@ function pickGatewayName(db: OpenbotDb, accountId: string): string | null {
 export function ensureGatewayBot(db: OpenbotDb, desk: string): { id: string; name: string } | null {
   const org = currentOrgMeta(db);
   if (!org?.account_id) return null;
-  const existing = findActiveGateway(db, org.account_id);
-  if (existing) {
-    ensureGatewayWorkspace(desk);
-    return existing;
-  }
-  const name = pickGatewayName(db, org.account_id);
-  if (!name) {
-    throw new Error("gateway.provision failed: names Gateway through Gateway-8 are taken");
-  }
-  const botId = id();
-  const threadId = id();
-  const t = now();
   const accountId = org.account_id;
-  db.immediate(() => {
-    ensureComputeInstance(db, accountId, desk);
-    db.run(
-      `INSERT INTO bots (id, account_id, name, description, status, permission_mode, harness, require_human_approval, model, reasoning_effort, role, created_at)
-       VALUES (?, ?, ?, ?, 'active', 'ask', 'grok', 0, ?, ?, 'gateway', ?)`,
-      [botId, accountId, name, GATEWAY_DESCRIPTION, DEFAULT_GROK_MODEL, DEFAULT_REASONING_EFFORT, t],
-    );
-    db.run(
-      `INSERT INTO threads (id, account_id, bot_id, title, kind, created_at) VALUES (?, ?, ?, 'New thread', 'human', ?)`,
-      [threadId, accountId, botId, t],
-    );
-  });
+  let row: { id: string; name: string };
+  try {
+    row = db.immediate(() => {
+      const existing = findActiveGateway(db, accountId);
+      if (existing) return existing;
+      ensureComputeInstance(db, accountId, desk);
+      const name = pickGatewayName(db, accountId);
+      if (!name) {
+        throw new Error("gateway.provision failed: names Gateway through Gateway-8 are taken");
+      }
+      const botId = id();
+      const threadId = id();
+      const t = now();
+      db.run(
+        `INSERT INTO bots (id, account_id, name, description, status, permission_mode, harness, require_human_approval, model, reasoning_effort, role, created_at)
+         VALUES (?, ?, ?, ?, 'active', 'ask', 'grok', 0, ?, ?, 'gateway', ?)`,
+        [botId, accountId, name, GATEWAY_DESCRIPTION, DEFAULT_GROK_MODEL, DEFAULT_REASONING_EFFORT, t],
+      );
+      db.run(
+        `INSERT INTO threads (id, account_id, bot_id, title, kind, created_at) VALUES (?, ?, ?, 'New thread', 'human', ?)`,
+        [threadId, accountId, botId, t],
+      );
+      return { id: botId, name };
+    });
+  } catch (err) {
+    const again = findActiveGateway(db, accountId);
+    if (again) {
+      ensureGatewayWorkspace(desk);
+      return again;
+    }
+    throw err;
+  }
   ensureGatewayWorkspace(desk);
-  return { id: botId, name };
+  return row;
 }
 
 export function provisionOrgGateway(db: OpenbotDb, home: string): { id: string; name: string } | null {

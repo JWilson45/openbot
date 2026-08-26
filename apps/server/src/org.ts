@@ -269,7 +269,7 @@ export function orgMemberSnapshot(row: OrgMetaRow): {
     slug: row.slug,
     name: row.name,
     publicOrigin: row.public_origin,
-    federationEnabled: row.federation_enabled === 1,
+    federationEnabled: federationEffective(row),
   };
 }
 
