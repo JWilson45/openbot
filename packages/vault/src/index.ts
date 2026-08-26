@@ -9,6 +9,7 @@ export function redactSecrets(text: string): string {
     .replace(/xai-[A-Za-z0-9_\-]{8,}/g, "xai-[redacted]")
     .replace(/XAI_API_KEY[=:\s]+[^\s"',}]+/gi, "XAI_API_KEY=[redacted]")
     .replace(/ob_sess_[A-Fa-f0-9]+/g, "ob_sess_[redacted]")
+    .replace(/sk-ob_[A-Za-z0-9]+/g, "sk-ob_[redacted]")
     .replace(/Bearer\s+[A-Za-z0-9._\-]+/gi, "Bearer [redacted]");
 }
 
@@ -33,7 +34,11 @@ export class RedactingLogger {
   }
 
   containsSecretLeak(): boolean {
-    return this.lines.some((l) => /xai-[A-Za-z0-9_\-]{8,}/.test(l) && !l.includes("[redacted]"));
+    return this.lines.some(
+      (l) =>
+        (/xai-[A-Za-z0-9_\-]{8,}/.test(l) && !l.includes("[redacted]")) ||
+        /sk-ob_[A-Za-z0-9]{8,}/.test(l),
+    );
   }
 }
 

@@ -1,3 +1,16 @@
+export function parseHttpUrl(raw: unknown): URL | null {
+  try {
+    const url = new URL(String(raw ?? "").trim());
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    if (!url.hostname) return null;
+    url.username = "";
+    url.password = "";
+    return url;
+  } catch {
+    return null;
+  }
+}
+
 export const SPA_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -98,7 +111,7 @@ export const SPA_HTML = `<!DOCTYPE html>
     .rail h2, aside.side h2 {
       font-size: .72rem; letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
     }
-    .shell.no-rail .rail h2, .shell.no-rail .desk-note, .shell.no-rail .bot-meta, .shell.no-rail #newbot { display: none; }
+    .shell.no-rail .rail h2, .shell.no-rail .desk-note, .shell.no-rail .bot-meta, .shell.no-rail #newbot, .shell.no-rail #new-group { display: none; }
     .shell.no-rail .rail { padding: 8px 6px; }
     .shell.no-side aside.side { padding: 8px 4px; }
     .shell.no-side aside.side .side-body { display: none; }
@@ -151,6 +164,11 @@ export const SPA_HTML = `<!DOCTYPE html>
       padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--bot);
     }
     .archive-row .meta { color: var(--muted); font-size: .9rem; }
+    .org-row, .peer-row {
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between;
+      padding: 10px 0; border-bottom: 1px solid var(--line);
+    }
+    .mono { font-family: ui-monospace, monospace; font-size: .78rem; overflow-wrap: anywhere; }
     .avatar {
       flex: 0 0 32px; width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center;
       background: #31415a; font-size: .75rem; font-weight: 700;
@@ -253,7 +271,7 @@ export const SPA_HTML = `<!DOCTYPE html>
   <div id="app"></div>
   <script>
   const state = {
-    me:null, bots:[], archived:[], archiveTtlMs: 30*24*60*60*1000, bot:null, thread:null, messages:[], live:[], compute:null, liveRaw: localStorage.getItem('openbot-live-raw') === '1', railCollapsed: localStorage.getItem('openbot-rail') === '1', sideCollapsed: localStorage.getItem('openbot-side') === '1',
+    me:null, bots:[], gateway:null, groups:[], org:null, archived:[], archiveTtlMs: 30*24*60*60*1000, bot:null, thread:null, messages:[], live:[], compute:null, liveRaw: localStorage.getItem('openbot-live-raw') === '1', railCollapsed: localStorage.getItem('openbot-rail') === '1', sideCollapsed: localStorage.getItem('openbot-side') === '1',
     turn:null, a2a:[], view:'human', auth:{}, harness:{}, ws:'down', sending:false, activity:[], models:[], sideW: Number(localStorage.getItem('openbot-side-w') || 320)
   };
   let hostPoll = 0;
@@ -281,6 +299,90 @@ export const SPA_HTML = `<!DOCTYPE html>
     return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
   function announce(msg) { if (announceEl) announceEl.textContent = msg; }
+  function parseHttpUrl(raw) {
+    try {
+      const url = new URL(String(raw || '').trim());
+      // Scheme must be http: or https:. Reject javascript:, data:, relative paths (new URL without a base).
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+      if (!url.hostname) return null;
+      url.username = '';
+      url.password = ''; // don't navigate with embedded credentials
+      return url;
+    } catch { return null; }
+  }
+  function loadOrgBookmarks() {
+    try {
+      const raw = JSON.parse(localStorage.getItem('openbot-orgs') || '[]');
+      if (!Array.isArray(raw)) return [];
+      const out = [];
+      for (const item of raw) {
+        if (!item || typeof item !== 'object') continue;
+        const name = String(item.name || '').trim();
+        const url = parseHttpUrl(item.baseUrl);
+        if (!name || !url) continue;
+        out.push({ name, baseUrl: url.origin });
+      }
+      return out;
+    } catch { return []; }
+  }
+  function saveOrgBookmarks(list) {
+    try { localStorage.setItem('openbot-orgs', JSON.stringify(list)); } catch {}
+  }
+  function goToOrg(baseUrl) {
+    const url = parseHttpUrl(baseUrl);
+    if (!url) { announce('Only http and https org URLs are allowed'); return; }
+    if (url.origin === location.origin) return;
+    location.href = url.href;
+  }
+  function addOrgBookmark(name, baseUrl) {
+    const url = parseHttpUrl(baseUrl);
+    if (!url) return 'Only http and https org URLs are allowed';
+    const list = loadOrgBookmarks();
+    if (list.some(o => { const u = parseHttpUrl(o.baseUrl); return u && u.origin === url.origin; })) {
+      return 'Already bookmarked';
+    }
+    list.push({ name: String(name || '').trim() || url.hostname, baseUrl: url.origin });
+    saveOrgBookmarks(list);
+    return '';
+  }
+  async function copyText(text, btn, doneMsg) {
+    const label = btn ? btn.textContent : '';
+    try {
+      await navigator.clipboard.writeText(String(text || ''));
+      if (btn) {
+        btn.textContent = 'Copied';
+        setTimeout(() => { btn.textContent = label; }, 1200);
+      }
+      announce(doneMsg || 'Copied');
+    } catch {
+      if (btn) btn.textContent = 'Copy failed';
+    }
+  }
+  function thisOrgName() {
+    return (state.org && (state.org.name || state.org.slug)) || location.host || 'this instance';
+  }
+  function solicitNotices(json) {
+    if (!json || typeof json !== 'object') return [];
+    const out = [];
+    const seen = new Set();
+    function emit(row, force) {
+      if (!row || typeof row !== 'object') return;
+      const kind = String(row.kind || row.type || row.reason || row.status || '');
+      const body = String(row.body || row.text || row.message || '');
+      const looks = force || row.solicit === true || /solicit|untrusted|unknown_peer|tried to send/i.test(kind + ' ' + body);
+      if (!looks) return;
+      const who = row.name || row.slug || row.fromOrg || row.orgName || row.host || row.from_org || 'unknown';
+      const line = 'Org ' + who + ' tried to send mail';
+      if (seen.has(line)) return;
+      seen.add(line);
+      out.push(line);
+    }
+    if (Array.isArray(json.solicitations)) for (const row of json.solicitations) emit(row, true);
+    if (Array.isArray(json.inbox)) for (const row of json.inbox) emit(row, false);
+    if (Array.isArray(json.rows)) for (const row of json.rows) emit(row, false);
+    if (Array.isArray(json.items)) for (const row of json.items) emit(row, false);
+    return out;
+  }
   function initials(name) {
     const p = String(name||'?').trim().split(/\\s+/).slice(0,2);
     return p.map(x => x[0] ? x[0].toUpperCase() : '').join('') || '?';
@@ -384,15 +486,23 @@ export const SPA_HTML = `<!DOCTYPE html>
     try { state.models = (await api('/v1/inference-models')).models || []; } catch { state.models = []; }
     try {
       const bots = await api('/v1/bots');
+      // Desk roster only — Gateway is the sidecar, never a Team row.
       state.bots = bots.bots || (bots.bot ? [bots.bot] : []);
+      state.gateway = bots.gateway || null;
       state.archived = bots.archived || [];
       if (bots.archiveTtlMs) state.archiveTtlMs = bots.archiveTtlMs;
       const last = localStorage.getItem('openbot-last-bot');
-      state.bot = state.bots.find(b => b.id === last) || state.bots[0] || null;
+      state.bot = state.bots.find(b => b.id === last)
+        || (state.gateway && last === state.gateway.id ? state.gateway : null)
+        || state.bots[0]
+        || null;
     } catch {}
-    if (!state.bot && !state.archived.length) return renderOnboard();
+    // Onboard until a desk bot exists; Gateway must not skip that screen.
+    if (!state.bots.length && !state.archived.length) return renderOnboard();
+    try { state.groups = (await api('/v1/threads?kind=group')).threads || []; } catch { state.groups = []; }
+    try { state.org = await api('/v1/org'); } catch { state.org = null; }
     connectPush();
-    if (!state.bot) { state.view = 'archive'; renderApp(); return; }
+    if (!state.bots.length) { state.view = 'archive'; renderApp(); return; }
     try {
       await selectBot(state.bot.id);
     } catch (err) {
@@ -438,7 +548,7 @@ export const SPA_HTML = `<!DOCTYPE html>
       \${inferenceFields('on-model', 'on-effort')}
       <label for="key">API key (optional)</label>
       <input id="key" name="key" type="password" autocomplete="off" placeholder="xai-… only if you are not using grok login" />
-      <p class="muted">Shared desk. One Chromium. Bots talk with SendToAgent.</p>
+      <p class="muted">Shared desk. One Chromium. Bots talk with SendToAgent. They hire with CreateBot — not by signing in as you.</p>
       <button class="primary" id="go" type="button">Create bot</button>
       <p class="err" id="err" role="alert"></p>
     </main>\`);
@@ -467,16 +577,30 @@ export const SPA_HTML = `<!DOCTYPE html>
     } catch (e) { if (err) err.textContent = e.message; }
   }
 
+  function isGatewayBot(b) {
+    return Boolean(b && state.gateway && b.id === state.gateway.id);
+  }
+  function visibleMessages(list) {
+    return (list || []).filter(m => m.origin !== 'prompt');
+  }
+  function principalById(botId) {
+    if (state.gateway && state.gateway.id === botId) return state.gateway;
+    return state.bots.find(b => b.id === botId) || null;
+  }
+
   async function selectBot(botId, threadId) {
     saveDraft();
-    state.bot = state.bots.find(b => b.id === botId) || state.bot;
+    const principal = principalById(botId);
+    // Gateway is not in state.bots; never keep the previous desk bot here.
+    if (!principal) return;
+    state.bot = principal;
     try { localStorage.setItem('openbot-last-bot', state.bot.id); } catch {}
     state.view = threadId ? 'a2a' : 'human';
     const t = threadId
       ? await api('/v1/threads/' + threadId)
       : await api('/v1/threads?botId=' + encodeURIComponent(botId));
     state.thread = t.thread;
-    state.messages = t.messages || [];
+    state.messages = visibleMessages(t.messages);
     try {
       const a2a = await api('/v1/threads?kind=a2a&botId=' + encodeURIComponent(botId));
       state.a2a = a2a.threads || [];
@@ -491,6 +615,71 @@ export const SPA_HTML = `<!DOCTYPE html>
     if (draft) draft.focus();
   }
 
+  async function refreshGroups() {
+    try {
+      const res = await api('/v1/threads?kind=group');
+      state.groups = res.threads || [];
+    } catch { state.groups = state.groups || []; }
+  }
+
+  async function selectGroup(threadId) {
+    if (!threadId) return;
+    saveDraft();
+    state.view = 'group';
+    const t = await api('/v1/threads/' + threadId);
+    state.thread = t.thread;
+    state.messages = visibleMessages(t.messages);
+    stickBottom = true;
+    renderApp();
+    const latestTurnId = t.latestTurnId || [...(state.messages || [])].reverse().find(m => m.turn_id)?.turn_id;
+    state.turn = latestTurnId;
+    await catchUpLive(latestTurnId);
+    loadDraft();
+    const draft = document.getElementById('draft');
+    if (draft) draft.focus();
+  }
+
+  function openNewGroup() {
+    const botChecks = state.bots.map(b =>
+      '<label><input type="checkbox" data-bot="' + b.id + '" /> ' + escapeHtml(b.name) + '</label>'
+    ).join('');
+    const gwCheck = state.gateway
+      ? '<label><input type="checkbox" data-bot="' + state.gateway.id + '" /> ' + escapeHtml(state.gateway.name) + '</label>'
+      : '';
+    const overlay = h(\`<div class="overlay"><div class="modal">
+      <h2 id="grp-title">New group</h2>
+      <label for="grp-name">Title</label>
+      <input id="grp-name" name="title" value="New thread" />
+      <p class="muted">Pick at least two teammates. You are included.</p>
+      <div id="grp-bots" style="display:flex;flex-direction:column;gap:6px">\${botChecks}\${gwCheck}</div>
+      <p class="err" id="grp-err" hidden></p>
+      <div class="modal-actions">
+        <button class="primary" type="button" id="grp-go">Create</button>
+        <button type="button" id="grp-no">Cancel</button>
+      </div>
+    </div></div>\`);
+    overlay.querySelector('.modal').setAttribute('aria-labelledby', 'grp-title');
+    const close = openOverlay(overlay);
+    overlay.querySelector('#grp-no').onclick = close;
+    overlay.querySelector('#grp-go').onclick = async () => {
+      const err = overlay.querySelector('#grp-err');
+      const botIds = [...overlay.querySelectorAll('#grp-bots input[data-bot]:checked')].map(i => i.getAttribute('data-bot'));
+      try {
+        const res = await api('/v1/threads', { method:'POST', body: JSON.stringify({
+          kind:'group',
+          title: overlay.querySelector('#grp-name').value,
+          botIds,
+        }) });
+        await refreshGroups();
+        close();
+        await selectGroup(res.thread.id);
+      } catch (e) {
+        err.hidden = false;
+        err.textContent = e.message || 'Could not create group';
+      }
+    };
+  }
+
   function statusPill() {
     const harness = state.compute && state.compute.harness;
     const ws = state.ws;
@@ -503,6 +692,7 @@ export const SPA_HTML = `<!DOCTYPE html>
   }
 
   function botName(id) {
+    if (state.gateway && state.gateway.id === id) return state.gateway.name;
     const b = state.bots.find(x => x.id === id) || state.archived.find(x => x.id === id);
     return b ? b.name : (id || 'bot').slice(0, 8);
   }
@@ -547,10 +737,13 @@ export const SPA_HTML = `<!DOCTYPE html>
         method:'PATCH',
         body: JSON.stringify({ model, reasoningEffort: effort })
       });
-      const bot = state.bots.find(b => b.id === state.bot.id) || state.bot;
+      const bot = state.bots.find(b => b.id === state.bot.id)
+        || (isGatewayBot(state.bot) ? state.gateway : null)
+        || state.bot;
       bot.model = res.model;
       bot.reasoning_effort = res.reasoningEffort;
       state.bot = bot;
+      if (isGatewayBot(bot)) state.gateway = bot;
       announce('Next turn uses ' + res.model + ' · ' + res.reasoningEffort);
     } catch (e) { announce(e.message); }
   }
@@ -576,14 +769,29 @@ export const SPA_HTML = `<!DOCTYPE html>
   function renderApp() {
     const inArchive = state.view === 'archive';
     const inActivity = state.view === 'activity';
-    document.title = (inArchive ? 'Archive' : inActivity ? 'Activity' : (state.bot?.name || 'OpenBot')) + ' · OpenBot';
+    const inGroup = state.view === 'group';
+    const gwSelected = isGatewayBot(state.bot) && state.view === 'human';
+    const heading = inArchive ? 'Archive' : inActivity ? 'Activity' : inGroup ? (state.thread?.title || 'Group') : (state.bot?.name || 'OpenBot');
+    document.title = heading + ' · OpenBot';
     const railBots = state.bots.map(b => {
-      const active = state.bot && b.id === state.bot.id && state.view === 'human';
+      const active = state.bot && b.id === state.bot.id && state.view === 'human' && !gwSelected;
       const pres = presenceOf(b);
       return '<button type="button" class="bot' + (active ? ' active' : '') + '" data-id="' + b.id + '" aria-current="' + (active ? 'page' : 'false') + '">' +
         '<span class="st ' + escapeHtml(pres.key) + '" title="' + escapeHtml(pres.label) + '"></span>' +
         '<span class="avatar" aria-hidden="true">' + escapeHtml(initials(b.name)) + '</span>' +
         '<span class="bot-meta"><strong>' + escapeHtml(b.name) + '</strong><span class="muted presence">' + escapeHtml(pres.label) + '</span></span></button>';
+    }).join('');
+    const gwEnabled = Boolean(state.gateway && state.gateway.enabled);
+    const gatewayPin = state.gateway
+      ? '<button type="button" class="bot folder' + (gwSelected ? ' active' : '') + '" id="open-gateway" data-id="' + state.gateway.id + '" aria-current="' + (gwSelected ? 'page' : 'false') + '">' +
+        '<span class="avatar" aria-hidden="true">' + escapeHtml(initials(state.gateway.name)) + '</span>' +
+        '<span class="bot-meta"><strong>' + escapeHtml(state.gateway.name) + '</strong><span class="muted presence">' + (gwEnabled ? 'Federation on' : 'Federation off') + '</span></span></button>'
+      : '';
+    const railGroups = (state.groups || []).map(t => {
+      const active = inGroup && state.thread && t.id === state.thread.id;
+      return '<button type="button" class="bot folder' + (active ? ' active' : '') + '" data-group="' + t.id + '" aria-current="' + (active ? 'page' : 'false') + '">' +
+        '<span class="avatar" aria-hidden="true">#</span>' +
+        '<span class="bot-meta"><strong>' + escapeHtml(t.title || 'Group') + '</strong></span></button>';
     }).join('');
     const handoffs = (state.a2a || []).map(t =>
       '<div><button type="button" data-a2a="' + t.id + '">' + escapeHtml(handoffLabel(t)) + '</button></div>'
@@ -593,6 +801,14 @@ export const SPA_HTML = `<!DOCTYPE html>
       ? ''
       : readonly
       ? '<p class="muted" id="draft-help">This handoff log is read-only. Message the bot from their human thread.</p>'
+      : inGroup
+      ? \`
+        <div class="composer">
+          <label class="sr-only" for="draft">Message group</label>
+          <textarea id="draft" name="draft" rows="2" maxlength="32000" aria-describedby="draft-help" placeholder="Message the group… @name to mention"></textarea>
+          <button class="primary" id="send" type="button" disabled>Send</button>
+        </div>
+        <div class="hint" id="draft-help"><span><kbd>Enter</kbd> send · <kbd>Shift</kbd>+<kbd>Enter</kbd> newline · @mention up to 3 teammates</span><span id="count"></span></div>\`
       : \`\${inferenceFields('pick-model', 'pick-effort')}
         <div class="composer">
           <label class="sr-only" for="draft">Message \${escapeHtml(state.bot?.name || '')}</label>
@@ -606,13 +822,16 @@ export const SPA_HTML = `<!DOCTYPE html>
       ? '<ul class="act-list" id="activity-board"></ul>'
       : '<ol class="msgs" id="msgs" tabindex="0"></ol><div class="composer-wrap">' + composer + '</div><p class="muted" style="padding:0 16px 12px">Closing this tab does not stop teammates. Stopping <code>openbot server</code> does.</p>';
 
+    const orgName = thisOrgName();
     el.innerHTML = '';
     el.append(h(\`<header class="app-header">
-      <h1>\${inArchive ? 'Archive' : inActivity ? 'Activity' : escapeHtml(state.bot?.name || 'OpenBot')}</h1>
+      <h1>\${escapeHtml(heading)}</h1>
       <div class="header-actions">
         \${statusPill()}
+        <span class="pill" id="this-org" title="This instance">\${escapeHtml(orgName)}</span>
+        <button type="button" id="open-orgs" aria-haspopup="dialog">Orgs</button>
         <button type="button" class="side-toggle" id="live-toggle" aria-expanded="false">Live work</button>
-        \${!inArchive && !inActivity && state.bot ? '<button type="button" id="archive-bot">Archive</button>' : ''}
+        \${!inArchive && !inActivity && !inGroup && state.bot && !gwSelected ? '<button type="button" id="archive-bot">Archive</button>' : ''}
         <button type="button" id="help" aria-haspopup="dialog">Help</button>
         <button type="button" id="takeover">Takeover</button>
         <button type="button" id="settings">Settings</button>
@@ -635,9 +854,13 @@ export const SPA_HTML = `<!DOCTYPE html>
           <span class="avatar" aria-hidden="true">📦</span>
           <span class="bot-meta"><strong>Archive</strong><span class="muted"> \${state.archived.length} teammate\${state.archived.length === 1 ? '' : 's'}</span></span>
         </button>
+        \${gatewayPin}
+        <h2>Groups</h2>
+        \${railGroups}
+        <button type="button" id="new-group">New group</button>
         <p class="muted desk-note">Shared desk · one browser · SendToAgent is how bots talk.</p>
       </nav>
-      <main class="thread" aria-label="\${inArchive ? 'Archive' : inActivity ? 'Activity' : 'Conversation'}">
+      <main class="thread" aria-label="\${inArchive ? 'Archive' : inActivity ? 'Activity' : inGroup ? 'Group' : 'Conversation'}">
         \${mainInner}
       </main>
       <div class="resize-side" id="resize-side" role="separator" aria-orientation="vertical" aria-label="Resize live work" tabindex="0"></div>
@@ -674,7 +897,9 @@ export const SPA_HTML = `<!DOCTYPE html>
     bind('#settings', openSettings);
     bind('#takeover', startTakeover);
     bind('#newbot', renderOnboard);
+    bind('#new-group', openNewGroup);
     bind('#help', openHelp);
+    bind('#open-orgs', openOrgs);
     bind('#open-archive', openArchiveFolder);
     bind('#open-activity', openActivity);
     bind('#archive-bot', archiveCurrentBot);
@@ -690,6 +915,9 @@ export const SPA_HTML = `<!DOCTYPE html>
     });
     el.querySelectorAll('button.bot[data-id]').forEach(btn => {
       btn.onclick = () => selectBot(btn.getAttribute('data-id'));
+    });
+    el.querySelectorAll('[data-group]').forEach(btn => {
+      btn.onclick = () => selectGroup(btn.getAttribute('data-group'));
     });
     el.querySelectorAll('[data-a2a]').forEach(btn => {
       btn.onclick = () => selectBot(state.bot.id, btn.getAttribute('data-a2a'));
@@ -730,10 +958,26 @@ export const SPA_HTML = `<!DOCTYPE html>
     if (jump) jump.hidden = stickBottom;
   }
 
+  function dropFinishedTurn(turnId, status) {
+    if (!turnId) return;
+    if (status !== 'completed' && status !== 'failed' && status !== 'cancelled') return;
+    for (const m of state.messages) {
+      if (!Array.isArray(m._turnIds) || !m._turnIds.length) continue;
+      m._turnIds = m._turnIds.filter(id => id !== turnId);
+    }
+    if (state.turn === turnId) {
+      const still = [...state.messages].reverse().find(m => Array.isArray(m._turnIds) && m._turnIds.length);
+      state.turn = still ? still._turnIds[0] : null;
+    }
+  }
+
   function waitingKind() {
     const last = state.messages[state.messages.length - 1];
     if (!last || last.role !== 'user' || last.origin === 'agent') return '';
     if (last._failed) return '';
+    // Group user rows stay turn_id null; hello is this POST's empty turnIds, not a missing turn_id.
+    // Finished mention turns are dropped from _turnIds so SendMessage-to-DM does not stick on waiting.
+    if (state.view === 'group' && !last._pending && !(Array.isArray(last._turnIds) && last._turnIds.length > 0)) return '';
     const harness = state.compute && state.compute.harness;
     if (last._pending || harness === 'starting') return 'starting';
     if (harness === 'in_turn') return 'working';
@@ -742,9 +986,13 @@ export const SPA_HTML = `<!DOCTYPE html>
   }
 
   function senderLabel(m) {
-    if (m.role === 'user' && m.origin === 'user') return 'You';
+    if (m.role === 'user' && (m.origin === 'user' || !m.origin)) return 'You';
     if (m.origin === 'agent') return botName(m.from_bot_id) || 'Bot';
     if (m.origin === 'system') return 'System';
+    if (m.origin === 'federation') return m.remote_actor_name || 'Org';
+    if (m.from_bot_id) return botName(m.from_bot_id);
+    // Group fallback has no from_bot_id; do not pin it to the last selected DM.
+    if (m.origin === 'fallback' && state.view === 'group') return 'Teammate';
     return state.bot?.name || 'Teammate';
   }
 
@@ -758,12 +1006,16 @@ export const SPA_HTML = `<!DOCTYPE html>
       empty.className = 'empty';
       empty.textContent = state.view === 'a2a'
         ? 'No handoff messages yet.'
+        : state.view === 'group'
+        ? 'No messages yet. @mention a teammate to loop them in.'
         : 'No messages yet. Say hello — Enter sends, Shift+Enter makes a new line.';
       box.append(empty);
     }
     for (const m of state.messages) {
       const li = document.createElement('li');
-      const kind = m.role === 'user' && m.origin !== 'agent' ? 'user' : m.origin === 'system' || m.origin === 'agent' ? 'system' : 'assistant';
+      const kind = m.origin === 'system' || m.origin === 'agent'
+        ? 'system'
+        : m.role === 'user' && m.origin !== 'thread' ? 'user' : 'assistant';
       li.className = 'msg ' + kind;
       if (m.origin === 'fallback') li.classList.add('fallback');
       if (m._pending) li.classList.add('pending');
@@ -791,6 +1043,12 @@ export const SPA_HTML = `<!DOCTYPE html>
         const badge = document.createElement('div');
         badge.className = 'badge';
         badge.textContent = 'Pending your approval';
+        li.append(badge);
+      }
+      if (m.origin === 'federation' || m.remote_org_id) {
+        const badge = document.createElement('div');
+        badge.className = 'badge';
+        badge.textContent = m.remote_actor_name ? ('From ' + m.remote_actor_name) : 'Federation';
         li.append(badge);
       }
       const body = document.createElement('div');
@@ -880,16 +1138,26 @@ export const SPA_HTML = `<!DOCTYPE html>
     announce('Sending message');
     try {
       const res = await api('/v1/threads/' + state.thread.id + '/messages', { method:'POST', body: JSON.stringify({ body }) });
-      tmp.id = res.userMessageId;
-      tmp.turn_id = res.turnId;
-      tmp._pending = false;
-      state.turn = res.turnId;
+      // WS may already have replaced tmp; stamp the in-array row, not the detached object.
+      const live = state.messages.find(x =>
+        (res.userMessageId && x.id === res.userMessageId) || x.id === tmp.id || x === tmp
+      ) || tmp;
+      if (res.userMessageId) live.id = res.userMessageId;
+      if (Array.isArray(res.turnIds)) {
+        live._turnIds = res.turnIds;
+        if (res.turnIds[0]) state.turn = res.turnIds[0];
+      } else if (res.turnId) {
+        live.turn_id = res.turnId;
+        state.turn = res.turnId;
+      }
+      live._pending = false;
       paintMessages();
       announce('Message sent');
     } catch (e) {
-      tmp._pending = false;
-      tmp._failed = true;
-      tmp.error = e.message;
+      const live = state.messages.find(x => x.id === tmp.id || x === tmp) || tmp;
+      live._pending = false;
+      live._failed = true;
+      live.error = e.message;
       paintMessages();
       announce('Send failed');
     } finally {
@@ -1237,14 +1505,27 @@ export const SPA_HTML = `<!DOCTYPE html>
 
   function upsertMessage(m) {
     if (!m || !m.id) return;
+    // Per-turn @mention clones are not transcript bubbles.
+    if (m.origin === 'prompt') return;
     const tid = m.thread_id || m.threadId;
-    const sameThread = state.thread && tid === state.thread.id;
-    const botReply = state.view === 'human' && m.origin && m.origin !== 'user' && m.origin !== 'agent';
-    if (!sameThread && !botReply) return;
+    const sameThread = Boolean(state.thread && tid === state.thread.id);
+    // Other threads' system/fallback must not land in this transcript.
+    if (!sameThread) return;
     const idx = state.messages.findIndex(x => x.id === m.id || (x.id && String(x.id).startsWith('tmp-') && x.body === m.body && x.role === m.role));
     const wasNew = idx < 0;
-    if (idx >= 0) state.messages[idx] = { ...state.messages[idx], ...m, _pending:false, _failed:false };
-    else state.messages.push(m);
+    if (idx >= 0) {
+      const prev = state.messages[idx];
+      state.messages[idx] = {
+        ...prev,
+        ...m,
+        // Keep tmp pending until sendMsg stamps _turnIds; WS can replace the object first.
+        _pending: Boolean(prev._pending && m.origin === 'user'),
+        _failed: false,
+        _turnIds: Array.isArray(prev._turnIds) ? prev._turnIds : m._turnIds,
+      };
+    } else {
+      state.messages.push(m);
+    }
     paintMessages();
     if (wasNew && m.role !== 'user') announce(senderLabel(m) + ' replied');
   }
@@ -1252,14 +1533,23 @@ export const SPA_HTML = `<!DOCTYPE html>
   async function reloadThread() {
     if (state.view === 'activity') { void paintActivity(); return; }
     if (state.view === 'archive') return;
-    if (!state.bot) return;
     try {
-      const t = state.view === 'a2a' && state.thread
-        ? await api('/v1/threads/' + state.thread.id)
-        : await api('/v1/threads?botId=' + encodeURIComponent(state.bot.id));
+      let t;
+      if ((state.view === 'a2a' || state.view === 'group') && state.thread) {
+        t = await api('/v1/threads/' + state.thread.id);
+      } else if (state.bot) {
+        t = await api('/v1/threads?botId=' + encodeURIComponent(state.bot.id));
+      } else {
+        return;
+      }
       if (t.thread) state.thread = t.thread;
+      const prevById = new Map(state.messages.filter(m => m.id).map(m => [m.id, m]));
       const keepFailed = state.messages.filter(m => m._failed);
-      state.messages = t.messages || [];
+      state.messages = visibleMessages(t.messages).map(m => {
+        const prev = prevById.get(m.id);
+        if (prev && Array.isArray(prev._turnIds)) return { ...m, _turnIds: prev._turnIds };
+        return m;
+      });
       for (const f of keepFailed) {
         if (!state.messages.some(m => m.body === f.body && m.role === 'user')) state.messages.push(f);
       }
@@ -1295,8 +1585,11 @@ export const SPA_HTML = `<!DOCTYPE html>
     };
     ws.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
-      if (msg.type === 'message.created' && msg.message) upsertMessage(msg.message);
-      if (msg.type === 'turn.updated') void reloadThread();
+      if (msg.type === 'message.created' && msg.message && msg.message.origin !== 'prompt') upsertMessage(msg.message);
+      if (msg.type === 'turn.updated') {
+        dropFinishedTurn(msg.turnId, msg.status);
+        void reloadThread();
+      }
       if (msg.type === 'live_work') {
         if (msg.turnId) state.turn = msg.turnId;
         state.live.push(msg.event);
@@ -1304,6 +1597,9 @@ export const SPA_HTML = `<!DOCTYPE html>
         paintMessages();
       }
       if (msg.type === 'permission_request') showPerm(msg);
+      if (msg.type === 'bots.updated') {
+        void refreshRoster().then(() => renderApp());
+      }
     };
   }
 
@@ -1411,8 +1707,13 @@ export const SPA_HTML = `<!DOCTYPE html>
   async function refreshRoster() {
     const bots = await api('/v1/bots');
     state.bots = bots.bots || [];
+    state.gateway = bots.gateway || null;
     state.archived = bots.archived || [];
     if (bots.archiveTtlMs) state.archiveTtlMs = bots.archiveTtlMs;
+    if (state.bot) {
+      state.bot = state.bots.find(b => b.id === state.bot.id)
+        || (state.gateway && state.gateway.id === state.bot.id ? state.gateway : state.bot);
+    }
   }
 
   async function openArchiveFolder() {
@@ -1422,7 +1723,7 @@ export const SPA_HTML = `<!DOCTYPE html>
   }
 
   async function archiveCurrentBot() {
-    if (!state.bot) return;
+    if (!state.bot || isGatewayBot(state.bot)) return;
     const name = state.bot.name;
     const id = state.bot.id;
     const ok = await askConfirm({
@@ -1491,6 +1792,76 @@ export const SPA_HTML = `<!DOCTYPE html>
     });
   }
 
+  function openOrgs() {
+    const overlay = h(\`<div class="overlay"><div class="modal">
+      <h2 id="orgs-title">Orgs</h2>
+      <p class="muted">Where this browser can open a desk. Not the Gateway peer allowlist — that lives in Settings.</p>
+      <p><strong>This instance</strong> · \${escapeHtml(thisOrgName())} · <span class="mono">\${escapeHtml(location.origin)}</span></p>
+      <ul id="org-list"></ul>
+      <label for="org-add-name">Name (optional)</label>
+      <input id="org-add-name" placeholder="defaults to hostname" autocomplete="off" />
+      <label for="org-url">Org URL</label>
+      <input id="org-url" placeholder="https://beta.example.com" autocomplete="off" />
+      <p class="err" id="org-err" hidden></p>
+      <div class="modal-actions">
+        <button type="button" id="add-org">Add org</button>
+        <button type="button" class="primary" id="bookmark-org">Bookmark this URL</button>
+        <button type="button" id="close-orgs">Close</button>
+      </div>
+    </div></div>\`);
+    overlay.querySelector('.modal').setAttribute('aria-labelledby', 'orgs-title');
+    const close = openOverlay(overlay);
+    overlay.querySelector('#close-orgs').onclick = close;
+    function paintBookmarks() {
+      const box = overlay.querySelector('#org-list');
+      const err = overlay.querySelector('#org-err');
+      err.hidden = true;
+      const list = loadOrgBookmarks();
+      if (!list.length) {
+        box.innerHTML = '<li class="muted">No bookmarks yet. Bookmark this URL, or paste another org http(s) URL.</li>';
+        return;
+      }
+      box.innerHTML = list.map(o => {
+        const here = parseHttpUrl(o.baseUrl) && parseHttpUrl(o.baseUrl).origin === location.origin;
+        return '<li class="org-row"><div><strong>' + escapeHtml(o.name) + '</strong>' +
+          (here ? ' <span class="muted">this instance</span>' : '') +
+          '<div class="muted mono">' + escapeHtml(o.baseUrl) + '</div></div><div class="msg-actions">' +
+          (here ? '' : '<button type="button" data-go="' + escapeHtml(o.baseUrl) + '">Open</button>') +
+          '<button type="button" data-forget="' + escapeHtml(o.baseUrl) + '">Remove</button></div></li>';
+      }).join('');
+      box.querySelectorAll('[data-go]').forEach(btn => {
+        btn.onclick = () => {
+          const url = parseHttpUrl(btn.getAttribute('data-go'));
+          if (!url) { err.hidden = false; err.textContent = 'Only http and https org URLs are allowed'; return; }
+          goToOrg(url.href);
+        };
+      });
+      box.querySelectorAll('[data-forget]').forEach(btn => {
+        btn.onclick = () => {
+          const target = parseHttpUrl(btn.getAttribute('data-forget'));
+          saveOrgBookmarks(loadOrgBookmarks().filter(o => {
+            const u = parseHttpUrl(o.baseUrl);
+            return !target || !u || u.origin !== target.origin;
+          }));
+          paintBookmarks();
+        };
+      });
+    }
+    function rememberOrg(name, baseUrl) {
+      const err = overlay.querySelector('#org-err');
+      const fail = addOrgBookmark(name, baseUrl);
+      if (fail) { err.hidden = false; err.textContent = fail; return; }
+      err.hidden = true;
+      announce('Bookmarked');
+      paintBookmarks();
+    }
+    overlay.querySelector('#bookmark-org').onclick = () => rememberOrg(thisOrgName(), location.origin);
+    overlay.querySelector('#add-org').onclick = () => {
+      rememberOrg(overlay.querySelector('#org-add-name').value, overlay.querySelector('#org-url').value);
+    };
+    paintBookmarks();
+  }
+
   function openHelp() {
     const overlay = h(\`<div class="overlay"><div class="modal">
       <h2 id="help-title">Keyboard and chat</h2>
@@ -1499,6 +1870,7 @@ export const SPA_HTML = `<!DOCTYPE html>
         <li>Focus stays in the composer after send</li>
         <li><kbd>Esc</kbd> closes dialogs</li>
         <li>Skip link (first Tab) jumps to the message box</li>
+        <li>Bots hire teammates with <code>CreateBot</code> (cap 6). They must not use <code>/auth/local</code> or <code>POST /v1/bots</code>.</li>
       </ul>
       <p class="muted">Teammates keep working if you close this tab. Stopping <code>openbot server</code> stops them.</p>
       <p class="muted">OpenAI-compatible clients (Open WebUI) can use <code>/v1</code> with an API key from Settings.</p>
@@ -1510,12 +1882,56 @@ export const SPA_HTML = `<!DOCTYPE html>
   }
 
   async function openSettings() {
+    try { state.org = await api('/v1/org'); } catch { state.org = state.org || {}; }
+    const fedOn = Boolean(state.org && state.org.federationEnabled);
+    let orgPub = '';
+    let orgId = (state.org && state.org.orgId) || '';
+    try {
+      const info = await api('/fed/v1/info');
+      if (info && info.pubkey) orgPub = String(info.pubkey);
+      if (!orgId && info && info.orgId) orgId = String(info.orgId);
+    } catch {}
     const overlay = h(\`<div class="overlay"><div class="modal">
       <h2 id="set-title">Settings</h2>
       <p class="muted">\${harnessBlurb()}</p>
+      <h2 style="margin-top:8px;font-size:1rem">Federation</h2>
+      <p class="muted" id="fed-state">\${fedOn ? 'Federation is on. Gateway may send and receive org mail.' : 'Federation is off. Gateway will not talk to other orgs.'}</p>
+      <div class="seg" role="group" aria-label="Federation">
+        <button type="button" id="fed-on" aria-pressed="\${fedOn ? 'true' : 'false'}">On</button>
+        <button type="button" id="fed-off" aria-pressed="\${fedOn ? 'false' : 'true'}">Off</button>
+      </div>
+      <p class="err" id="fed-err" hidden></p>
+      <h2 style="margin-top:16px;font-size:1rem">This org</h2>
+      <p class="muted">Share org id and pubkey with the other operator. Never the private key.</p>
+      <label for="org-id">Org id</label>
+      <input id="org-id" class="mono" readonly value="\${escapeHtml(orgId)}" />
+      <button type="button" id="copy-org-id">Copy org id</button>
+      <label for="org-pub">Pubkey</label>
+      <input id="org-pub" class="mono" readonly value="\${escapeHtml(orgPub)}" />
+      <button type="button" id="copy-org-pub">Copy pubkey</button>
+      <h2 style="margin-top:16px;font-size:1rem">Peers</h2>
+      <p class="muted">Who Gateway may talk to. Separate from Orgs bookmarks.</p>
+      <ul id="peer-list"></ul>
+      <p class="err" id="peer-err" hidden></p>
+      <label for="peer-url">Peer base URL</label>
+      <input id="peer-url" placeholder="https://beta.example.com" autocomplete="off" />
+      <button type="button" id="peer-from-info">Preview from-info</button>
+      <div id="peer-preview-box" hidden>
+        <label for="peer-slug">Slug</label>
+        <input id="peer-slug" autocomplete="off" />
+        <label for="peer-name">Name</label>
+        <input id="peer-name" autocomplete="off" />
+        <p class="muted mono" id="peer-preview-meta"></p>
+        <button type="button" class="primary" id="peer-add">Add peer</button>
+      </div>
+      <div id="solicit-wrap" hidden>
+        <h2 style="margin-top:16px;font-size:1rem">Solicitations</h2>
+        <ul id="solicit-list"></ul>
+      </div>
       <label for="set-key">API key override (optional)</label>
       <input id="set-key" type="password" autocomplete="off" placeholder="leave blank to use grok login" />
       \${inferenceFields('set-model', 'set-effort')}
+      <div id="desk-controls">
       <label for="mode">Permission mode</label>
       <select id="mode">
         <option value="auto">Auto</option>
@@ -1523,8 +1939,10 @@ export const SPA_HTML = `<!DOCTYPE html>
         <option value="always-approve">Always-approve</option>
       </select>
       <label><input type="checkbox" id="approve" /> Require approval for SendMessage</label>
+      </div>
       <h2 style="margin-top:16px;font-size:1rem">OpenAI-compatible keys</h2>
       <p class="muted">For Open WebUI or any OpenAI client. Base URL <code>\${location.origin}/v1</code>, model <code>openbot/\${escapeHtml(state.bot?.name || 'Ada')}</code>.</p>
+      <p class="muted">Each OpenBot process is one org. Switch org in Open WebUI by adding another connection (that VM’s base URL + a <code>sk-ob_…</code> key minted there). There is no OpenAI organization field. Models include <code>openbot/Gateway</code> when present. Federation is off until you turn it on.</p>
       <ul id="key-list" class="muted"></ul>
       <p class="err" id="key-err" hidden></p>
       <button type="button" id="mint">Create API key</button>
@@ -1547,23 +1965,194 @@ export const SPA_HTML = `<!DOCTYPE html>
     overlay.querySelector('.modal').setAttribute('aria-labelledby', 'set-title');
     const close = openOverlay(overlay);
     overlay.querySelector('#close').onclick = close;
-    if (state.bot) {
+    const gwView = isGatewayBot(state.bot);
+    if (gwView) {
+      const desk = overlay.querySelector('#desk-controls');
+      if (desk) desk.hidden = true;
+      const arch = overlay.querySelector('#archive');
+      if (arch) arch.hidden = true;
+    }
+    if (state.bot && !gwView) {
       overlay.querySelector('#mode').value = state.bot.permission_mode || 'auto';
       overlay.querySelector('#approve').checked = Boolean(Number(state.bot.require_human_approval));
     }
+    function paintFedState() {
+      const on = Boolean(state.org && state.org.federationEnabled);
+      overlay.querySelector('#fed-on').setAttribute('aria-pressed', on ? 'true' : 'false');
+      overlay.querySelector('#fed-off').setAttribute('aria-pressed', on ? 'false' : 'true');
+      overlay.querySelector('#fed-state').textContent = on
+        ? 'Federation is on. Gateway may send and receive org mail.'
+        : 'Federation is off. Gateway will not talk to other orgs.';
+      const lab = document.querySelector('#open-gateway .presence');
+      if (lab && state.gateway) lab.textContent = state.gateway.enabled ? 'Federation on' : 'Federation off';
+    }
+    async function setFederation(on) {
+      const err = overlay.querySelector('#fed-err');
+      try {
+        const res = await api('/v1/org', { method:'PATCH', body: JSON.stringify({ federationEnabled: on }) });
+        state.org = res;
+        if (state.gateway) state.gateway.enabled = Boolean(res.federationEnabled);
+        paintFedState();
+        if (on && !res.federationEnabled) {
+          err.hidden = false;
+          err.textContent = 'Federation stayed off. OPENBOT_FEDERATION=0 overrides the toggle.';
+        } else {
+          err.hidden = true;
+        }
+      } catch (e) {
+        err.hidden = false;
+        err.textContent = e.message || 'Could not update federation';
+      }
+    }
+    overlay.querySelector('#fed-on').onclick = () => setFederation(true);
+    overlay.querySelector('#fed-off').onclick = () => setFederation(false);
+    overlay.querySelector('#copy-org-id').onclick = (e) => copyText(overlay.querySelector('#org-id').value, e.currentTarget, 'Copied org id');
+    overlay.querySelector('#copy-org-pub').onclick = (e) => copyText(overlay.querySelector('#org-pub').value, e.currentTarget, 'Copied pubkey');
+    let peerPreview = null;
+    async function refreshPeers() {
+      const list = overlay.querySelector('#peer-list');
+      const err = overlay.querySelector('#peer-err');
+      try {
+        const res = await api('/v1/org/peers');
+        const peers = res.peers || [];
+        list.innerHTML = peers.length
+          ? peers.map(p => '<li class="peer-row"><div><strong>' + escapeHtml(p.slug) + '</strong> ' + escapeHtml(p.name || '') +
+            '<div class="muted">' + escapeHtml(p.baseUrl || '') + ' · ' + escapeHtml(p.status || '') + '</div></div>' +
+            '<div class="msg-actions">' +
+            '<button type="button" class="linkish" data-copy-pub="' + escapeHtml(p.pubkey || '') + '">Copy pubkey</button>' +
+            (p.status === 'allowed' ? '<button type="button" data-disable="' + escapeHtml(p.orgId) + '">Disable</button>' : '') +
+            '<button type="button" data-del="' + escapeHtml(p.orgId) + '">Remove</button></div></li>').join('')
+          : '<li class="muted">No peers yet. Preview a URL, then add.</li>';
+        list.querySelectorAll('[data-copy-pub]').forEach(btn => {
+          btn.onclick = () => copyText(btn.getAttribute('data-copy-pub'), btn, 'Copied pubkey');
+        });
+        list.querySelectorAll('[data-disable]').forEach(btn => {
+          btn.onclick = async () => {
+            try {
+              await api('/v1/org/peers/' + encodeURIComponent(btn.getAttribute('data-disable')) + '/disable', { method:'POST', body: '{}' });
+              err.hidden = true;
+              refreshPeers();
+            } catch (e) { err.hidden = false; err.textContent = e.message || 'Could not disable peer'; }
+          };
+        });
+        list.querySelectorAll('[data-del]').forEach(btn => {
+          btn.onclick = async () => {
+            try {
+              await api('/v1/org/peers/' + encodeURIComponent(btn.getAttribute('data-del')), { method:'DELETE' });
+              err.hidden = true;
+              refreshPeers();
+            } catch (e) { err.hidden = false; err.textContent = e.message || 'Could not remove peer'; }
+          };
+        });
+        err.hidden = true;
+      } catch (e) {
+        list.innerHTML = '';
+        err.hidden = false;
+        err.textContent = e.message || 'Could not load peers';
+      }
+    }
+    overlay.querySelector('#peer-from-info').onclick = async () => {
+      const err = overlay.querySelector('#peer-err');
+      const box = overlay.querySelector('#peer-preview-box');
+      const url = parseHttpUrl(overlay.querySelector('#peer-url').value);
+      if (!url) { err.hidden = false; err.textContent = 'Only http and https peer URLs are allowed'; box.hidden = true; peerPreview = null; return; }
+      const origin = url.origin;
+      try {
+        const info = await api('/v1/org/peers/from-info', { method:'POST', body: JSON.stringify({ baseUrl: origin }) });
+        peerPreview = {
+          orgId: info.orgId,
+          pubkey: info.pubkey,
+          slug: info.slug,
+          name: info.name,
+          baseUrl: origin,
+        };
+        overlay.querySelector('#peer-url').value = origin;
+        overlay.querySelector('#peer-slug').value = peerPreview.slug || '';
+        overlay.querySelector('#peer-name').value = peerPreview.name || '';
+        overlay.querySelector('#peer-preview-meta').textContent =
+          (peerPreview.orgId || '') + ' · ' + (peerPreview.pubkey || '') + ' · ' + origin;
+        box.hidden = false;
+        err.hidden = true;
+      } catch (e) {
+        peerPreview = null;
+        box.hidden = true;
+        err.hidden = false;
+        err.textContent = e.message || 'from-info failed';
+      }
+    };
+    overlay.querySelector('#peer-add').onclick = async () => {
+      const err = overlay.querySelector('#peer-err');
+      if (!peerPreview) { err.hidden = false; err.textContent = 'Preview from-info first'; return; }
+      try {
+        await api('/v1/org/peers', { method:'POST', body: JSON.stringify({
+          slug: overlay.querySelector('#peer-slug').value,
+          name: overlay.querySelector('#peer-name').value,
+          orgId: peerPreview.orgId,
+          pubkey: peerPreview.pubkey,
+          baseUrl: peerPreview.baseUrl,
+        }) });
+        overlay.querySelector('#peer-preview-box').hidden = true;
+        peerPreview = null;
+        err.hidden = true;
+        announce('Peer added');
+        refreshPeers();
+      } catch (e) {
+        err.hidden = false;
+        err.textContent = e.message || 'Could not add peer';
+      }
+    };
+    async function refreshSolicits() {
+      const wrap = overlay.querySelector('#solicit-wrap');
+      const box = overlay.querySelector('#solicit-list');
+      const lines = [];
+      const seen = new Set();
+      function addLines(arr) {
+        for (const line of arr) {
+          if (seen.has(line)) continue;
+          seen.add(line);
+          lines.push(line);
+        }
+      }
+      try {
+        // Untrusted solicitations may live on inbox; skip if that route is not shipped yet.
+        const res = await fetch('/v1/org/inbox', { credentials:'same-origin', headers: { 'content-type':'application/json' } });
+        if (res.status !== 404 && res.ok) addLines(solicitNotices(await res.json()));
+      } catch {}
+      try {
+        if (state.gateway && state.gateway.id) {
+          const t = await api('/v1/threads?botId=' + encodeURIComponent(state.gateway.id));
+          for (const m of t.messages || []) {
+            if (m.origin !== 'system') continue;
+            const text = String(m.body || '');
+            const named = /Org (.+) tried to send mail/i.exec(text);
+            if (named) addLines(['Org ' + named[1] + ' tried to send mail']);
+            else if (/solicit|untrusted|tried to send/i.test(text) && text.trim()) addLines([text.trim()]);
+          }
+        }
+      } catch {}
+      if (!lines.length) { wrap.hidden = true; return; }
+      wrap.hidden = false;
+      box.innerHTML = lines.map(s => '<li>' + escapeHtml(s) + '</li>').join('');
+    }
+    void refreshPeers();
+    void refreshSolicits();
     bindInferenceSelects(overlay, '#set-model', '#set-effort');
     overlay.querySelector('#save').onclick = async () => {
       const key = overlay.querySelector('#set-key').value.trim();
       if (key) await api('/v1/credentials/xai', { method:'PUT', body: JSON.stringify({ key }) });
-      await api('/v1/bots/' + state.bot.id + '/settings', { method:'PATCH', body: JSON.stringify({
-        permissionMode: overlay.querySelector('#mode').value,
-        requireHumanApproval: overlay.querySelector('#approve').checked,
-        model: overlay.querySelector('#set-model')?.value,
-        reasoningEffort: overlay.querySelector('#set-effort')?.value,
-      }) });
       if (state.bot) {
-        state.bot.model = overlay.querySelector('#set-model')?.value || state.bot.model;
-        state.bot.reasoning_effort = overlay.querySelector('#set-effort')?.value || state.bot.reasoning_effort;
+        const payload = {
+          model: overlay.querySelector('#set-model')?.value,
+          reasoningEffort: overlay.querySelector('#set-effort')?.value,
+        };
+        if (!isGatewayBot(state.bot)) {
+          payload.permissionMode = overlay.querySelector('#mode').value;
+          payload.requireHumanApproval = overlay.querySelector('#approve').checked;
+        }
+        await api('/v1/bots/' + state.bot.id + '/settings', { method:'PATCH', body: JSON.stringify(payload) });
+        state.bot.model = payload.model || state.bot.model;
+        state.bot.reasoning_effort = payload.reasoningEffort || state.bot.reasoning_effort;
+        if (isGatewayBot(state.bot)) state.gateway = state.bot;
       }
       close();
     };

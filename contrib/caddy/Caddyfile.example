@@ -1,0 +1,23 @@
+# Reverse-proxy OpenBot with HTTPS. OpenBot itself does not terminate TLS.
+# Bind OpenBot to 127.0.0.1:8787 (the default). Do not expose 0.0.0.0 without a proxy.
+#
+# Set on the OpenBot service (not in this file):
+#   OPENBOT_PUBLIC_ORIGIN=https://desk.example.com
+# GitHub OAuth callback:
+#   https://desk.example.com/auth/callback/github
+# Put OPENBOT_GITHUB_CLIENT_ID / OPENBOT_GITHUB_CLIENT_SECRET in the service
+# environment. Comments only — no secrets in this file.
+#
+# Caddy upgrades WebSockets for /v1/push and /v1/takeover by default.
+# MCP is loopback-only (Grok talks to 127.0.0.1, not through this proxy).
+# /fed/v1 is the public federation surface — proxy it (do not 404).
+# Two-VM walkthrough: docs/host-service.md
+
+desk.example.com {
+	handle /mcp/v1* {
+		respond 404
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8787
+	}
+}

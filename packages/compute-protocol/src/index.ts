@@ -52,6 +52,11 @@ export type EnsureHarnessRequest = {
   permissionMode: "ask" | "auto" | "always-approve";
   model?: string;
   reasoningEffort?: string;
+  role?: "desk" | "gateway";
+  orgId?: string;
+  orgSlug?: string;
+  idleTtlMs?: number;
+  omitCdp?: boolean;
 };
 
 export type PromptResult = {

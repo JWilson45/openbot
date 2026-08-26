@@ -1,10 +1,17 @@
 import { join } from "node:path";
-import { id, now, purgeExpiredArchivedBots, type OpenbotDb, type TurnRow } from "@openbot/db";
+import { id, now, purgeExpiredArchivedBots, purgeExpiredOrgInbox, type OpenbotDb, type TurnRow } from "@openbot/db";
 import { appendLiveWork, buildThreadDigest, insertMessage, promote, wrapPromptWithDigest } from "@openbot/live-work";
 import { mintMcpToken, persistMcpToken, type McpInflight } from "@openbot/mcp-send-message";
 import { open, type Envelope } from "@openbot/vault";
-import { LocalHostRunner } from "@openbot/runner";
+import {
+  acpIdleTtlMs,
+  deleteBotProject,
+  gatewayAcpIdleTtlMs,
+  LocalHostRunner,
+} from "@openbot/runner";
 import { DEFAULT_GROK_MODEL, DEFAULT_REASONING_EFFORT, grokCliSignedIn } from "@openbot/acp-grok";
+import { currentOrgMeta, FEDERATION_OFF_NOTICE, federationEffective } from "./org.ts";
+import { maybeEnqueueGatewayDrain } from "./inbox.ts";
 
 export type EngineOpts = {
   db: OpenbotDb;
@@ -40,7 +47,17 @@ export class TurnEngine {
         this.opts.onPush(accountId, { type: "live_work", turnId: turn.id, event: ev });
         if (ev.kind === "permission_request") {
           const reqId = String((ev.payload as { reqId?: string }).reqId ?? "");
-          if (r.permissionMode === "ask") {
+          const client = botId ? r.acpFor(botId) : r.acp;
+          const handler = client?.permissionHandler;
+          if (handler) {
+            void Promise.resolve(handler(ev)).then(
+              (res) => r.respondPermission(reqId, res.allow),
+              () => r.respondPermission(reqId, false),
+            );
+            return;
+          }
+          const mode = client?.permissionMode ?? r.permissionMode;
+          if (mode === "ask") {
             this.opts.onPush(accountId, {
               type: "permission_request",
               turnId: turn.id,
@@ -58,9 +75,66 @@ export class TurnEngine {
   }
 
   kick(): void {
-    this.reapOrphans();
-    purgeExpiredArchivedBots(this.opts.db);
+    this.maintenance();
     void this.loop();
+  }
+
+  /** Reap orphans, idle ACPs, archived bots, and expired inbox rows. Does not start turns. */
+  maintenance(): void {
+    this.reapOrphans();
+    this.reapIdleHarnesses();
+    this.purgeExpiredArchives();
+    purgeExpiredOrgInbox(this.opts.db);
+  }
+
+  maybeKickGatewayDrain(gatewayBotId: string, finishedTurnId?: string): void {
+    const result = maybeEnqueueGatewayDrain(this.opts.db, gatewayBotId, finishedTurnId);
+    const bot = this.opts.db.get<{ account_id: string }>("SELECT account_id FROM bots WHERE id = ?", [
+      gatewayBotId,
+    ]);
+    if (bot) {
+      for (const m of result.push) {
+        if (m.origin === "prompt") continue;
+        this.opts.onPush(bot.account_id, { type: "message.created", message: m });
+      }
+    }
+    if (result.kick) this.kick();
+  }
+
+  /** DB-purge expired archives, then best-effort delete each `desk/projects/<id>` only (not isolation). */
+  purgeExpiredArchives(accountId?: string): string[] {
+    const ids = purgeExpiredArchivedBots(this.opts.db, accountId);
+    const desk = join(this.opts.home, "desk");
+    for (const botId of ids) {
+      try {
+        deleteBotProject(desk, botId);
+      } catch {
+        /* best-effort; the bot row is already gone */
+      }
+    }
+    return ids;
+  }
+
+  reapIdleHarnesses(): void {
+    const federationOff = !federationEffective(currentOrgMeta(this.opts.db));
+    for (const runner of this.runners.values()) {
+      const killed = runner.reapIdle(Date.now(), { federationOff });
+      for (const botId of killed) {
+        this.opts.db.run(
+          "UPDATE harness_sessions SET state = 'ended', ended_at = ? WHERE bot_id = ? AND ended_at IS NULL",
+          [now(), botId],
+        );
+      }
+    }
+  }
+
+  stopGatewayAcps(): void {
+    const rows = this.opts.db.all<{ id: string; account_id: string }>(
+      `SELECT id, account_id FROM bots WHERE IFNULL(role, 'desk') = 'gateway' AND status = 'active'`,
+    );
+    for (const row of rows) {
+      this.runners.get(row.account_id)?.invalidateAcp(row.id);
+    }
   }
 
   /** Turns left `running` after a process crash/restart would block the bot's queue forever. */
@@ -85,10 +159,12 @@ export class TurnEngine {
       ]);
       if (bot) {
         this.opts.onPush(bot.account_id, { type: "turn.updated", turnId: turn.id, status: "failed" });
-        const msgs = this.opts.db.all("SELECT * FROM messages WHERE turn_id = ? ORDER BY created_at", [
-          turn.id,
-        ]);
+        const msgs = this.opts.db.all<{ origin: string }>(
+          "SELECT * FROM messages WHERE turn_id = ? ORDER BY created_at",
+          [turn.id],
+        );
         for (const m of msgs) {
+          if (m.origin === "prompt") continue; // per-turn clones, not transcript bubbles
           this.opts.onPush(bot.account_id, { type: "message.created", message: m });
         }
       }
@@ -148,10 +224,11 @@ export class TurnEngine {
       permission_mode: string;
       model: string | null;
       reasoning_effort: string | null;
+      role: string | null;
     }>("SELECT * FROM bots WHERE id = ?", [turn.bot_id]);
     if (!bot) return;
 
-    const thread = this.opts.db.get<{ id: string; account_id: string }>(
+    const thread = this.opts.db.get<{ id: string; account_id: string; kind: string; title: string }>(
       "SELECT * FROM threads WHERE id = ?",
       [turn.thread_id],
     );
@@ -161,9 +238,42 @@ export class TurnEngine {
       "SELECT * FROM compute_instances WHERE account_id = ?",
       [bot.account_id],
     );
+    const isGateway = bot.role === "gateway";
+    const org = currentOrgMeta(this.opts.db);
     const runner = this.runnerFor(bot.account_id);
     runner.permissionMode = (bot.permission_mode as typeof runner.permissionMode) || "auto";
     await runner.ensure(bot.account_id);
+    const cwd = isGateway ? runner.ensureGatewayWorkspace() : runner.ensureProject(bot.id, bot.name);
+
+    if (isGateway && !federationEffective(org)) {
+      runner.invalidateAcp(bot.id);
+      this.opts.db.run("UPDATE turns SET status = 'running', started_at = ? WHERE id = ?", [
+        now(),
+        turn.id,
+      ]);
+      this.opts.onPush(bot.account_id, { type: "turn.updated", turnId: turn.id, status: "running" });
+      insertMessage(this.opts.db, {
+        threadId: turn.thread_id,
+        turnId: turn.id,
+        role: "system",
+        origin: "system",
+        body: FEDERATION_OFF_NOTICE,
+      });
+      // skip promote() empty-turn placeholder; the system line is the reply
+      this.opts.db.run("UPDATE turns SET sent_message_count = 1 WHERE id = ?", [turn.id]);
+      promote(this.opts.db, turn.id, { kind: "acp_done", stopReason: "end_turn", assistantText: "" });
+      this.opts.onPush(bot.account_id, { type: "turn.updated", turnId: turn.id, status: "completed" });
+      const msgs = this.opts.db.all<{ origin: string }>(
+        "SELECT * FROM messages WHERE turn_id = ? ORDER BY created_at",
+        [turn.id],
+      );
+      for (const m of msgs) {
+        if (m.origin === "prompt") continue;
+        this.opts.onPush(bot.account_id, { type: "message.created", message: m });
+      }
+      this.maybeKickGatewayDrain(bot.id, turn.id);
+      return;
+    }
 
     const cred = this.opts.db.get<{ ciphertext: Uint8Array; dek_wrapped: Uint8Array; key_id: string }>(
       "SELECT ciphertext, dek_wrapped, key_id FROM credentials WHERE account_id = ? AND kind = 'xai_api_key'",
@@ -223,6 +333,7 @@ export class TurnEngine {
       this.opts.db.run("UPDATE turns SET status = 'running' WHERE id = ?", [turn.id]);
       promote(this.opts.db, turn.id, { kind: "crash", assistantText: "" });
       this.opts.onPush(bot.account_id, { type: "turn.updated", turnId: turn.id, status: "failed" });
+      if (isGateway) this.maybeKickGatewayDrain(bot.id, turn.id);
       return;
     }
 
@@ -262,12 +373,17 @@ export class TurnEngine {
         env: apiKey ? { XAI_API_KEY: apiKey } : {},
         mcpUrl,
         mcpToken: token,
-        cwd: runner.desk,
+        cwd,
         botName: bot.name,
         botDescription: bot.description,
         permissionMode: bot.permission_mode as "ask" | "auto" | "always-approve",
         model,
         reasoningEffort,
+        role: isGateway ? "gateway" : "desk",
+        orgId: org?.org_id,
+        orgSlug: org?.slug,
+        idleTtlMs: isGateway ? gatewayAcpIdleTtlMs() : acpIdleTtlMs(),
+        omitCdp: isGateway,
       });
       this.opts.db.run("UPDATE harness_sessions SET acp_session_id = ? WHERE id = ?", [
         runner.acpSessionId ?? null,
@@ -279,6 +395,9 @@ export class TurnEngine {
         [turn.id],
       );
       let prompt = userMsg?.body ?? "";
+      if (thread.kind === "group") {
+        prompt = `Group thread "${thread.title}". To speak here call SendToThread. SendMessage still DMs the human privately. SendToAgent is 1:1, not this group.\n\n${prompt}`;
+      }
       if (!warm) {
         const digest = buildThreadDigest(this.opts.db, {
           threadId: turn.thread_id,
@@ -310,10 +429,15 @@ export class TurnEngine {
       turnId: turn.id,
       status: updated?.status,
     });
-    const msgs = this.opts.db.all("SELECT * FROM messages WHERE turn_id = ? ORDER BY created_at", [turn.id]);
+    const msgs = this.opts.db.all<{ origin: string }>(
+      "SELECT * FROM messages WHERE turn_id = ? ORDER BY created_at",
+      [turn.id],
+    );
     for (const m of msgs) {
+      if (m.origin === "prompt") continue;
       this.opts.onPush(bot.account_id, { type: "message.created", message: m });
     }
+    if (isGateway) this.maybeKickGatewayDrain(bot.id, turn.id);
   }
 }
 

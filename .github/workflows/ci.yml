@@ -1,6 +1,5 @@
 name: ci
 on:
-  push:
   pull_request:
 jobs:
   test:
@@ -10,3 +9,5 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - run: bun test
+      - run: bun run build:binary
+      - run: ./dist/openbot-linux-x64 version

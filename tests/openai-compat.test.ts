@@ -111,6 +111,34 @@ describe("openai-compatible api", () => {
     }
   });
 
+  test("GET /v1/models lists openbot/Gateway and UUID; GET /v1/bots.bots does not", async () => {
+    process.env.OPENBOT_ACP_COMMAND = fakeAgentCommand();
+    const { ctx, server, origin } = startTestServer({ home: tempHome() });
+    try {
+      const { cookie } = loginCookie({ ctx }, "alice");
+      await setupAda(origin, cookie);
+      const minted = await mintKey(origin, cookie);
+      const roster = (await fetch(`${origin}/v1/bots`, { headers: { cookie } }).then((r) => r.json())) as {
+        bots: Array<{ id: string; name: string }>;
+        gateway: { id: string; name: string } | null;
+      };
+      expect(roster.gateway).toBeTruthy();
+      expect(roster.bots.map((b) => b.name)).toContain("Ada");
+      expect(roster.bots.some((b) => b.id === roster.gateway!.id || b.name === roster.gateway!.name)).toBe(false);
+
+      const res = await fetch(`${origin}/v1/models`, {
+        headers: { authorization: `Bearer ${minted.token}` },
+      });
+      expect(res.status).toBe(200);
+      const ids = ((await res.json()) as ModelsList).data.map((m) => m.id);
+      expect(ids).toContain("openbot/Ada");
+      expect(ids).toContain(`openbot/${roster.gateway!.name}`);
+      expect(ids).toContain(roster.gateway!.id);
+    } finally {
+      server.stop(true);
+    }
+  });
+
   test("OPTIONS /v1/chat/completions returns CORS allow headers", async () => {
     const { server, origin } = startTestServer({ home: tempHome() });
     try {

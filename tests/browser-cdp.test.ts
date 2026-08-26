@@ -88,7 +88,7 @@ describe("CDP + takeover", () => {
     if (chromeError) {
       console.log(JSON.stringify({ chromeError, log }));
     }
-  });
+  }, 30_000);
 });
 
 async function takeoverSession(

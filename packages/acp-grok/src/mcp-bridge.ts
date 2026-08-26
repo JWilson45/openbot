@@ -2,37 +2,32 @@
 /**
  * Stdio MCP bridge: agent talks stdio MCP, we forward JSON-RPC to Streamable HTTP.
  * Used when the harness lacks mcpCapabilities.http.
+ * Compiled binaries expose this as `openbot mcp-bridge <url> <token>`.
  */
-const url = process.argv[2];
-const token = process.argv[3];
-if (!url || !token) {
-  console.error("usage: mcp-bridge <url> <token>");
-  process.exit(1);
-}
 
-let buf = Buffer.alloc(0);
-const stdin = Bun.stdin.stream().getReader();
+export async function runMcpBridge(url: string, token: string): Promise<void> {
+  let buf = Buffer.alloc(0);
+  const stdin = Bun.stdin.stream().getReader();
 
-function send(msg: unknown): void {
-  const body = Buffer.from(JSON.stringify(msg), "utf8");
-  process.stdout.write(`Content-Length: ${body.length}\r\n\r\n`);
-  process.stdout.write(body);
-}
+  function send(msg: unknown): void {
+    const body = Buffer.from(JSON.stringify(msg), "utf8");
+    process.stdout.write(`Content-Length: ${body.length}\r\n\r\n`);
+    process.stdout.write(body);
+  }
 
-async function forward(rpc: unknown): Promise<void> {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(rpc),
-  });
-  const json = await res.json().catch(() => ({}));
-  send(json);
-}
+  async function forward(rpc: unknown): Promise<void> {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(rpc),
+    });
+    const json = await res.json().catch(() => ({}));
+    send(json);
+  }
 
-async function loop(): Promise<void> {
   while (true) {
     const { done, value } = await stdin.read();
     if (done) break;
@@ -56,4 +51,12 @@ async function loop(): Promise<void> {
   }
 }
 
-void loop();
+if (import.meta.main) {
+  const url = process.argv[2];
+  const token = process.argv[3];
+  if (!url || !token) {
+    console.error("usage: mcp-bridge <url> <token>");
+    process.exit(1);
+  }
+  await runMcpBridge(url, token);
+}

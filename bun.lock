@@ -10,6 +10,7 @@
         "@openbot/auth": "workspace:*",
         "@openbot/compute-protocol": "workspace:*",
         "@openbot/db": "workspace:*",
+        "@openbot/federation": "workspace:*",
         "@openbot/live-work": "workspace:*",
         "@openbot/mcp-send-message": "workspace:*",
         "@openbot/runner": "workspace:*",
@@ -34,6 +35,7 @@
         "@openbot/api-types": "workspace:*",
         "@openbot/auth": "workspace:*",
         "@openbot/db": "workspace:*",
+        "@openbot/federation": "workspace:*",
         "@openbot/live-work": "workspace:*",
         "@openbot/mcp-send-message": "workspace:*",
         "@openbot/runner": "workspace:*",
@@ -70,6 +72,10 @@
       "name": "@openbot/db",
       "version": "0.1.0",
     },
+    "packages/federation": {
+      "name": "@openbot/federation",
+      "version": "0.1.0",
+    },
     "packages/live-work": {
       "name": "@openbot/live-work",
       "version": "0.1.0",
@@ -84,6 +90,7 @@
       "dependencies": {
         "@openbot/api-types": "workspace:*",
         "@openbot/db": "workspace:*",
+        "@openbot/federation": "workspace:*",
         "@openbot/live-work": "workspace:*",
       },
     },
@@ -110,6 +117,8 @@
     "@openbot/compute-protocol": ["@openbot/compute-protocol@workspace:packages/compute-protocol"],
 
     "@openbot/db": ["@openbot/db@workspace:packages/db"],
+
+    "@openbot/federation": ["@openbot/federation@workspace:packages/federation"],
 
     "@openbot/live-work": ["@openbot/live-work@workspace:packages/live-work"],
 

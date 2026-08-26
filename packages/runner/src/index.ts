@@ -9,6 +9,32 @@ import type {
   PromptResult,
 } from "@openbot/compute-protocol";
 import { AcpClient, DEFAULT_GROK_MODEL, DEFAULT_REASONING_EFFORT, prepareIsolatedGrokHome } from "@openbot/acp-grok";
+import { botProjectDir, deleteBotProject, ensureBotProject, ensureGatewayWorkspace } from "./workspace.ts";
+
+export const DEFAULT_ACP_IDLE_MS = 10 * 60 * 1000;
+export const DEFAULT_GATEWAY_ACP_IDLE_MS = 30 * 60 * 1000;
+
+function envTtlMs(raw: string | undefined, fallback: number): number {
+  if (raw == null || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return n;
+}
+
+export function acpIdleTtlMs(): number {
+  return envTtlMs(process.env.OPENBOT_ACP_IDLE_MS, DEFAULT_ACP_IDLE_MS);
+}
+
+export function gatewayAcpIdleTtlMs(): number {
+  return envTtlMs(process.env.OPENBOT_GATEWAY_ACP_IDLE_MS, DEFAULT_GATEWAY_ACP_IDLE_MS);
+}
+
+type AcpSlot = {
+  client: AcpClient;
+  botId: string;
+  idleTtlMs: number;
+  role: "desk" | "gateway";
+};
 
 type CdpConn = {
   ws: WebSocket;
@@ -30,10 +56,18 @@ export type BrowserHandle = {
 
 export type PermissionHandler = (req: LiveWorkEvent) => Promise<{ allow: boolean }>;
 
+/** Gateway spike: deny execute/shell. Not isolation; ACP-native bash can still exist. */
+export function denyGatewayExec(ev: LiveWorkEvent): Promise<{ allow: boolean }> {
+  const toolCall = ev.payload.toolCall as { kind?: string } | undefined;
+  const kind = String(toolCall?.kind ?? "").toLowerCase();
+  if (kind === "execute" || kind === "shell") return Promise.resolve({ allow: false });
+  return Promise.resolve({ allow: false });
+}
+
 export class LocalHostRunner implements ComputeContract, ComputeDriver {
   harness: "down" | "starting" | "idle" | "in_turn" | "crashed" = "down";
   acp: AcpClient | null = null;
-  readonly acps = new Map<string, AcpClient>();
+  readonly acps = new Map<string, AcpSlot>();
   browser: BrowserHandle | null = null;
   harnessSessionId?: string;
   acpSessionId?: string;
@@ -57,6 +91,22 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
 
   get desk(): string {
     return join(this.home, "desk");
+  }
+
+  projectDir(botId: string): string {
+    return botProjectDir(this.desk, botId);
+  }
+
+  ensureProject(botId: string, name: string): string {
+    return ensureBotProject(this.desk, botId, name);
+  }
+
+  ensureGatewayWorkspace(): string {
+    return ensureGatewayWorkspace(this.desk);
+  }
+
+  deleteProject(botId: string): void {
+    deleteBotProject(this.desk, botId);
   }
 
   async ensure(_accountId: string): Promise<{ id: string; workspacePath: string }> {
@@ -175,7 +225,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
       if (this.harness === "down" || this.harness === "crashed") this.harness = "idle";
     }
     if (req.op === "stop") {
-      for (const c of this.acps.values()) await c.kill();
+      for (const slot of this.acps.values()) await slot.client.kill();
       this.acps.clear();
       this.acp = null;
       this.harness = "down";
@@ -292,15 +342,15 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   }
 
   acpFor(botId: string): AcpClient | null {
-    return this.acps.get(botId) ?? null;
+    return this.acps.get(botId)?.client ?? null;
   }
 
   acpPid(botId: string): number | undefined {
-    return this.acps.get(botId)?.pid;
+    return this.acps.get(botId)?.client.pid;
   }
 
   matchesHarness(botId: string, model?: string, reasoningEffort?: string): boolean {
-    const existing = this.acps.get(botId);
+    const existing = this.acps.get(botId)?.client;
     if (!existing || existing.closed || !existing.sessionId || this.harness === "crashed") return false;
     const wantModel = model || DEFAULT_GROK_MODEL;
     const wantEffort = reasoningEffort || DEFAULT_REASONING_EFFORT;
@@ -308,15 +358,36 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   }
 
   invalidateAcp(botId: string): void {
-    const client = this.acps.get(botId);
-    if (!client) return;
-    if (this.acp === client && this.harness === "in_turn") return;
-    void client.kill();
+    const slot = this.acps.get(botId);
+    if (!slot) return;
+    if (this.acp === slot.client && this.harness === "in_turn") return;
+    void slot.client.kill();
     this.acps.delete(botId);
-    if (this.acp === client) {
+    if (this.acp === slot.client) {
       this.acp = null;
       this.acpSessionId = undefined;
     }
+  }
+
+  reapIdle(now = Date.now(), opts?: { federationOff?: boolean }): string[] {
+    const killed: string[] = [];
+    for (const [botId, slot] of this.acps) {
+      const client = slot.client;
+      if (client.closed) continue;
+      if (this.acp === client && this.harness === "in_turn") continue;
+      const federationKill = opts?.federationOff && slot.role === "gateway";
+      // Desk OPENBOT_ACP_IDLE_MS=0 disables desk idle kill only.
+      if (!federationKill && slot.idleTtlMs === 0) continue;
+      if (!federationKill && client.lastActivityAt + slot.idleTtlMs > now) continue;
+      void client.kill();
+      this.acps.delete(botId);
+      if (this.acp === client) {
+        this.acp = null;
+        this.acpSessionId = undefined;
+      }
+      killed.push(botId);
+    }
+    return killed;
   }
 
   async ensureHarness(req: EnsureHarnessRequest): Promise<void> {
@@ -327,16 +398,25 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     const model = req.model || DEFAULT_GROK_MODEL;
     const reasoningEffort = req.reasoningEffort || DEFAULT_REASONING_EFFORT;
     const existing = this.acps.get(req.botId);
+    const role = req.role === "gateway" ? "gateway" : "desk";
+    const idleTtlMs = req.idleTtlMs ?? (role === "gateway" ? gatewayAcpIdleTtlMs() : acpIdleTtlMs());
+    const permissionHandler = role === "gateway" ? denyGatewayExec : undefined;
     if (this.matchesHarness(req.botId, model, reasoningEffort)) {
-      this.acp = existing!;
-      this.acpSessionId = existing!.sessionId;
+      const client = existing!.client;
+      existing!.idleTtlMs = idleTtlMs;
+      existing!.role = role;
+      client.permissionMode = req.permissionMode;
+      client.permissionHandler = permissionHandler;
+      this.acp = client;
+      this.acpSessionId = client.sessionId;
       this.harness = "idle";
+      client.lastActivityAt = Date.now();
       for (const k of Object.keys(this.lastEnv)) this.lastEnv[k] = "";
       return;
     }
     this.harness = "starting";
     try {
-      if (existing) await existing.kill();
+      if (existing) await existing.client.kill();
       const grokHome = prepareIsolatedGrokHome(this.home);
       const spawnEnv: Record<string, string> = {
         ...processEnvSansSecrets(),
@@ -347,21 +427,24 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
         GROK_CURSOR_MCPS_ENABLED: "0",
         GROK_CLAUDE_MCPS_ENABLED: "0",
         GROK_SUBAGENTS: "0",
-        OPENBOT_CDP_URL: this.browser?.cdpUrl ?? "",
         OPENBOT_MCP_URL: req.mcpUrl,
         OPENBOT_MCP_TOKEN: req.mcpToken,
         GROK_CONFIG: JSON.stringify({
           models: { default: model, default_reasoning_effort: reasoningEffort },
         }),
       };
+      if (req.omitCdp) delete spawnEnv.OPENBOT_CDP_URL;
+      else spawnEnv.OPENBOT_CDP_URL = this.browser?.cdpUrl ?? "";
       const client = AcpClient.launch({
         cwd: req.cwd,
         env: spawnEnv,
         model,
         reasoningEffort,
+        permissionMode: req.permissionMode,
+        permissionHandler,
         onEvent: (ev) => this.onLiveWork?.({ ...ev, botId: req.botId }, req.botId),
       });
-      this.acps.set(req.botId, client);
+      this.acps.set(req.botId, { client, botId: req.botId, idleTtlMs, role });
       this.acp = client;
       for (const k of Object.keys(env)) {
         delete spawnEnv[k];
@@ -381,13 +464,15 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   }
 
   async prompt(text: string, botId?: string): Promise<PromptResult> {
-    const client = botId ? this.acps.get(botId) : this.acp;
+    const client = botId ? this.acps.get(botId)?.client : this.acp;
     if (!client) throw new Error("harness not started");
+    client.lastActivityAt = Date.now();
     this.harness = "in_turn";
     this.acp = client;
     try {
       const result = await client.prompt(text);
       this.harness = "idle";
+      client.lastActivityAt = Date.now();
       return result;
     } catch (err) {
       this.harness = "crashed";
@@ -460,8 +545,8 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   }
 
   respondPermission(reqId: string, allow: boolean): boolean {
-    for (const c of this.acps.values()) {
-      if (c.respondPermission(reqId, allow)) return true;
+    for (const slot of this.acps.values()) {
+      if (slot.client.respondPermission(reqId, allow)) return true;
     }
     return this.acp?.respondPermission(reqId, allow) ?? false;
   }
@@ -674,3 +759,11 @@ async function cdpInput(cdpHttp: string, event: Record<string, unknown>): Promis
 }
 
 export { findChrome };
+export {
+  botProjectDir,
+  deleteBotProject,
+  ensureBotProject,
+  ensureGatewayWorkspace,
+  gatewayWorkspaceDir,
+  isInsideDesk,
+} from "./workspace.ts";

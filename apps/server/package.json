@@ -7,6 +7,7 @@
     "@openbot/api-types": "workspace:*",
     "@openbot/auth": "workspace:*",
     "@openbot/db": "workspace:*",
+    "@openbot/federation": "workspace:*",
     "@openbot/live-work": "workspace:*",
     "@openbot/mcp-send-message": "workspace:*",
     "@openbot/runner": "workspace:*",

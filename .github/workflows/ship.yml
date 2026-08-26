@@ -1,0 +1,51 @@
+# Merge to the default branch: if package.json version has no matching v* tag,
+# create it and run release.yml. GITHUB_TOKEN tag pushes do not trigger other
+# workflows, so this calls release.yml directly.
+name: ship
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  maybe-tag:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: check
+        run: |
+          set -euo pipefail
+          git fetch --tags --force origin
+          VERSION="$(jq -r .version package.json)"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "package.json version missing" >&2
+            exit 1
+          fi
+          TAG="v${VERSION}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "${TAG} already exists; skip release"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "${TAG}"
+          git push origin "refs/tags/${TAG}"
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "created ${TAG}"
+  release:
+    needs: maybe-tag
+    if: needs.maybe-tag.outputs.should_release == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.maybe-tag.outputs.tag }}
+    secrets: inherit
+    permissions:
+      contents: write

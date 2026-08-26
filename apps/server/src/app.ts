@@ -9,8 +9,8 @@ import {
   OpenbotDb,
   deleteBotPermanently,
   id,
+  isGatewayRole,
   now,
-  purgeExpiredArchivedBots,
   type TurnRow,
 } from "@openbot/db";
 import {
@@ -25,14 +25,46 @@ import {
   type SessionInfo,
 } from "@openbot/auth";
 import { loadOrCreateMasterKey, open, seal, RedactingLogger } from "@openbot/vault";
-import { approveMessage, handleMcpJsonRpc, McpInflight, rejectMessage } from "@openbot/mcp-send-message";
-import { McpError } from "@openbot/api-types";
+import {
+  approveMessage,
+  handleMcpJsonRpc,
+  McpInflight,
+  queueGroupMentions,
+  rejectMessage,
+} from "@openbot/mcp-send-message";
+import { McpError, addThreadParticipantInput, createGroupThreadInput, postMessageInput } from "@openbot/api-types";
 import { insertMessage, parseLivePayload, promote, summarizeLiveEvent } from "@openbot/live-work";
 import { sha256Hex } from "@openbot/db";
 import { detectCliLogins, listGrokModels, resolveBotInference } from "@openbot/acp-grok";
+import { FED_MAX_REQUEST_BYTES } from "@openbot/federation";
 import { SPA_HTML } from "./spa.ts";
 import { TurnEngine } from "./engine.ts";
 import { mountOpenAiCompat } from "./openai.ts";
+import {
+  clientRateKey,
+  currentOrgMeta,
+  deleteOrgPeer,
+  disableOrgPeer,
+  ensureOrgAccount,
+  ensureOrgKeypair,
+  ensureOrgMeta,
+  federationEffective,
+  fedInfoPayload,
+  FED_INFO_RATE_LIMIT,
+  FED_INFO_RATE_WINDOW_MS,
+  fetchPeerFedInfo,
+  insertOrgPeer,
+  listOrgPeers,
+  loadOrgKeypair,
+  OrgPeerError,
+  orgMemberSnapshot,
+  orgPeerPublic,
+  parsePeerBaseUrl,
+  setFederationEnabled,
+  SlidingWindowRateLimiter,
+} from "./org.ts";
+import { findActiveGateway, provisionOrgGateway } from "./gateway.ts";
+import { handleFedInbound, parseContentLength, readCappedBody } from "./inbox.ts";
 
 export type HomeConfig = {
   home: string;
@@ -42,6 +74,7 @@ export type HomeConfig = {
   publicOrigin?: string;
   logger?: RedactingLogger;
   devLogin?: boolean;
+  env?: Record<string, string | undefined>;
 };
 
 export type AppContext = {
@@ -58,21 +91,46 @@ export type AppContext = {
   publicOrigin: string;
   push: Map<string, Set<ServerWebSocket>>;
   devLogin: boolean;
+  maintenanceTimer?: ReturnType<typeof setInterval>;
 };
 
 function cookies(c: { req: { header: (n: string) => string | undefined } }): string | undefined {
   return parseCookie(c.req.header("cookie"));
 }
 
-export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready: () => void } {
+const VISIBLE_MESSAGES_SQL =
+  "SELECT * FROM messages WHERE thread_id = ? AND origin != 'prompt' ORDER BY created_at";
+
+function groupMeetsMinimum(botCount: number, principalCount: number): boolean {
+  return botCount >= 2 || principalCount >= 3;
+}
+
+export function createApp(cfg: HomeConfig): {
+  app: Hono;
+  ctx: AppContext;
+  ready: () => void;
+  stop: () => void;
+} {
   mkdirSync(cfg.home, { recursive: true });
   mkdirSync(join(cfg.home, "desk"), { recursive: true });
   const db = OpenbotDb.open(join(cfg.home, "openbot.sqlite"));
-  const master = loadOrCreateMasterKey(cfg.home, process.env.OPENBOT_MASTER_KEY);
-  const allowlist = loadAllowlist(cfg.home, process.env.OPENBOT_GITHUB_ALLOWLIST);
+  const advertisedOrigin = cfg.publicOrigin ?? `http://127.0.0.1:${cfg.port}`;
+  const org = ensureOrgMeta(db, {
+    env: cfg.env ?? process.env,
+    file: join(cfg.home, "org.json"),
+    publicOrigin: cfg.publicOrigin,
+    advertisedOrigin,
+  });
   const log = cfg.logger ?? new RedactingLogger();
+  ensureOrgAccount(db, log);
+  provisionOrgGateway(db, cfg.home);
+  const master = loadOrCreateMasterKey(cfg.home, process.env.OPENBOT_MASTER_KEY);
+  ensureOrgKeypair(cfg.home, master, db);
+  const allowlist = loadAllowlist(cfg.home, process.env.OPENBOT_GITHUB_ALLOWLIST);
   const inflight = new McpInflight();
   const push = new Map<string, Set<ServerWebSocket>>();
+  const fedInfoLimiter = new SlidingWindowRateLimiter(FED_INFO_RATE_LIMIT, FED_INFO_RATE_WINDOW_MS);
+  const fedUntrustedLimiter = new SlidingWindowRateLimiter(FED_INFO_RATE_LIMIT, FED_INFO_RATE_WINDOW_MS);
 
   const ctx: AppContext = {
     db,
@@ -85,12 +143,17 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
     port: cfg.port,
     githubClientId: cfg.githubClientId ?? process.env.OPENBOT_GITHUB_CLIENT_ID,
     githubClientSecret: cfg.githubClientSecret ?? process.env.OPENBOT_GITHUB_CLIENT_SECRET,
-    publicOrigin: cfg.publicOrigin ?? `http://127.0.0.1:${cfg.port}`,
+    publicOrigin: org.public_origin || advertisedOrigin,
     push,
     devLogin: cfg.devLogin ?? process.env.OPENBOT_DEV_LOGIN === "1",
   };
 
   const onPush = (accountId: string, event: unknown) => {
+    if (event && typeof event === "object") {
+      const ev = event as { type?: string; message?: { origin?: string } };
+      // Group prompt clones are per-turn engine input, not transcript bubbles.
+      if (ev.type === "message.created" && ev.message?.origin === "prompt") return;
+    }
     const set = push.get(accountId);
     if (!set) return;
     const payload = JSON.stringify(event);
@@ -111,6 +174,8 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
     mcpPort: () => ctx.port,
     onPush,
   });
+  ctx.maintenanceTimer = setInterval(() => ctx.engine.maintenance(), 30_000);
+  ctx.maintenanceTimer.unref();
 
   const { upgradeWebSocket, websocket } = createBunWebSocket<ServerWebSocket>();
   const app = new Hono();
@@ -130,6 +195,7 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
     throw err;
   });
 
+  // Cookie or bearer session — not sk-ob_ keys (org credential for OpenAI clients).
   function requireSession(c: { req: { header: (n: string) => string | undefined } }): SessionInfo {
     const s =
       sessionFromToken(db, cookies(c)) ?? sessionFromToken(db, parseBearer(c.req.header("authorization")));
@@ -148,6 +214,56 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
     } catch (err) {
       return c.json({ ok: false, error: String(err) }, 503);
     }
+  });
+
+  app.get("/fed/v1/info", (c) => {
+    const key = clientRateKey(bunRequestIp(c.env, c.req.raw), c.req.header("x-forwarded-for"));
+    if (!fedInfoLimiter.take(key)) return c.json({ error: "rate_limited" }, 429);
+    const row = currentOrgMeta(db);
+    if (!row) return c.json({ error: "no_org" }, 500);
+    const gw = row.account_id ? findActiveGateway(db, row.account_id) : undefined;
+    return c.json(fedInfoPayload(row, gw ? { name: gw.name } : null));
+  });
+
+  app.post("/fed/v1/messages", async (c) => {
+    if (c.req.header("cookie") && !parseBearer(c.req.header("authorization"))) {
+      return c.json({ error: "cookies_not_accepted" }, 401);
+    }
+    const cl = parseContentLength(c.req.header("content-length"));
+    if (cl == null || cl > FED_MAX_REQUEST_BYTES) {
+      return c.json({ error: "too_large" }, 413);
+    }
+    const raw = await readCappedBody(c.req.raw, FED_MAX_REQUEST_BYTES);
+    if (raw === "too_large") return c.json({ error: "too_large" }, 413);
+    const rawBody = Buffer.from(raw).toString("utf8");
+    let json: unknown;
+    try {
+      json = JSON.parse(rawBody);
+    } catch {
+      json = null;
+      const key = clientRateKey(bunRequestIp(c.env, c.req.raw), c.req.header("x-forwarded-for"));
+      if (!fedUntrustedLimiter.take(key)) return c.json({ error: "rate_limited" }, 429);
+      return c.json({ error: "invalid_json" }, 400);
+    }
+    const clientIp = bunRequestIp(c.env, c.req.raw);
+    const rateKey = clientRateKey(clientIp, c.req.header("x-forwarded-for"));
+    const result = handleFedInbound(db, {
+      rawBody,
+      json,
+      authorization: c.req.header("authorization"),
+      idempotencyKey: c.req.header("idempotency-key"),
+      clientIp,
+      takeUntrusted: () => fedUntrustedLimiter.take(rateKey),
+    });
+    for (const msg of result.push) {
+      if (msg.origin === "prompt") continue;
+      if (result.accountId) onPush(result.accountId, { type: "message.created", message: msg });
+    }
+    if (result.kick) ctx.engine.kick();
+    return c.json(
+      result.body,
+      result.status as 200 | 202 | 400 | 401 | 403 | 413 | 429 | 503,
+    );
   });
 
   app.get("/", (c) => c.html(SPA_HTML));
@@ -197,6 +313,7 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
         name: user.name,
         email: user.email,
       });
+      provisionOrgGateway(db, cfg.home);
       c.header("Set-Cookie", cookieHeader(session.token, ctx.publicOrigin.startsWith("https")));
       return c.redirect("/");
     } catch (err) {
@@ -221,6 +338,7 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
     const login = String(c.req.query("login") ?? "demo").trim().toLowerCase();
     try {
       const session = completeGithubLogin(db, allowlist, { login });
+      provisionOrgGateway(db, cfg.home);
       c.header("Set-Cookie", cookieHeader(session.token, false));
       return c.redirect("/");
     } catch (err) {
@@ -232,25 +350,185 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
   app.get("/v1/me", (c) => {
     try {
       const s = requireSession(c);
+      const org = currentOrgMeta(db);
+      const member = db.get<{ role: string }>("SELECT role FROM org_members WHERE user_id = ?", [s.userId]);
       return c.json({
         githubLogin: s.githubLogin,
         accountId: s.accountId,
         userId: s.userId,
+        orgId: org?.org_id ?? "",
+        orgSlug: org?.slug ?? "",
+        orgName: org?.name ?? "",
+        pubkey: org?.pubkey ?? "",
+        role: member?.role ?? "member",
       });
     } catch {
       return c.json({ error: "unauthorized" }, 401);
     }
   });
 
+  app.get("/v1/org", (c) => {
+    try {
+      requireSession(c);
+      const row = currentOrgMeta(db);
+      if (!row) return c.json({ error: "no_org" }, 500);
+      return c.json(orgMemberSnapshot(row));
+    } catch {
+      return c.json({ error: "unauthorized" }, 401);
+    }
+  });
+
+  app.patch("/v1/org", async (c) => {
+    requireSession(c);
+    const body = (await c.req.json()) as { federationEnabled?: unknown };
+    if ("federationEnabled" in body) {
+      if (typeof body.federationEnabled !== "boolean") {
+        return c.json({ error: "invalid_federation" }, 400);
+      }
+      setFederationEnabled(db, body.federationEnabled);
+      const after = currentOrgMeta(db);
+      if (!federationEffective(after)) ctx.engine.stopGatewayAcps();
+      else if (after?.account_id) {
+        const gw = findActiveGateway(db, after.account_id);
+        if (gw) ctx.engine.maybeKickGatewayDrain(gw.id);
+      }
+    }
+    const row = currentOrgMeta(db);
+    if (!row) return c.json({ error: "no_org" }, 500);
+    return c.json(orgMemberSnapshot(row));
+  });
+
+  app.get("/v1/org/inbox", (c) => {
+    requireSession(c);
+    const rows = db.all<{
+      id: string;
+      message_id: string;
+      from_org_id: string;
+      from_slug: string;
+      to_org_id: string;
+      hop: number;
+      urgency: string;
+      body: string;
+      status: string;
+      acked_turn_id: string | null;
+      acked_at: number | null;
+      created_at: number;
+    }>("SELECT * FROM org_inbox ORDER BY created_at DESC, id DESC LIMIT 100");
+    return c.json({
+      inbox: rows.map((r) => ({
+        id: r.id,
+        messageId: r.message_id,
+        fromOrgId: r.from_org_id,
+        fromSlug: r.from_slug,
+        toOrgId: r.to_org_id,
+        hop: r.hop,
+        urgency: r.urgency,
+        body: r.body,
+        status: r.status,
+        ackedTurnId: r.acked_turn_id,
+        ackedAt: r.acked_at,
+        createdAt: r.created_at,
+      })),
+    });
+  });
+
+  const peerEnv = cfg.env ?? process.env;
+
+  function peerError(err: unknown) {
+    if (err instanceof OrgPeerError) {
+      const status = err.code.startsWith("duplicate") ? 409 : 400;
+      return { error: err.code, status: status as 400 | 409 };
+    }
+    return null;
+  }
+
+  async function readObjectJson(c: { req: { json: () => Promise<unknown> } }) {
+    try {
+      const parsed = await c.req.json();
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+      return parsed as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+
+  app.get("/v1/org/peers", (c) => {
+    requireSession(c);
+    return c.json({ peers: listOrgPeers(db).map(orgPeerPublic) });
+  });
+
+  app.post("/v1/org/peers/from-info", async (c) => {
+    requireSession(c);
+    const body = await readObjectJson(c);
+    if (!body) return c.json({ error: "invalid_json" }, 400);
+    const baseUrl = typeof body.baseUrl === "string" ? body.baseUrl : "";
+    let origin: string;
+    try {
+      origin = parsePeerBaseUrl(baseUrl, peerEnv);
+    } catch (err) {
+      const mapped = peerError(err);
+      if (mapped) return c.json({ error: mapped.error }, mapped.status);
+      throw err;
+    }
+    try {
+      const info = await fetchPeerFedInfo(origin);
+      return c.json(info);
+    } catch (err) {
+      const mapped = peerError(err);
+      if (mapped) return c.json({ error: mapped.error }, mapped.status);
+      return c.json({ error: "info_failed" }, 400);
+    }
+  });
+
+  app.post("/v1/org/peers", async (c) => {
+    requireSession(c);
+    const body = await readObjectJson(c);
+    if (!body) return c.json({ error: "invalid_json" }, 400);
+    try {
+      const row = insertOrgPeer(
+        db,
+        {
+          slug: typeof body.slug === "string" ? body.slug : "",
+          orgId: typeof body.orgId === "string" ? body.orgId : "",
+          baseUrl: typeof body.baseUrl === "string" ? body.baseUrl : "",
+          pubkey: typeof body.pubkey === "string" ? body.pubkey : "",
+          name: typeof body.name === "string" ? body.name : "",
+        },
+        peerEnv,
+      );
+      return c.json(orgPeerPublic(row));
+    } catch (err) {
+      const mapped = peerError(err);
+      if (mapped) return c.json({ error: mapped.error }, mapped.status);
+      throw err;
+    }
+  });
+
+  app.delete("/v1/org/peers/:orgId", (c) => {
+    requireSession(c);
+    const ok = deleteOrgPeer(db, c.req.param("orgId"));
+    if (!ok) return c.json({ error: "not_found" }, 404);
+    return c.json({ ok: true });
+  });
+
+  app.post("/v1/org/peers/:orgId/disable", (c) => {
+    requireSession(c);
+    const row = disableOrgPeer(db, c.req.param("orgId"));
+    if (!row) return c.json({ error: "not_found" }, 404);
+    return c.json(orgPeerPublic(row));
+  });
+
   app.post("/v1/bots", async (c) => {
     const s = requireSession(c);
+    provisionOrgGateway(db, cfg.home);
     const body = await c.req.json();
+    if (body.role != null) return c.json({ error: "invalid_role" }, 400);
     const name = String(body.name ?? "").trim();
     const description = String(body.description ?? "");
     if (!name) return c.json({ error: "name required" }, 400);
     const normalized = name.trim();
     const active = db.get<{ n: number }>(
-      "SELECT COUNT(*) as n FROM bots WHERE account_id = ? AND status = 'active'",
+      "SELECT COUNT(*) AS n FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'desk'",
       [s.accountId],
     );
     if ((active?.n ?? 0) >= MAX_ACTIVE_BOTS) return c.json({ error: "cap" }, 409);
@@ -286,7 +564,9 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
         [threadId, s.accountId, botId, now()],
       );
     });
-    await ctx.engine.runnerFor(s.accountId).ensure(s.accountId);
+    const runner = ctx.engine.runnerFor(s.accountId);
+    await runner.ensure(s.accountId);
+    runner.ensureProject(botId, normalized);
     return c.json({
       bot: {
         id: botId,
@@ -302,16 +582,30 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
 
   app.get("/v1/bots", (c) => {
     const s = requireSession(c);
-    purgeExpiredArchivedBots(db, s.accountId);
-    const bots = db.all("SELECT * FROM bots WHERE account_id = ? AND status = 'active' ORDER BY created_at", [
-      s.accountId,
-    ]);
-    const archived = db.all(
-      "SELECT * FROM bots WHERE account_id = ? AND status = 'archived' ORDER BY archived_at DESC",
+    provisionOrgGateway(db, cfg.home);
+    ctx.engine.purgeExpiredArchives(s.accountId);
+    const bots = db.all(
+      "SELECT * FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'desk' ORDER BY created_at",
       [s.accountId],
     );
+    const archived = db.all(
+      "SELECT * FROM bots WHERE account_id = ? AND status = 'archived' AND IFNULL(role, 'desk') = 'desk' ORDER BY archived_at DESC",
+      [s.accountId],
+    );
+    const gatewayRow = db.get(
+      "SELECT * FROM bots WHERE account_id = ? AND IFNULL(role, 'desk') = 'gateway' AND status = 'active'",
+      [s.accountId],
+    ) as { id: string } | undefined;
+    const org = currentOrgMeta(db);
     return c.json({
       bots: bots.map((b) => ({ ...(b as object), presence: botPresence(ctx, (b as { id: string }).id) })),
+      gateway: gatewayRow
+        ? {
+            ...(gatewayRow as object),
+            presence: botPresence(ctx, gatewayRow.id),
+            enabled: federationEffective(org),
+          }
+        : null,
       archived,
       bot: bots[0] ?? null,
       archiveTtlMs: ARCHIVE_TTL_MS,
@@ -320,11 +614,12 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
 
   app.post("/v1/bots/:id/archive", (c) => {
     const s = requireSession(c);
-    const bot = db.get<{ id: string; name: string; status: string }>(
-      "SELECT id, name, status FROM bots WHERE id = ? AND account_id = ?",
+    const bot = db.get<{ id: string; name: string; status: string; role: string | null }>(
+      "SELECT id, name, status, role FROM bots WHERE id = ? AND account_id = ?",
       [c.req.param("id"), s.accountId],
     );
     if (!bot) return c.json({ error: "not_found" }, 404);
+    if (isGatewayRole(bot.role)) return c.json({ error: "gateway_protected" }, 409);
     if (bot.status !== "active") return c.json({ error: "not_active" }, 409);
     const t = now();
     db.run("UPDATE bots SET status = 'archived', archived_at = ? WHERE id = ?", [t, bot.id]);
@@ -339,15 +634,16 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
 
   app.post("/v1/bots/:id/restore", (c) => {
     const s = requireSession(c);
-    purgeExpiredArchivedBots(db, s.accountId);
-    const bot = db.get<{ id: string; name: string; status: string }>(
-      "SELECT id, name, status FROM bots WHERE id = ? AND account_id = ?",
+    ctx.engine.purgeExpiredArchives(s.accountId);
+    const bot = db.get<{ id: string; name: string; status: string; role: string | null }>(
+      "SELECT id, name, status, role FROM bots WHERE id = ? AND account_id = ?",
       [c.req.param("id"), s.accountId],
     );
     if (!bot) return c.json({ error: "not_found" }, 404);
+    if (isGatewayRole(bot.role)) return c.json({ error: "gateway_protected" }, 409);
     if (bot.status !== "archived") return c.json({ error: "not_archived" }, 409);
     const active = db.get<{ n: number }>(
-      "SELECT COUNT(*) as n FROM bots WHERE account_id = ? AND status = 'active'",
+      "SELECT COUNT(*) AS n FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'desk'",
       [s.accountId],
     );
     if ((active?.n ?? 0) >= MAX_ACTIVE_BOTS) return c.json({ error: "cap" }, 409);
@@ -370,14 +666,20 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
     if (String(body.confirm ?? "").trim().toUpperCase() !== "DELETE") {
       return { status: 400 as const, json: { error: "confirm", message: "Type DELETE to permanently delete" } };
     }
-    const bot = db.get<{ id: string; status: string }>(
-      "SELECT id, status FROM bots WHERE id = ? AND account_id = ?",
+    const bot = db.get<{ id: string; status: string; role: string | null }>(
+      "SELECT id, status, role FROM bots WHERE id = ? AND account_id = ?",
       [c.req.param("id"), accountId],
     );
     if (!bot) return { status: 404 as const, json: { error: "not_found" } };
+    if (isGatewayRole(bot.role)) return { status: 409 as const, json: { error: "gateway_protected" } };
     if (bot.status !== "archived") return { status: 409 as const, json: { error: "archive_first" } };
     void ctx.engine.runnerFor(accountId).acpFor(bot.id)?.kill();
     deleteBotPermanently(db, bot.id);
+    try {
+      ctx.engine.runnerFor(accountId).deleteProject(bot.id);
+    } catch (err) {
+      ctx.log.error("delete bot project failed", { botId: bot.id, error: String(err) });
+    }
     return { status: 200 as const, json: { ok: true } };
   }
 
@@ -403,11 +705,12 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
   app.patch("/v1/bots/:id", async (c) => {
     const s = requireSession(c);
     const body = await c.req.json();
-    const bot = db.get<{ id: string }>("SELECT id FROM bots WHERE id = ? AND account_id = ?", [
-      c.req.param("id"),
-      s.accountId,
-    ]);
+    const bot = db.get<{ id: string; role: string | null }>(
+      "SELECT id, role FROM bots WHERE id = ? AND account_id = ?",
+      [c.req.param("id"), s.accountId],
+    );
     if (!bot) return c.json({ error: "not_found" }, 404);
+    if (isGatewayRole(bot.role) && body.name) return c.json({ error: "gateway_protected" }, 409);
     if (body.name) db.run("UPDATE bots SET name = ? WHERE id = ?", [String(body.name), bot.id]);
     if (body.description != null) db.run("UPDATE bots SET description = ? WHERE id = ?", [String(body.description), bot.id]);
     return c.json({ ok: true });
@@ -420,11 +723,18 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
       id: string;
       model: string | null;
       reasoning_effort: string | null;
-    }>("SELECT id, model, reasoning_effort FROM bots WHERE id = ? AND account_id = ?", [
+      role: string | null;
+    }>("SELECT id, model, reasoning_effort, role FROM bots WHERE id = ? AND account_id = ?", [
       c.req.param("id"),
       s.accountId,
     ]);
     if (!bot) return c.json({ error: "not_found" }, 404);
+    if (
+      isGatewayRole(bot.role) &&
+      (body.permissionMode != null || body.harness != null || body.requireHumanApproval != null)
+    ) {
+      return c.json({ error: "gateway_protected" }, 409);
+    }
     const catalog = listGrokModels(cfg.home);
     let model = bot.model || "";
     let reasoningEffort = bot.reasoning_effort || "";
@@ -468,6 +778,69 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
     return c.json({ models: listGrokModels(cfg.home) });
   });
 
+  app.post("/v1/threads", async (c) => {
+    const s = requireSession(c);
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      return c.json({ error: "bad_request" }, 400);
+    }
+    const parsed = createGroupThreadInput.safeParse(raw);
+    if (!parsed.success) return c.json({ error: "bad_request" }, 400);
+    const body = parsed.data;
+    if ((body.userIds ?? []).some((uid) => uid !== s.userId)) {
+      return c.json({ error: "org_members_required" }, 400);
+    }
+    const addCaller = body.addCaller !== false;
+    const bots: { id: string; name: string }[] = [];
+    const seen = new Set<string>();
+    for (const botId of body.botIds) {
+      if (seen.has(botId)) continue;
+      seen.add(botId);
+      const bot = db.get<{ id: string; name: string; status: string }>(
+        "SELECT id, name, status FROM bots WHERE id = ? AND account_id = ?",
+        [botId, s.accountId],
+      );
+      if (!bot || bot.status !== "active") continue;
+      bots.push(bot);
+    }
+    const principalCount = bots.length + (addCaller ? 1 : 0);
+    if (bots.length === 0 || !groupMeetsMinimum(bots.length, principalCount)) {
+      return c.json({ error: "too_small" }, 400);
+    }
+    const title = (body.title ?? "").trim() || "New thread";
+    const threadId = db.immediate(() => {
+      const createdId = id();
+      const t = now();
+      db.run(
+        `INSERT INTO threads (id, account_id, bot_id, title, kind, created_at)
+         VALUES (?, ?, ?, ?, 'group', ?)`,
+        [createdId, s.accountId, bots[0]!.id, title, t],
+      );
+      if (addCaller) {
+        db.run(
+          `INSERT INTO thread_participants (id, thread_id, kind, user_id, bot_id, created_at)
+           VALUES (?, ?, 'human', ?, NULL, ?)`,
+          [id(), createdId, s.userId, t],
+        );
+      }
+      for (const bot of bots) {
+        db.run(
+          `INSERT INTO thread_participants (id, thread_id, kind, user_id, bot_id, created_at)
+           VALUES (?, ?, 'bot', NULL, ?, ?)`,
+          [id(), createdId, bot.id, t],
+        );
+      }
+      return createdId;
+    });
+    const thread = db.get("SELECT * FROM threads WHERE id = ?", [threadId]);
+    const participants = db.all("SELECT * FROM thread_participants WHERE thread_id = ? ORDER BY created_at", [
+      threadId,
+    ]);
+    return c.json({ thread, participants }, 201);
+  });
+
   app.get("/v1/threads", (c) => {
     const s = requireSession(c);
     const botId = c.req.query("botId");
@@ -480,18 +853,27 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
       );
       return c.json({ threads });
     }
+    if (kind === "group") {
+      const threads = db.all(
+        `SELECT * FROM threads WHERE account_id = ? AND kind = 'group' ORDER BY created_at DESC`,
+        [s.accountId],
+      );
+      return c.json({ threads });
+    }
     const thread = botId
       ? db.get(
           "SELECT * FROM threads WHERE account_id = ? AND bot_id = ? AND IFNULL(kind,'human') = 'human'",
           [s.accountId, botId],
         )
       : db.get(
-          "SELECT * FROM threads WHERE account_id = ? AND IFNULL(kind,'human') = 'human' ORDER BY created_at LIMIT 1",
+          `SELECT t.* FROM threads t
+           JOIN bots b ON b.id = t.bot_id
+           WHERE t.account_id = ? AND IFNULL(t.kind,'human') = 'human'
+             AND IFNULL(b.role, 'desk') = 'desk'
+           ORDER BY t.created_at LIMIT 1`,
           [s.accountId],
         );
-    const messages = thread
-      ? db.all("SELECT * FROM messages WHERE thread_id = ? ORDER BY created_at", [(thread as { id: string }).id])
-      : [];
+    const messages = thread ? db.all(VISIBLE_MESSAGES_SQL, [(thread as { id: string }).id]) : [];
     const latestTurn = thread
       ? db.get<{ id: string }>(
           "SELECT id FROM turns WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1",
@@ -508,7 +890,7 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
       s.accountId,
     ]);
     if (!thread) return c.json({ error: "not_found" }, 404);
-    const messages = db.all("SELECT * FROM messages WHERE thread_id = ? ORDER BY created_at", [c.req.param("id")]);
+    const messages = db.all(VISIBLE_MESSAGES_SQL, [c.req.param("id")]);
     const latestTurn = db.get<{ id: string }>(
       "SELECT id FROM turns WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1",
       [c.req.param("id")],
@@ -516,40 +898,201 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
     return c.json({ thread, messages, latestTurnId: latestTurn?.id ?? null });
   });
 
+  type GroupThread = { id: string; bot_id: string; kind: string; title: string };
+
+  function requireGroupThread(s: SessionInfo, threadId: string): GroupThread | { error: string; status: 400 | 404 } {
+    const thread = db.get<GroupThread>("SELECT id, bot_id, kind, title FROM threads WHERE id = ? AND account_id = ?", [
+      threadId,
+      s.accountId,
+    ]);
+    if (!thread) return { error: "not_found", status: 404 };
+    if (thread.kind !== "group") return { error: "not_group", status: 400 };
+    return thread;
+  }
+
+  function removeGroupParticipant(
+    thread: GroupThread,
+    participant: { id: string; bot_id: string | null },
+  ): { error: string } | { ok: true } {
+    return db.immediate(() => {
+      const remaining = db.all<{ id: string; bot_id: string | null }>(
+        "SELECT id, bot_id FROM thread_participants WHERE thread_id = ? AND id != ?",
+        [thread.id, participant.id],
+      );
+      const remainingBots = remaining.filter((p) => p.bot_id);
+      if (remainingBots.length === 0 || !groupMeetsMinimum(remainingBots.length, remaining.length)) {
+        return { error: "too_small" };
+      }
+      const current = db.get<{ bot_id: string }>("SELECT bot_id FROM threads WHERE id = ?", [thread.id]);
+      if (participant.bot_id && participant.bot_id === current?.bot_id) {
+        db.run("UPDATE threads SET bot_id = ? WHERE id = ?", [remainingBots[0]!.bot_id, thread.id]);
+      }
+      db.run("DELETE FROM thread_participants WHERE id = ?", [participant.id]);
+      return { ok: true as const };
+    });
+  }
+
+  app.post("/v1/threads/:id/participants", async (c) => {
+    const s = requireSession(c);
+    const thread = requireGroupThread(s, c.req.param("id"));
+    if ("error" in thread) return c.json({ error: thread.error }, thread.status);
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      return c.json({ error: "bad_request" }, 400);
+    }
+    const parsed = addThreadParticipantInput.safeParse(raw);
+    if (!parsed.success) return c.json({ error: "bad_request" }, 400);
+    const botId = parsed.data.botId;
+    const userId = parsed.data.userId;
+    if (Boolean(botId) === Boolean(userId)) return c.json({ error: "bad_request" }, 400);
+    if (userId) {
+      if (userId !== s.userId) return c.json({ error: "org_members_required" }, 400);
+      const existing = db.get("SELECT id FROM thread_participants WHERE thread_id = ? AND user_id = ?", [
+        thread.id,
+        userId,
+      ]);
+      if (existing) return c.json({ error: "duplicate" }, 409);
+      const participantId = id();
+      db.run(
+        `INSERT INTO thread_participants (id, thread_id, kind, user_id, bot_id, created_at)
+         VALUES (?, ?, 'human', ?, NULL, ?)`,
+        [participantId, thread.id, userId, now()],
+      );
+      return c.json({ ok: true, participant: { id: participantId, kind: "human", userId, botId: null } });
+    }
+    const bot = db.get<{ id: string; status: string }>(
+      "SELECT id, status FROM bots WHERE id = ? AND account_id = ?",
+      [botId!, s.accountId],
+    );
+    if (!bot || bot.status !== "active") return c.json({ error: "not_found" }, 404);
+    const existing = db.get("SELECT id FROM thread_participants WHERE thread_id = ? AND bot_id = ?", [
+      thread.id,
+      bot.id,
+    ]);
+    if (existing) return c.json({ error: "duplicate" }, 409);
+    const participantId = id();
+    db.run(
+      `INSERT INTO thread_participants (id, thread_id, kind, user_id, bot_id, created_at)
+       VALUES (?, ?, 'bot', NULL, ?, ?)`,
+      [participantId, thread.id, bot.id, now()],
+    );
+    return c.json({ ok: true, participant: { id: participantId, kind: "bot", userId: null, botId: bot.id } });
+  });
+
+  app.delete("/v1/threads/:id/participants/:participantId", (c) => {
+    const s = requireSession(c);
+    const thread = requireGroupThread(s, c.req.param("id"));
+    if ("error" in thread) return c.json({ error: thread.error }, thread.status);
+    const participant = db.get<{ id: string; bot_id: string | null }>(
+      "SELECT id, bot_id FROM thread_participants WHERE id = ? AND thread_id = ?",
+      [c.req.param("participantId"), thread.id],
+    );
+    if (!participant) return c.json({ error: "not_found" }, 404);
+    const result = removeGroupParticipant(thread, participant);
+    if ("error" in result) return c.json({ error: result.error }, 400);
+    return c.json({ ok: true });
+  });
+
+  app.delete("/v1/threads/:id/participants", (c) => {
+    const s = requireSession(c);
+    const thread = requireGroupThread(s, c.req.param("id"));
+    if ("error" in thread) return c.json({ error: thread.error }, thread.status);
+    const botId = c.req.query("botId");
+    if (!botId) return c.json({ error: "bad_request" }, 400);
+    const participant = db.get<{ id: string; bot_id: string | null }>(
+      "SELECT id, bot_id FROM thread_participants WHERE thread_id = ? AND bot_id = ?",
+      [thread.id, botId],
+    );
+    if (!participant) return c.json({ error: "not_found" }, 404);
+    const result = removeGroupParticipant(thread, participant);
+    if ("error" in result) return c.json({ error: result.error }, 400);
+    return c.json({ ok: true });
+  });
+
   app.post("/v1/threads/:id/messages", async (c) => {
     const s = requireSession(c);
-    const thread = db.get<{ id: string; bot_id: string; kind: string }>(
+    const thread = db.get<{ id: string; bot_id: string; kind: string; title: string }>(
       "SELECT * FROM threads WHERE id = ? AND account_id = ?",
       [c.req.param("id"), s.accountId],
     );
     if (!thread) return c.json({ error: "not_found" }, 404);
-    if (thread.kind === "a2a") return c.json({ error: "a2a_readonly" }, 403);
-    const queued = db.get<{ n: number }>(
-      "SELECT COUNT(*) as n FROM turns WHERE bot_id = ? AND status = 'queued'",
-      [thread.bot_id],
-    );
-    if ((queued?.n ?? 0) >= 5) return c.json({ error: "queue_full" }, 429);
-    const body = (await c.req.json()) as { body?: string };
-    const text = String(body.body ?? "").trim();
-    if (!text) return c.json({ error: "empty" }, 400);
-    const turnId = id();
-    const userMessage = db.immediate(() => {
-      const turnCreated = now();
-      db.run(
-        `INSERT INTO turns (id, thread_id, bot_id, status, sent_message_count, assistant_text, deadline_at, created_at)
-         VALUES (?, ?, ?, 'queued', 0, '', ?, ?)`,
-        [turnId, thread.id, thread.bot_id, turnCreated + 2 * 60 * 60 * 1000, turnCreated],
-      );
-      return insertMessage(db, {
-        threadId: thread.id,
-        turnId,
-        role: "user",
-        origin: "user",
-        body: text,
-      });
-    });
-    ctx.engine.kick();
-    return c.json({ turnId, userMessageId: userMessage.id }, 202);
+    switch (thread.kind) {
+      case "a2a":
+        return c.json({ error: "a2a_readonly" }, 403);
+      case "group": {
+        let raw: unknown;
+        try {
+          raw = await c.req.json();
+        } catch {
+          return c.json({ error: "bad_request" }, 400);
+        }
+        const parsed = postMessageInput.safeParse(raw);
+        if (!parsed.success) return c.json({ error: "bad_request" }, 400);
+        const text = parsed.data.body.trim();
+        if (!text) return c.json({ error: "empty" }, 400);
+        const posted = db.immediate(() => {
+          const userMessage = insertMessage(db, {
+            threadId: thread.id,
+            turnId: null,
+            role: "user",
+            origin: "user",
+            body: text,
+          });
+          const fanout = queueGroupMentions(db, {
+            threadId: thread.id,
+            title: thread.title,
+            body: text,
+          });
+          return {
+            userMessage,
+            turnIds: fanout.turnIds,
+            mentioned: fanout.mentioned,
+            mentionedTruncated: fanout.mentionedTruncated,
+          };
+        });
+        onPush(s.accountId, { type: "message.created", message: posted.userMessage });
+        if (posted.turnIds.length) ctx.engine.kick();
+        return c.json(
+          {
+            turnIds: posted.turnIds,
+            mentioned: posted.mentioned,
+            userMessageId: posted.userMessage.id,
+            ...(posted.mentionedTruncated ? { mentionedTruncated: true } : {}),
+          },
+          202,
+        );
+      }
+      default: {
+        const queued = db.get<{ n: number }>(
+          "SELECT COUNT(*) as n FROM turns WHERE bot_id = ? AND status = 'queued'",
+          [thread.bot_id],
+        );
+        if ((queued?.n ?? 0) >= 5) return c.json({ error: "queue_full" }, 429);
+        const body = (await c.req.json()) as { body?: string };
+        const text = String(body.body ?? "").trim();
+        if (!text) return c.json({ error: "empty" }, 400);
+        const turnId = id();
+        const userMessage = db.immediate(() => {
+          const turnCreated = now();
+          db.run(
+            `INSERT INTO turns (id, thread_id, bot_id, status, sent_message_count, assistant_text, deadline_at, created_at)
+             VALUES (?, ?, ?, 'queued', 0, '', ?, ?)`,
+            [turnId, thread.id, thread.bot_id, turnCreated + 2 * 60 * 60 * 1000, turnCreated],
+          );
+          return insertMessage(db, {
+            threadId: thread.id,
+            turnId,
+            role: "user",
+            origin: "user",
+            body: text,
+          });
+        });
+        ctx.engine.kick();
+        return c.json({ turnId, userMessageId: userMessage.id }, 202);
+      }
+    }
   });
 
   app.post("/v1/turns/:id/cancel", (c) => {
@@ -560,11 +1103,20 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
       [c.req.param("id"), s.accountId],
     );
     if (!turn) return c.json({ error: "not_found" }, 404);
+    let cancelled = false;
     if (turn.status === "running") {
       void ctx.engine.runnerFor(s.accountId).acpFor(turn.bot_id)?.cancel();
       promote(db, turn.id, { kind: "cancel" });
+      cancelled = true;
     } else if (turn.status === "queued") {
       db.run("UPDATE turns SET status = 'cancelled', finished_at = ? WHERE id = ?", [now(), turn.id]);
+      cancelled = true;
+    }
+    if (cancelled) {
+      const bot = db.get<{ role: string | null }>("SELECT role FROM bots WHERE id = ?", [turn.bot_id]);
+      if (isGatewayRole(bot?.role) && federationEffective(currentOrgMeta(db))) {
+        ctx.engine.maybeKickGatewayDrain(turn.bot_id);
+      }
     }
     return c.json({ ok: true });
   });
@@ -772,7 +1324,17 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
       body = {};
     }
     try {
-      const result = handleMcpJsonRpc(db, inflight, bearer, body, { onKick: () => ctx.engine.kick() });
+      const result = await handleMcpJsonRpc(db, inflight, bearer, body, {
+        onKick: () => ctx.engine.kick(),
+        federationEffective: () => federationEffective(currentOrgMeta(db)),
+        orgPrivateKey: () => loadOrgKeypair(ctx.home, ctx.master).privateKey,
+        onCreateBot: async ({ accountId, botId, name }) => {
+          const runner = ctx.engine.runnerFor(accountId);
+          await runner.ensure(accountId);
+          runner.ensureProject(botId, name);
+          onPush(accountId, { type: "bots.updated" });
+        },
+      });
       const json = result.json as { result?: { content?: unknown[] } };
       if (result.status === 200 && json?.result?.content) {
         const parsed = JSON.parse(String((json.result.content as { text?: string }[])[0]?.text ?? "{}")) as {
@@ -911,7 +1473,33 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
     ctx,
     ready: () => undefined,
     websocket,
-  } as { app: Hono; ctx: AppContext; ready: () => void; websocket: typeof websocket };
+    stop: () => stopApp(ctx),
+  } as { app: Hono; ctx: AppContext; ready: () => void; stop: () => void; websocket: typeof websocket };
+}
+
+function stopApp(ctx: AppContext): void {
+  if (ctx.maintenanceTimer == null) return;
+  clearInterval(ctx.maintenanceTimer);
+  ctx.maintenanceTimer = undefined;
+}
+
+function bunRequestIp(env: unknown, req: Request): string {
+  if (!env || typeof env !== "object") return "";
+  const rec = env as {
+    requestIP?: (r: Request) => { address?: string } | null;
+    server?: { requestIP?: (r: Request) => { address?: string } | null };
+  };
+  try {
+    const direct = rec.requestIP?.(req)?.address;
+    if (direct) return direct;
+  } catch {
+    /* fetch adapter did not bind Bun.Server */
+  }
+  try {
+    return rec.server?.requestIP?.(req)?.address ?? "";
+  } catch {
+    return "";
+  }
 }
 
 function botPresence(ctx: AppContext, botId: string): { key: string; label: string } {
@@ -948,7 +1536,7 @@ function botPresence(ctx: AppContext, botId: string): { key: string; label: stri
 
 function activityForAccount(ctx: AppContext, accountId: string) {
   const bots = ctx.db.all<{ id: string; name: string }>(
-    "SELECT id, name FROM bots WHERE account_id = ? AND status = 'active' ORDER BY created_at",
+    "SELECT id, name FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'desk' ORDER BY created_at",
     [accountId],
   );
   return bots.map((b) => {
@@ -1017,10 +1605,6 @@ function activityForAccount(ctx: AppContext, accountId: string) {
 
 function healthPayload(ctx: AppContext, accountId: string) {
   const runner = ctx.engine.runners.get(accountId);
-  const bots = ctx.db.all<{ id: string }>(
-    "SELECT id FROM bots WHERE account_id = ? AND status = 'active'",
-    [accountId],
-  );
   return {
     driver: "localhost",
     state: runner?.harness === "crashed" ? "unhealthy" : "running",

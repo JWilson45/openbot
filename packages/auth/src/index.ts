@@ -65,7 +65,7 @@ export function completeGithubLogin(
 
   return db.immediate(() => {
     let user = db.get<{ id: string }>("SELECT id FROM users WHERE github_login = ?", [login]);
-    if (!user) {
+    if (user == null) {
       const userId = id();
       db.run(
         `INSERT INTO users (id, github_login, github_id, name, email, created_at)
@@ -74,16 +74,41 @@ export function completeGithubLogin(
       );
       user = { id: userId };
     }
-    let account = db.get<{ id: string }>("SELECT id FROM accounts WHERE auth_user_id = ?", [user.id]);
-    if (!account) {
-      const accountId = id();
-      db.run("INSERT INTO accounts (id, auth_user_id, created_at) VALUES (?, ?, ?)", [
-        accountId,
-        user.id,
-        now(),
-      ]);
-      account = { id: accountId };
+
+    const org = db.get<{ org_id: string; account_id: string | null }>(
+      "SELECT org_id, account_id FROM org_meta WHERE id = 'current'",
+    );
+    let accountId: string;
+    if (org != null && org.account_id != null) {
+      accountId = org.account_id;
+    } else {
+      let account = db.get<{ id: string }>("SELECT id FROM accounts WHERE auth_user_id = ?", [user.id]);
+      if (account == null) {
+        const newId = id();
+        db.run("INSERT INTO accounts (id, auth_user_id, created_at) VALUES (?, ?, ?)", [
+          newId,
+          user.id,
+          now(),
+        ]);
+        account = { id: newId };
+      }
+      accountId = account.id;
+      if (org != null) {
+        db.run("UPDATE org_meta SET account_id = ? WHERE id = 'current'", [accountId]);
+      }
     }
+
+    if (org != null) {
+      const member = db.get<{ id: string }>("SELECT id FROM org_members WHERE user_id = ?", [user.id]);
+      if (member == null) {
+        db.run(
+          `INSERT INTO org_members (id, org_id, user_id, account_id, role, created_at)
+           VALUES (?, ?, ?, ?, 'member', ?)`,
+          [id(), org.org_id, user.id, accountId, now()],
+        );
+      }
+    }
+
     const token = crypto.randomUUID().replaceAll("-", "") + randomHex(16);
     const sessionId = id();
     db.run(
@@ -95,7 +120,7 @@ export function completeGithubLogin(
       sessionId,
       token,
       userId: user.id,
-      accountId: account.id,
+      accountId,
       githubLogin: login,
     };
   });
@@ -115,16 +140,18 @@ export function sessionFromToken(
     user_id: string;
     expires_at: number;
     github_login: string;
-    account_id: string;
+    account_id: string | null;
   }>(
-    `SELECT s.id, s.user_id, s.expires_at, u.github_login, a.id as account_id
-     FROM sessions s
-     JOIN users u ON u.id = s.user_id
-     JOIN accounts a ON a.auth_user_id = u.id
-     WHERE s.token_hash = ?`,
+    `SELECT s.id, s.user_id, s.expires_at, u.github_login,
+            COALESCE(om.account_id, a.id) AS account_id
+       FROM sessions s
+       JOIN users u ON u.id = s.user_id
+       LEFT JOIN org_members om ON om.user_id = u.id
+       LEFT JOIN accounts a ON a.auth_user_id = u.id
+      WHERE s.token_hash = ?`,
     [sha256Hex(token)],
   );
-  if (!row || row.expires_at < now()) return null;
+  if (row == null || row.expires_at < now() || row.account_id == null) return null;
   return {
     sessionId: row.id,
     token,
@@ -206,6 +233,10 @@ export function revokeApiKey(db: OpenbotDb, accountId: string, keyId: string): b
   return true;
 }
 
+/**
+ * Org-scoped `sk-ob_` credential for OpenAI clients, not a second-human identity.
+ * Reports the founding user. Do not accept API keys on peer-admin routes.
+ */
 export function sessionFromApiKey(db: OpenbotDb, token: string | undefined): SessionInfo | null {
   if (!token) return null;
   const row = db.get<{

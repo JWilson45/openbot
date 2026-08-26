@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS bots (
   require_human_approval integer NOT NULL DEFAULT 0,
   model text NOT NULL DEFAULT 'grok-4.6',
   reasoning_effort text NOT NULL DEFAULT 'high',
+  role text NOT NULL DEFAULT 'desk',
   created_at integer NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS bots_active_name ON bots(account_id, name) WHERE status = 'active';
@@ -60,8 +61,17 @@ CREATE TABLE IF NOT EXISTS threads (
   peer_bot_id text,
   created_at integer NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS threads_one_human_per_bot ON threads(bot_id) WHERE kind = 'human';
-CREATE UNIQUE INDEX IF NOT EXISTS threads_a2a_pair ON threads(account_id, bot_id, peer_bot_id) WHERE kind = 'a2a';
+
+CREATE TABLE IF NOT EXISTS thread_participants (
+  id text PRIMARY KEY,
+  thread_id text NOT NULL REFERENCES threads(id),
+  kind text NOT NULL,
+  user_id text REFERENCES users(id),
+  bot_id text REFERENCES bots(id),
+  created_at integer NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS tp_bot ON thread_participants(thread_id, bot_id) WHERE bot_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS tp_user ON thread_participants(thread_id, user_id) WHERE user_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS harness_sessions (
   id text PRIMARY KEY,
@@ -122,6 +132,8 @@ CREATE TABLE IF NOT EXISTS messages (
   body text NOT NULL,
   urgency text NOT NULL DEFAULT 'normal',
   from_bot_id text,
+  remote_org_id text,
+  remote_actor_name text,
   created_at integer NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_thread_created ON messages(thread_id, created_at);
@@ -169,6 +181,82 @@ CREATE TABLE IF NOT EXISTS api_keys (
   last_used_at integer,
   revoked_at integer
 );
+
+CREATE TABLE IF NOT EXISTS org_meta (
+  id text PRIMARY KEY,
+  account_id text REFERENCES accounts(id),
+  org_id text NOT NULL UNIQUE,
+  slug text NOT NULL,
+  name text NOT NULL,
+  public_origin text,
+  pubkey text NOT NULL DEFAULT '',
+  federation_enabled integer NOT NULL DEFAULT 0,
+  created_at integer NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS org_members (
+  id text PRIMARY KEY,
+  org_id text NOT NULL,
+  user_id text NOT NULL REFERENCES users(id),
+  account_id text NOT NULL REFERENCES accounts(id),
+  role text NOT NULL DEFAULT 'member',
+  created_at integer NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS org_members_user ON org_members(user_id);
+
+CREATE TABLE IF NOT EXISTS org_peers (
+  id text PRIMARY KEY,
+  peer_org_id text NOT NULL UNIQUE,
+  slug text NOT NULL UNIQUE,
+  name text NOT NULL DEFAULT '',
+  base_url text NOT NULL,
+  pubkey text NOT NULL,
+  status text NOT NULL DEFAULT 'allowed',
+  created_at integer NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS org_inbox (
+  id text PRIMARY KEY,
+  message_id text NOT NULL,
+  from_org_id text NOT NULL,
+  from_slug text NOT NULL DEFAULT '',
+  to_org_id text NOT NULL,
+  hop integer NOT NULL,
+  urgency text NOT NULL DEFAULT 'normal',
+  body text NOT NULL,
+  envelope text NOT NULL,
+  status text NOT NULL DEFAULT 'pending',
+  acked_turn_id text REFERENCES turns(id) ON DELETE SET NULL,
+  acked_at integer,
+  created_at integer NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS org_inbox_peer_msg ON org_inbox(from_org_id, message_id);
+CREATE INDEX IF NOT EXISTS org_inbox_from_created ON org_inbox(from_org_id, created_at);
+CREATE INDEX IF NOT EXISTS org_inbox_created ON org_inbox(created_at);
+
+CREATE TABLE IF NOT EXISTS org_solicit (
+  id text PRIMARY KEY,
+  bucket text NOT NULL,
+  reason text NOT NULL,
+  count integer NOT NULL DEFAULT 1,
+  host text,
+  last_at integer NOT NULL,
+  last_notice_message_id text
+);
+CREATE UNIQUE INDEX IF NOT EXISTS org_solicit_bucket_reason ON org_solicit(bucket, reason);
+
+-- 1:1 same-pair; auto_forward stays 0 because hop is always 1
+CREATE TABLE IF NOT EXISTS thread_bridges (
+  id text PRIMARY KEY,
+  local_thread_id text NOT NULL REFERENCES threads(id),
+  peer_org_id text NOT NULL,
+  peer_thread_id text,
+  auto_forward integer NOT NULL DEFAULT 0,
+  created_at integer NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS thread_bridges_local ON thread_bridges(local_thread_id);
+CREATE UNIQUE INDEX IF NOT EXISTS thread_bridges_peer_thread
+  ON thread_bridges(peer_org_id, peer_thread_id) WHERE peer_thread_id IS NOT NULL;
 `;
 
 export type SqlValue = string | number | bigint | boolean | null | Uint8Array;
@@ -207,11 +295,18 @@ export class OpenbotDb {
     this.ensureColumn("bots", "archived_at", "integer");
     this.ensureColumn("bots", "model", "text NOT NULL DEFAULT 'grok-4.6'");
     this.ensureColumn("bots", "reasoning_effort", "text NOT NULL DEFAULT 'high'");
+    this.ensureColumn("bots", "role", "text NOT NULL DEFAULT 'desk'");
+    this.ensureColumn("org_meta", "federation_enabled", "integer NOT NULL DEFAULT 0");
+    this.ensureColumn("messages", "remote_org_id", "text");
+    this.ensureColumn("messages", "remote_actor_name", "text");
     this.raw.exec(
       "UPDATE bots SET archived_at = created_at WHERE status = 'archived' AND archived_at IS NULL",
     );
     this.raw.exec(
       "CREATE UNIQUE INDEX IF NOT EXISTS bots_active_name ON bots(account_id, name) WHERE status = 'active'",
+    );
+    this.raw.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS bots_one_active_gateway ON bots(account_id) WHERE status = 'active' AND IFNULL(role, 'desk') = 'gateway'",
     );
     this.raw.exec(
       "CREATE UNIQUE INDEX IF NOT EXISTS threads_one_human_per_bot ON threads(bot_id) WHERE kind = 'human'",
@@ -301,15 +396,152 @@ export type MessageRow = {
   body: string;
   urgency: string;
   from_bot_id: string | null;
+  remote_org_id: string | null;
+  remote_actor_name: string | null;
   created_at: number;
 };
+
+export type OrgInboxRow = {
+  id: string;
+  message_id: string;
+  from_org_id: string;
+  from_slug: string;
+  to_org_id: string;
+  hop: number;
+  urgency: string;
+  body: string;
+  envelope: string;
+  status: string;
+  acked_turn_id: string | null;
+  acked_at: number | null;
+  created_at: number;
+};
+
+export type OrgSolicitRow = {
+  id: string;
+  bucket: string;
+  reason: string;
+  count: number;
+  host: string | null;
+  last_at: number;
+  last_notice_message_id: string | null;
+};
+
+export type ThreadBridgeRow = {
+  id: string;
+  local_thread_id: string;
+  peer_org_id: string;
+  peer_thread_id: string | null;
+  auto_forward: number;
+  created_at: number;
+};
+
+export class ThreadBridgeConflict extends Error {
+  constructor(message = "local thread is already bridged to another org") {
+    super(message);
+    this.name = "ThreadBridgeConflict";
+  }
+}
+
+function isUniqueConstraint(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /UNIQUE/i.test(msg);
+}
+
+export function getThreadBridgeByLocal(
+  db: OpenbotDb,
+  localThreadId: string,
+): ThreadBridgeRow | undefined {
+  return db.get<ThreadBridgeRow>("SELECT * FROM thread_bridges WHERE local_thread_id = ?", [
+    localThreadId,
+  ]);
+}
+
+export function getThreadBridgeByPeerThread(
+  db: OpenbotDb,
+  peerOrgId: string,
+  peerThreadId: string,
+): ThreadBridgeRow | undefined {
+  return db.get<ThreadBridgeRow>(
+    "SELECT * FROM thread_bridges WHERE peer_org_id = ? AND peer_thread_id = ?",
+    [peerOrgId, peerThreadId],
+  );
+}
+
+export function listOpenPeerBridges(db: OpenbotDb, peerOrgId: string): ThreadBridgeRow[] {
+  return db.all<ThreadBridgeRow>(
+    "SELECT * FROM thread_bridges WHERE peer_org_id = ? AND peer_thread_id IS NULL ORDER BY created_at ASC, id ASC",
+    [peerOrgId],
+  );
+}
+
+/** 1:1 same-pair only. auto_forward stays 0 so this cannot become a hop chain. */
+export function ensureThreadBridge(
+  db: OpenbotDb,
+  opts: { localThreadId: string; peerOrgId: string; peerThreadId?: string | null },
+): ThreadBridgeRow {
+  const peerOrgId = opts.peerOrgId.trim();
+  const peerThreadId = opts.peerThreadId?.trim() || null;
+  const existing = getThreadBridgeByLocal(db, opts.localThreadId);
+  if (existing) {
+    if (existing.peer_org_id.toLowerCase() !== peerOrgId.toLowerCase()) {
+      throw new ThreadBridgeConflict();
+    }
+    if (peerThreadId && !existing.peer_thread_id) {
+      try {
+        db.run("UPDATE thread_bridges SET peer_thread_id = ? WHERE id = ? AND peer_thread_id IS NULL", [
+          peerThreadId,
+          existing.id,
+        ]);
+      } catch (err) {
+        if (isUniqueConstraint(err)) throw new ThreadBridgeConflict();
+        throw err;
+      }
+      return getThreadBridgeByLocal(db, opts.localThreadId) ?? existing;
+    }
+    return existing;
+  }
+  const row: ThreadBridgeRow = {
+    id: id(),
+    local_thread_id: opts.localThreadId,
+    peer_org_id: peerOrgId,
+    peer_thread_id: peerThreadId,
+    auto_forward: 0,
+    created_at: now(),
+  };
+  try {
+    db.run(
+      `INSERT INTO thread_bridges (id, local_thread_id, peer_org_id, peer_thread_id, auto_forward, created_at)
+       VALUES (?, ?, ?, ?, 0, ?)`,
+      [row.id, row.local_thread_id, row.peer_org_id, row.peer_thread_id, row.created_at],
+    );
+  } catch (err) {
+    if (isUniqueConstraint(err)) throw new ThreadBridgeConflict();
+    throw err;
+  }
+  return getThreadBridgeByLocal(db, opts.localThreadId) ?? row;
+}
 
 export const MAX_ACTIVE_BOTS = 6;
 /** Archived bots are purged this long after archive unless restored. */
 export const ARCHIVE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const INBOX_ACKED_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const INBOX_OPEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+export const INBOX_CAP = 10_000;
+export const FED_RATE_PEER_HOUR = 60;
+export const FED_RATE_INSTANCE_HOUR = 200;
+export const FED_RATE_WINDOW_MS = 60 * 60 * 1000;
+
+export function isGatewayRole(role: string | null | undefined): boolean {
+  return role === "gateway";
+}
 
 export function deleteBotPermanently(db: OpenbotDb, botId: string): void {
+  const row = db.get<{ role: string | null }>("SELECT role FROM bots WHERE id = ?", [botId]);
+  if (isGatewayRole(row?.role)) return;
   db.immediate(() => {
+    // Membership rows FK to bots; drop this bot before the bots DELETE.
+    db.run(`DELETE FROM thread_participants WHERE bot_id = ?`, [botId]);
     // Detach FKs first. SendMessage on another bot's human thread can point
     // turn_id at this bot's A2A turn; those rows must be unlinked, not deleted.
     db.run(
@@ -334,7 +566,27 @@ export function deleteBotPermanently(db: OpenbotDb, botId: string): void {
     );
     db.run(`UPDATE threads SET peer_bot_id = NULL WHERE peer_bot_id = ?`, [botId]);
 
-    // Remaining threads are this bot's human DM (and any orphaned A2A).
+    // bot_id is only the convening pointer; keep the group if another member bot remains.
+    db.run(
+      `UPDATE threads SET bot_id = (
+         SELECT tp.bot_id FROM thread_participants tp
+         WHERE tp.thread_id = threads.id AND tp.bot_id IS NOT NULL
+         LIMIT 1
+       )
+       WHERE bot_id = ? AND kind = 'group'
+         AND EXISTS (
+           SELECT 1 FROM thread_participants tp
+           WHERE tp.thread_id = threads.id AND tp.bot_id IS NOT NULL
+         )`,
+      [botId],
+    );
+    // Leftover members of threads we still own (groups with no bot left).
+    db.run(
+      `DELETE FROM thread_participants WHERE thread_id IN (SELECT id FROM threads WHERE bot_id = ?)`,
+      [botId],
+    );
+
+    // Remaining threads are this bot's human DM (and any orphaned A2A / empty group).
     db.run(
       `DELETE FROM mcp_tokens WHERE thread_id IN (SELECT id FROM threads WHERE bot_id = ?)`,
       [botId],
@@ -360,12 +612,39 @@ export function deleteBotPermanently(db: OpenbotDb, botId: string): void {
       [botId],
     );
     db.run(`DELETE FROM turns WHERE thread_id IN (SELECT id FROM threads WHERE bot_id = ?)`, [botId]);
+    // FK: thread_bridges.local_thread_id → threads(id)
+    db.run(
+      `DELETE FROM thread_bridges WHERE local_thread_id IN (SELECT id FROM threads WHERE bot_id = ?)`,
+      [botId],
+    );
     db.run(`DELETE FROM threads WHERE bot_id = ?`, [botId]);
     db.run(`DELETE FROM bots WHERE id = ?`, [botId]);
   });
 }
 
-export function purgeExpiredArchivedBots(db: OpenbotDb, accountId?: string): number {
+export function purgeExpiredOrgInbox(db: OpenbotDb): number {
+  const t = now();
+  db.run(
+    "DELETE FROM org_inbox WHERE status = 'acked' AND IFNULL(acked_at, created_at) < ?",
+    [t - INBOX_ACKED_TTL_MS],
+  );
+  db.run(
+    "DELETE FROM org_inbox WHERE status IN ('pending', 'dropped', 'held') AND created_at < ?",
+    [t - INBOX_OPEN_TTL_MS],
+  );
+  const n = db.get<{ n: number }>("SELECT COUNT(*) AS n FROM org_inbox")?.n ?? 0;
+  if (n <= INBOX_CAP) return n;
+  const extra = n - INBOX_CAP;
+  db.run(
+    `DELETE FROM org_inbox WHERE id IN (
+       SELECT id FROM org_inbox ORDER BY created_at ASC, id ASC LIMIT ?
+     )`,
+    [extra],
+  );
+  return db.get<{ n: number }>("SELECT COUNT(*) AS n FROM org_inbox")?.n ?? 0;
+}
+
+export function purgeExpiredArchivedBots(db: OpenbotDb, accountId?: string): string[] {
   const cutoff = now() - ARCHIVE_TTL_MS;
   const rows = accountId
     ? db.all<{ id: string }>(
@@ -377,7 +656,7 @@ export function purgeExpiredArchivedBots(db: OpenbotDb, accountId?: string): num
         [cutoff],
       );
   for (const row of rows) deleteBotPermanently(db, row.id);
-  return rows.length;
+  return rows.map((row) => row.id);
 }
 
 export function humanThread(db: OpenbotDb, botId: string): { id: string; bot_id: string; account_id: string } | undefined {

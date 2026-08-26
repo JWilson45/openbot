@@ -1,6 +1,26 @@
 import { describe, expect, test } from "bun:test";
 import { tempHome } from "./helpers.ts";
 import { startTestServer } from "../apps/server/src/test-helpers.ts";
+import { parseHttpUrl, SPA_HTML } from "../apps/server/src/spa.ts";
+
+function spaParseHttpUrl(): (raw: unknown) => URL | null {
+  const start = SPA_HTML.indexOf("function parseHttpUrl(raw)");
+  expect(start).toBeGreaterThan(-1);
+  const brace = SPA_HTML.indexOf("{", start);
+  let depth = 0;
+  for (let i = brace; i < SPA_HTML.length; i++) {
+    const c = SPA_HTML[i];
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) {
+        const src = SPA_HTML.slice(start, i + 1);
+        return new Function(`${src}; return parseHttpUrl;`)() as (raw: unknown) => URL | null;
+      }
+    }
+  }
+  throw new Error("SPA parseHttpUrl not closed");
+}
 
 describe("desk SPA markup", () => {
   test("ships skip link, noscript sign-in, live region, and language", async () => {
@@ -33,6 +53,66 @@ describe("desk SPA markup", () => {
     expect(html).toContain("pick-model");
     expect(html).toContain("pick-effort");
     expect(html).toContain("Reasoning");
+    expect(html).toContain("open-gateway");
+    expect(html).toContain("fed-on");
+    expect(html).toContain("fed-off");
+    expect(html).toContain("Federation");
+    expect(html).toContain("federationEnabled");
+    expect(html).toContain("/v1/threads?kind=group");
+    expect(html).toContain("new-group");
+    expect(html).toContain("data-group");
+    expect(html).toContain("origin === 'prompt'");
+    expect(html).toContain("turnIds");
+    expect(html).toContain("_turnIds");
+    expect(html).toContain("dropFinishedTurn");
+    expect(html).toContain("sameThread");
+    expect(html).toContain("Groups");
+    expect(html).toContain("openbot-orgs");
+    expect(html).toContain("open-orgs");
+    expect(html).toContain("Bookmark this URL");
+    expect(html).toContain("add-org");
+    expect(html).toContain("This instance");
+    expect(html).toContain("new URL");
+    expect(html).toContain("javascript:");
+    expect(html).toContain("data:");
+    expect(html).toContain("http:");
+    expect(html).toContain("https:");
+    expect(html).toContain("location.href");
+    expect(html).toContain("/v1/org/peers");
+    expect(html).toContain("/v1/org/peers/from-info");
+    expect(html).toContain("/v1/org/inbox");
+    expect(html).toContain("Copy pubkey");
+    expect(html).toContain("tried to send mail");
+    expect(html).toContain("navigator.clipboard.writeText");
+    expect(html).not.toContain("thread_bridges");
+    expect(html).toContain("peerPreview.baseUrl");
+    expect(html).toContain("url.protocol !== 'http:'");
     server.stop(true);
+  });
+
+  test("parseHttpUrl allows http(s) and rejects javascript:, data:, relative, protocol-relative", () => {
+    const fromSpa = spaParseHttpUrl();
+    const cases: Array<[string, string | null]> = [
+      ["javascript:alert(1)", null],
+      ["data:text/html,hi", null],
+      ["/relative", null],
+      ["//evil.example", null],
+      ["https://beta.example.com/desk", "https://beta.example.com"],
+      ["http://127.0.0.1:8787/x", "http://127.0.0.1:8787"],
+    ];
+    for (const [input, origin] of cases) {
+      const exported = parseHttpUrl(input);
+      const inlined = fromSpa(input);
+      if (origin == null) {
+        expect(exported).toBeNull();
+        expect(inlined).toBeNull();
+      } else {
+        expect(exported).toBeInstanceOf(URL);
+        expect(inlined).toBeInstanceOf(URL);
+        expect(exported!.origin).toBe(origin);
+        expect(inlined!.origin).toBe(origin);
+        expect(exported!.protocol === "http:" || exported!.protocol === "https:").toBe(true);
+      }
+    }
   });
 });

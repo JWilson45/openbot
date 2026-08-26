@@ -1,10 +1,30 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { OpenbotDb } from "@openbot/db";
-import { AuthDenied, completeGithubLogin, isAllowlisted, loadAllowlist, writeAllowlistFile } from "@openbot/auth";
+import {
+  AuthDenied,
+  completeGithubLogin,
+  isAllowlisted,
+  loadAllowlist,
+  mintApiKey,
+  sessionFromApiKey,
+  sessionFromToken,
+  writeAllowlistFile,
+} from "@openbot/auth";
 import { RedactingLogger, loadOrCreateMasterKey, open, seal } from "@openbot/vault";
 import { fakeAgentCommand, tempHome } from "./helpers.ts";
 import { loginCookie, startTestServer } from "../apps/server/src/test-helpers.ts";
+
+describe("RedactingLogger", () => {
+  test("redacts sk-ob_ keys", () => {
+    const logger = new RedactingLogger(() => undefined);
+    logger.info("mint", { token: "sk-ob_deadbeefcafebabe" });
+    const line = logger.lines.join("\n");
+    expect(line).toContain("sk-ob_[redacted]");
+    expect(line).not.toContain("deadbeef");
+    expect(logger.containsSecretLeak()).toBe(false);
+  });
+});
 
 describe("allowlist + bot-create + key inject", () => {
   test("listed GitHub login can become a session; unlisted is denied", () => {
@@ -18,6 +38,28 @@ describe("allowlist + bot-create + key inject", () => {
     expect(session.githubLogin).toBe("alice");
     expect(session.accountId).toBeTruthy();
     expect(() => completeGithubLogin(db, allow, { login: "mallory" })).toThrow(AuthDenied);
+    expect(sessionFromToken(db, session.token)?.accountId).toBe(session.accountId);
+  });
+
+  test("second allowlisted login shares the org account; sk-ob_ stays the founder", () => {
+    const home = tempHome();
+    writeAllowlistFile(home, ["alice", "bob"]);
+    const allow = loadAllowlist(home);
+    const db = OpenbotDb.open(join(home, "openbot.sqlite"));
+    db.run(
+      `INSERT INTO org_meta (id, account_id, org_id, slug, name, public_origin, pubkey, federation_enabled, created_at)
+       VALUES ('current', NULL, ?, 'local', 'local', NULL, '', 0, ?)`,
+      [crypto.randomUUID(), Date.now()],
+    );
+    const alice = completeGithubLogin(db, allow, { login: "alice" });
+    const bob = completeGithubLogin(db, allow, { login: "bob" });
+    expect(bob.accountId).toBe(alice.accountId);
+    expect(db.all("SELECT id FROM accounts").length).toBe(1);
+    expect(sessionFromToken(db, bob.token)?.accountId).toBe(alice.accountId);
+    expect(sessionFromToken(db, bob.token)?.githubLogin).toBe("bob");
+    const minted = mintApiKey(db, alice.accountId);
+    expect(sessionFromApiKey(db, minted.token)?.githubLogin).toBe("alice");
+    db.close();
   });
 
   test("unlisted user is denied via the same completeGithubLogin path the OAuth callback uses", async () => {

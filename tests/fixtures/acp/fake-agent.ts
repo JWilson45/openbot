@@ -4,7 +4,14 @@
  *
  * Directives in the user prompt:
  *   [[send:body]]     POST SendMessage via MCP HTTP
+ *   [[sendto:Name:body]]  POST SendToAgent
+ *   [[sendorg:slug:body]] POST SendToOrg (Gateway)
+ *   [[inbox]]         POST Inbox list, then SendMessage the JSON
+ *   [[inboxack:id]]   POST Inbox ack
  *   [[echo-prompt]]   SendMessage "got-digest" or "no-digest" based on ACP reset block
+ *   [[echo-prefix]]   SendMessage "got-group-prefix" if the group runTurn prefix is present
+ *   [[thread:Title:body]]  SendToThread by group title (empty Title omits name/threadId)
+ *   [[threadid:uuid:body]] SendToThread by group thread id
  *   [[write:name]]    write name into cwd
  *   [[ramble]]        emit assistant text, do not SendMessage
  *   [[sleep:ms]]      wait
@@ -61,7 +68,13 @@ function extractText(prompt: unknown): string {
   return "";
 }
 
-async function callTool(url: string, token: string, name: string, args: Record<string, unknown>): Promise<void> {
+function currentMessage(text: string): string {
+  const marker = "\nCurrent message:\n";
+  const idx = text.lastIndexOf(marker);
+  return idx >= 0 ? text.slice(idx + marker.length) : text;
+}
+
+async function callTool(url: string, token: string, name: string, args: Record<string, unknown>): Promise<unknown> {
   const res = await fetch(url, {
     method: "POST",
     headers: {
@@ -75,10 +88,27 @@ async function callTool(url: string, token: string, name: string, args: Record<s
       params: { name, arguments: args },
     }),
   });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`${name} HTTP ${res.status}: ${text}`);
+  const text = await res.text();
+  let json: { result?: { content?: Array<{ text?: string }> }; error?: { data?: { code?: string }; message?: string } } =
+    {};
+  try {
+    json = JSON.parse(text) as typeof json;
+  } catch {
+    /* keep empty */
   }
+  if (!res.ok) {
+    const code = json.error?.data?.code ?? json.error?.message ?? text;
+    throw new Error(`${name} HTTP ${res.status}: ${code}`);
+  }
+  const payload = json.result?.content?.[0]?.text;
+  if (payload) {
+    try {
+      return JSON.parse(payload) as unknown;
+    } catch {
+      return payload;
+    }
+  }
+  return json;
 }
 
 async function callSend(url: string, token: string, body: string): Promise<void> {
@@ -130,6 +160,7 @@ async function handle(msg: {
     const sessionId = String(params.sessionId ?? "");
     const sess = sessions.get(sessionId);
     const text = extractText(params.prompt);
+    const current = currentMessage(text);
     notify("session/update", {
       sessionId,
       update: {
@@ -138,21 +169,21 @@ async function handle(msg: {
       },
     });
 
-    const sleep = /\[\[sleep:(\d+)\]\]/.exec(text);
+    const sleep = /\[\[sleep:(\d+)\]\]/.exec(current);
     if (sleep) await Bun.sleep(Number(sleep[1]));
 
-    const writeMatch = /\[\[write:([^\]]+)\]\]/.exec(text);
+    const writeMatch = /\[\[write:([^\]]+)\]\]/.exec(current);
     if (writeMatch && sess) {
       writeFileSync(join(sess.cwd, writeMatch[1]), `written-by-fake-agent\ncwd=${sess.cwd}\n`);
     }
 
-    const shell = /\[\[shell:([^\]]+)\]\]/.exec(text);
+    const shell = /\[\[shell:([^\]]+)\]\]/.exec(current);
     if (shell && sess) {
       const proc = Bun.spawn(["bash", "-lc", shell[1]], { cwd: sess.cwd, stdout: "pipe", stderr: "pipe" });
       await proc.exited;
     }
 
-    if (text.includes("[[permission]]")) {
+    if (current.includes("[[permission]]")) {
       const rpcId = permRpc++;
       write({
         jsonrpc: "2.0",
@@ -175,35 +206,7 @@ async function handle(msg: {
     const mcpUrl = sess?.mcpUrl || process.env.OPENBOT_MCP_URL;
     const mcpToken = sess?.mcpToken || process.env.OPENBOT_MCP_TOKEN;
 
-    try {
-      const sendto = /\[\[sendto:([^:\]]+):([\s\S]*?)\]\]/.exec(text);
-      if (sendto && mcpUrl && mcpToken) {
-        await callTool(mcpUrl, mcpToken, "SendToAgent", { name: sendto[1].trim(), body: sendto[2].trim() });
-      }
-
-      if (text.includes("[[echo-prompt]]") && mcpUrl && mcpToken) {
-        await callSend(mcpUrl, mcpToken, /ACP session reset/.test(text) ? "got-digest" : "no-digest");
-      }
-
-      const send = /\[\[send:([\s\S]*?)\]\]/.exec(text);
-      const sendCwd = text.includes("[[cwd]]");
-      if ((send || sendCwd) && mcpUrl && mcpToken) {
-        const body = sendCwd ? `cwd=${sess?.cwd}` : send![1].trim();
-        await callSend(mcpUrl, mcpToken, body);
-      } else if (
-        mcpUrl &&
-        mcpToken &&
-        !text.includes("[[ramble]]") &&
-        !text.includes("[[permission]]") &&
-        !text.includes("[[echo-prompt]]") &&
-        !text.includes("[[sendto:") &&
-        !writeMatch &&
-        !shell &&
-        text.trim()
-      ) {
-        await callSend(mcpUrl, mcpToken, text.trim());
-      }
-    } catch (err) {
+    const noteMcpError = (err: unknown) => {
       notify("session/update", {
         sessionId,
         update: {
@@ -211,6 +214,105 @@ async function handle(msg: {
           content: { type: "text", text: `mcp_error: ${String(err)}\n` },
         },
       });
+    };
+
+    if (mcpUrl && mcpToken) {
+      const sendorg = /\[\[sendorg:([^:\]]+):([\s\S]*?)\]\]/.exec(current);
+      if (sendorg) {
+        try {
+          await callTool(mcpUrl, mcpToken, "SendToOrg", { org: sendorg[1].trim(), body: sendorg[2].trim() });
+        } catch (err) {
+          noteMcpError(err);
+        }
+      }
+
+      const sendto = /\[\[sendto:([^:\]]+):([\s\S]*?)\]\]/.exec(current);
+      if (sendto) {
+        try {
+          await callTool(mcpUrl, mcpToken, "SendToAgent", { name: sendto[1].trim(), body: sendto[2].trim() });
+        } catch (err) {
+          noteMcpError(err);
+        }
+      }
+
+      const threadById = /\[\[threadid:([^:\]]+):([\s\S]*?)\]\]/.exec(current);
+      if (threadById) {
+        try {
+          await callTool(mcpUrl, mcpToken, "SendToThread", {
+            threadId: threadById[1].trim(),
+            body: threadById[2].trim(),
+          });
+        } catch (err) {
+          noteMcpError(err);
+        }
+      }
+
+      const threadByName = /\[\[thread:(?!id)([^:\]]*):([\s\S]*?)\]\]/.exec(current);
+      if (threadByName) {
+        try {
+          const title = threadByName[1].trim();
+          const body = threadByName[2].trim();
+          await callTool(mcpUrl, mcpToken, "SendToThread", title ? { name: title, body } : { body });
+        } catch (err) {
+          noteMcpError(err);
+        }
+      }
+
+      if (current.includes("[[inbox]]")) {
+        try {
+          const listed = await callTool(mcpUrl, mcpToken, "Inbox", { limit: 20 });
+          await callSend(mcpUrl, mcpToken, JSON.stringify(listed));
+        } catch (err) {
+          noteMcpError(err);
+        }
+      }
+
+      const inboxack = /\[\[inboxack:([^\]]+)\]\]/.exec(current);
+      if (inboxack) {
+        try {
+          const remaining = await callTool(mcpUrl, mcpToken, "Inbox", { ack: inboxack[1].trim() });
+          await callSend(mcpUrl, mcpToken, JSON.stringify(remaining));
+        } catch (err) {
+          noteMcpError(err);
+        }
+      }
+
+      try {
+        if (current.includes("[[echo-prompt]]")) {
+          await callSend(mcpUrl, mcpToken, /ACP session reset/.test(text) ? "got-digest" : "no-digest");
+        }
+        if (current.includes("[[echo-prefix]]")) {
+          await callSend(
+            mcpUrl,
+            mcpToken,
+            /To speak here call SendToThread/.test(text) ? "got-group-prefix" : "no-group-prefix",
+          );
+        }
+
+        const send = /\[\[send:([\s\S]*?)\]\]/.exec(current);
+        const sendCwd = current.includes("[[cwd]]");
+        if (send || sendCwd) {
+          const body = sendCwd ? `cwd=${sess?.cwd}` : send![1].trim();
+          await callSend(mcpUrl, mcpToken, body);
+        } else if (
+          !current.includes("[[ramble]]") &&
+          !current.includes("[[permission]]") &&
+          !current.includes("[[echo-prompt]]") &&
+          !current.includes("[[echo-prefix]]") &&
+          !current.includes("[[sendto:") &&
+          !current.includes("[[sendorg:") &&
+          !current.includes("[[inbox]]") &&
+          !current.includes("[[inboxack:") &&
+          !current.includes("[[thread") &&
+          !writeMatch &&
+          !shell &&
+          current.trim()
+        ) {
+          await callSend(mcpUrl, mcpToken, current.trim());
+        }
+      } catch (err) {
+        noteMcpError(err);
+      }
     }
 
     write({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
