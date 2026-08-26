@@ -151,6 +151,11 @@ export const SPA_HTML = `<!DOCTYPE html>
       padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--bot);
     }
     .archive-row .meta { color: var(--muted); font-size: .9rem; }
+    .org-row, .peer-row {
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between;
+      padding: 10px 0; border-bottom: 1px solid var(--line);
+    }
+    .mono { font-family: ui-monospace, monospace; font-size: .78rem; overflow-wrap: anywhere; }
     .avatar {
       flex: 0 0 32px; width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center;
       background: #31415a; font-size: .75rem; font-weight: 700;
@@ -281,6 +286,79 @@ export const SPA_HTML = `<!DOCTYPE html>
     return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
   function announce(msg) { if (announceEl) announceEl.textContent = msg; }
+  function parseHttpUrl(raw) {
+    try {
+      const url = new URL(String(raw || '').trim());
+      // Scheme must be http: or https:. Reject javascript:, data:, relative paths (new URL without a base).
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+      if (!url.hostname) return null;
+      url.username = '';
+      url.password = ''; // don't navigate with embedded credentials
+      return url;
+    } catch { return null; }
+  }
+  function loadOrgBookmarks() {
+    try {
+      const raw = JSON.parse(localStorage.getItem('openbot-orgs') || '[]');
+      if (!Array.isArray(raw)) return [];
+      const out = [];
+      for (const item of raw) {
+        if (!item || typeof item !== 'object') continue;
+        const name = String(item.name || '').trim();
+        const url = parseHttpUrl(item.baseUrl);
+        if (!name || !url) continue;
+        out.push({ name, baseUrl: url.href });
+      }
+      return out;
+    } catch { return []; }
+  }
+  function saveOrgBookmarks(list) {
+    try { localStorage.setItem('openbot-orgs', JSON.stringify(list)); } catch {}
+  }
+  function goToOrg(baseUrl) {
+    const url = parseHttpUrl(baseUrl);
+    if (!url) { announce('Only http and https org URLs are allowed'); return; }
+    if (url.origin === location.origin) return;
+    location.href = url.href;
+  }
+  async function copyText(text, btn, doneMsg) {
+    const label = btn ? btn.textContent : '';
+    try {
+      await navigator.clipboard.writeText(String(text || ''));
+      if (btn) {
+        btn.textContent = 'Copied';
+        setTimeout(() => { btn.textContent = label; }, 1200);
+      }
+      announce(doneMsg || 'Copied');
+    } catch {
+      if (btn) btn.textContent = 'Copy failed';
+    }
+  }
+  function thisOrgName() {
+    return (state.org && (state.org.name || state.org.slug)) || location.host || 'this instance';
+  }
+  function solicitNotices(json) {
+    if (!json || typeof json !== 'object') return [];
+    const out = [];
+    const seen = new Set();
+    function emit(row, force) {
+      if (!row || typeof row !== 'object') return;
+      const kind = String(row.kind || row.type || row.reason || row.status || '');
+      const body = String(row.body || row.text || row.message || '');
+      const looks = force || row.solicit === true || /solicit|untrusted|unknown_peer|tried to send/i.test(kind + ' ' + body);
+      if (!looks) return;
+      const who = row.name || row.slug || row.fromOrg || row.orgName || row.host || row.from_org || 'unknown';
+      const line = 'Org ' + who + ' tried to send mail';
+      if (seen.has(line)) return;
+      seen.add(line);
+      out.push(line);
+    }
+    if (Array.isArray(json.solicitations)) for (const row of json.solicitations) emit(row, true);
+    if (Array.isArray(json.inbox)) for (const row of json.inbox) emit(row, false);
+    if (Array.isArray(json.rows)) for (const row of json.rows) emit(row, false);
+    if (Array.isArray(json.items)) for (const row of json.items) emit(row, false);
+    return out;
+  }
   function initials(name) {
     const p = String(name||'?').trim().split(/\\s+/).slice(0,2);
     return p.map(x => x[0] ? x[0].toUpperCase() : '').join('') || '?';
@@ -720,11 +798,14 @@ export const SPA_HTML = `<!DOCTYPE html>
       ? '<ul class="act-list" id="activity-board"></ul>'
       : '<ol class="msgs" id="msgs" tabindex="0"></ol><div class="composer-wrap">' + composer + '</div><p class="muted" style="padding:0 16px 12px">Closing this tab does not stop teammates. Stopping <code>openbot server</code> does.</p>';
 
+    const orgName = thisOrgName();
     el.innerHTML = '';
     el.append(h(\`<header class="app-header">
       <h1>\${escapeHtml(heading)}</h1>
       <div class="header-actions">
         \${statusPill()}
+        <span class="pill" id="this-org" title="This instance">\${escapeHtml(orgName)}</span>
+        <button type="button" id="open-orgs" aria-haspopup="dialog">Orgs</button>
         <button type="button" class="side-toggle" id="live-toggle" aria-expanded="false">Live work</button>
         \${!inArchive && !inActivity && !inGroup && state.bot && !gwSelected ? '<button type="button" id="archive-bot">Archive</button>' : ''}
         <button type="button" id="help" aria-haspopup="dialog">Help</button>
@@ -794,6 +875,7 @@ export const SPA_HTML = `<!DOCTYPE html>
     bind('#newbot', renderOnboard);
     bind('#new-group', openNewGroup);
     bind('#help', openHelp);
+    bind('#open-orgs', openOrgs);
     bind('#open-archive', openArchiveFolder);
     bind('#open-activity', openActivity);
     bind('#archive-bot', archiveCurrentBot);
@@ -1683,6 +1765,74 @@ export const SPA_HTML = `<!DOCTYPE html>
     });
   }
 
+  function openOrgs() {
+    const overlay = h(\`<div class="overlay"><div class="modal">
+      <h2 id="orgs-title">Orgs</h2>
+      <p class="muted">Where this browser can open a desk. Not the Gateway peer allowlist — that lives in Settings.</p>
+      <p><strong>This instance</strong> · \${escapeHtml(thisOrgName())} · <span class="mono">\${escapeHtml(location.origin)}</span></p>
+      <ul id="org-list"></ul>
+      <p class="err" id="org-err" hidden></p>
+      <div class="modal-actions">
+        <button type="button" class="primary" id="bookmark-org">Bookmark this URL</button>
+        <button type="button" id="close-orgs">Close</button>
+      </div>
+    </div></div>\`);
+    overlay.querySelector('.modal').setAttribute('aria-labelledby', 'orgs-title');
+    const close = openOverlay(overlay);
+    overlay.querySelector('#close-orgs').onclick = close;
+    function paintBookmarks() {
+      const box = overlay.querySelector('#org-list');
+      const err = overlay.querySelector('#org-err');
+      err.hidden = true;
+      const list = loadOrgBookmarks();
+      if (!list.length) {
+        box.innerHTML = '<li class="muted">No bookmarks yet. Bookmark this URL, then open the other org and bookmark there too.</li>';
+        return;
+      }
+      box.innerHTML = list.map(o => {
+        const here = parseHttpUrl(o.baseUrl) && parseHttpUrl(o.baseUrl).origin === location.origin;
+        return '<li class="org-row"><div><strong>' + escapeHtml(o.name) + '</strong>' +
+          (here ? ' <span class="muted">this instance</span>' : '') +
+          '<div class="muted mono">' + escapeHtml(o.baseUrl) + '</div></div><div class="msg-actions">' +
+          (here ? '' : '<button type="button" data-go="' + escapeHtml(o.baseUrl) + '">Open</button>') +
+          '<button type="button" data-forget="' + escapeHtml(o.baseUrl) + '">Remove</button></div></li>';
+      }).join('');
+      box.querySelectorAll('[data-go]').forEach(btn => {
+        btn.onclick = () => {
+          const url = parseHttpUrl(btn.getAttribute('data-go'));
+          if (!url) { err.hidden = false; err.textContent = 'Only http and https org URLs are allowed'; return; }
+          goToOrg(url.href);
+        };
+      });
+      box.querySelectorAll('[data-forget]').forEach(btn => {
+        btn.onclick = () => {
+          const target = parseHttpUrl(btn.getAttribute('data-forget'));
+          saveOrgBookmarks(loadOrgBookmarks().filter(o => {
+            const u = parseHttpUrl(o.baseUrl);
+            return !target || !u || u.origin !== target.origin;
+          }));
+          paintBookmarks();
+        };
+      });
+    }
+    overlay.querySelector('#bookmark-org').onclick = () => {
+      const err = overlay.querySelector('#org-err');
+      const url = parseHttpUrl(location.origin);
+      if (!url) { err.hidden = false; err.textContent = 'Only http and https org URLs are allowed'; return; }
+      const name = thisOrgName();
+      const list = loadOrgBookmarks();
+      if (list.some(o => { const u = parseHttpUrl(o.baseUrl); return u && u.origin === url.origin; })) {
+        err.hidden = false; err.textContent = 'Already bookmarked'; return;
+      }
+      list.push({ name, baseUrl: url.origin });
+      saveOrgBookmarks(list);
+      err.hidden = true;
+      announce('Bookmarked ' + name);
+      paintBookmarks();
+    };
+    paintBookmarks();
+  }
+
   function openHelp() {
     const overlay = h(\`<div class="overlay"><div class="modal">
       <h2 id="help-title">Keyboard and chat</h2>
@@ -1704,6 +1854,13 @@ export const SPA_HTML = `<!DOCTYPE html>
   async function openSettings() {
     try { state.org = await api('/v1/org'); } catch { state.org = state.org || {}; }
     const fedOn = Boolean(state.org && state.org.federationEnabled);
+    let orgPub = '';
+    let orgId = (state.org && state.org.orgId) || '';
+    try {
+      const info = await api('/fed/v1/info');
+      if (info && info.pubkey) orgPub = String(info.pubkey);
+      if (!orgId && info && info.orgId) orgId = String(info.orgId);
+    } catch {}
     const overlay = h(\`<div class="overlay"><div class="modal">
       <h2 id="set-title">Settings</h2>
       <p class="muted">\${harnessBlurb()}</p>
@@ -1714,6 +1871,33 @@ export const SPA_HTML = `<!DOCTYPE html>
         <button type="button" id="fed-off" aria-pressed="\${fedOn ? 'false' : 'true'}">Off</button>
       </div>
       <p class="err" id="fed-err" hidden></p>
+      <h2 style="margin-top:16px;font-size:1rem">This org</h2>
+      <p class="muted">Share org id and pubkey with the other operator. Never the private key.</p>
+      <label for="org-id">Org id</label>
+      <input id="org-id" class="mono" readonly value="\${escapeHtml(orgId)}" />
+      <button type="button" id="copy-org-id">Copy org id</button>
+      <label for="org-pub">Pubkey</label>
+      <input id="org-pub" class="mono" readonly value="\${escapeHtml(orgPub)}" />
+      <button type="button" id="copy-org-pub">Copy pubkey</button>
+      <h2 style="margin-top:16px;font-size:1rem">Peers</h2>
+      <p class="muted">Who Gateway may talk to. Separate from Orgs bookmarks.</p>
+      <ul id="peer-list"></ul>
+      <p class="err" id="peer-err" hidden></p>
+      <label for="peer-url">Peer base URL</label>
+      <input id="peer-url" placeholder="https://beta.example.com" autocomplete="off" />
+      <button type="button" id="peer-from-info">Preview from-info</button>
+      <div id="peer-preview-box" hidden>
+        <label for="peer-slug">Slug</label>
+        <input id="peer-slug" autocomplete="off" />
+        <label for="peer-name">Name</label>
+        <input id="peer-name" autocomplete="off" />
+        <p class="muted mono" id="peer-preview-meta"></p>
+        <button type="button" class="primary" id="peer-add">Add peer</button>
+      </div>
+      <div id="solicit-wrap" hidden>
+        <h2 style="margin-top:16px;font-size:1rem">Solicitations</h2>
+        <ul id="solicit-list"></ul>
+      </div>
       <label for="set-key">API key override (optional)</label>
       <input id="set-key" type="password" autocomplete="off" placeholder="leave blank to use grok login" />
       \${inferenceFields('set-model', 'set-effort')}
@@ -1792,6 +1976,125 @@ export const SPA_HTML = `<!DOCTYPE html>
     }
     overlay.querySelector('#fed-on').onclick = () => setFederation(true);
     overlay.querySelector('#fed-off').onclick = () => setFederation(false);
+    overlay.querySelector('#copy-org-id').onclick = (e) => copyText(overlay.querySelector('#org-id').value, e.currentTarget, 'Copied org id');
+    overlay.querySelector('#copy-org-pub').onclick = (e) => copyText(overlay.querySelector('#org-pub').value, e.currentTarget, 'Copied pubkey');
+    let peerPreview = null;
+    async function refreshPeers() {
+      const list = overlay.querySelector('#peer-list');
+      const err = overlay.querySelector('#peer-err');
+      try {
+        const res = await api('/v1/org/peers');
+        const peers = res.peers || [];
+        list.innerHTML = peers.length
+          ? peers.map(p => '<li class="peer-row"><div><strong>' + escapeHtml(p.slug) + '</strong> ' + escapeHtml(p.name || '') +
+            '<div class="muted">' + escapeHtml(p.baseUrl || '') + ' · ' + escapeHtml(p.status || '') + '</div></div>' +
+            '<div class="msg-actions">' +
+            '<button type="button" class="linkish" data-copy-pub="' + escapeHtml(p.pubkey || '') + '">Copy pubkey</button>' +
+            (p.status === 'allowed' ? '<button type="button" data-disable="' + escapeHtml(p.orgId) + '">Disable</button>' : '') +
+            '<button type="button" data-del="' + escapeHtml(p.orgId) + '">Remove</button></div></li>').join('')
+          : '<li class="muted">No peers yet. Preview a URL, then add.</li>';
+        list.querySelectorAll('[data-copy-pub]').forEach(btn => {
+          btn.onclick = () => copyText(btn.getAttribute('data-copy-pub'), btn, 'Copied pubkey');
+        });
+        list.querySelectorAll('[data-disable]').forEach(btn => {
+          btn.onclick = async () => {
+            try {
+              await api('/v1/org/peers/' + encodeURIComponent(btn.getAttribute('data-disable')) + '/disable', { method:'POST', body: '{}' });
+              err.hidden = true;
+              refreshPeers();
+            } catch (e) { err.hidden = false; err.textContent = e.message || 'Could not disable peer'; }
+          };
+        });
+        list.querySelectorAll('[data-del]').forEach(btn => {
+          btn.onclick = async () => {
+            try {
+              await api('/v1/org/peers/' + encodeURIComponent(btn.getAttribute('data-del')), { method:'DELETE' });
+              err.hidden = true;
+              refreshPeers();
+            } catch (e) { err.hidden = false; err.textContent = e.message || 'Could not remove peer'; }
+          };
+        });
+        err.hidden = true;
+      } catch (e) {
+        list.innerHTML = '';
+        err.hidden = false;
+        err.textContent = e.message || 'Could not load peers';
+      }
+    }
+    overlay.querySelector('#peer-from-info').onclick = async () => {
+      const err = overlay.querySelector('#peer-err');
+      const box = overlay.querySelector('#peer-preview-box');
+      const typed = overlay.querySelector('#peer-url').value;
+      const url = parseHttpUrl(typed);
+      if (!url) { err.hidden = false; err.textContent = 'Only http and https peer URLs are allowed'; box.hidden = true; return; }
+      try {
+        peerPreview = await api('/v1/org/peers/from-info', { method:'POST', body: JSON.stringify({ baseUrl: typed }) });
+        overlay.querySelector('#peer-slug').value = peerPreview.slug || '';
+        overlay.querySelector('#peer-name').value = peerPreview.name || '';
+        overlay.querySelector('#peer-preview-meta').textContent =
+          (peerPreview.orgId || '') + ' · ' + (peerPreview.pubkey || '') +
+          (peerPreview.publicOrigin ? ' · ' + peerPreview.publicOrigin : '');
+        box.hidden = false;
+        err.hidden = true;
+      } catch (e) {
+        peerPreview = null;
+        box.hidden = true;
+        err.hidden = false;
+        err.textContent = e.message || 'from-info failed';
+      }
+    };
+    overlay.querySelector('#peer-add').onclick = async () => {
+      const err = overlay.querySelector('#peer-err');
+      if (!peerPreview) { err.hidden = false; err.textContent = 'Preview from-info first'; return; }
+      try {
+        await api('/v1/org/peers', { method:'POST', body: JSON.stringify({
+          slug: overlay.querySelector('#peer-slug').value,
+          name: overlay.querySelector('#peer-name').value,
+          orgId: peerPreview.orgId,
+          pubkey: peerPreview.pubkey,
+          baseUrl: overlay.querySelector('#peer-url').value,
+        }) });
+        overlay.querySelector('#peer-preview-box').hidden = true;
+        peerPreview = null;
+        err.hidden = true;
+        announce('Peer added');
+        refreshPeers();
+      } catch (e) {
+        err.hidden = false;
+        err.textContent = e.message || 'Could not add peer';
+      }
+    };
+    async function refreshSolicits() {
+      const wrap = overlay.querySelector('#solicit-wrap');
+      const box = overlay.querySelector('#solicit-list');
+      const lines = [];
+      const seen = new Set();
+      function addLines(arr) {
+        for (const line of arr) {
+          if (seen.has(line)) continue;
+          seen.add(line);
+          lines.push(line);
+        }
+      }
+      try {
+        // Untrusted solicitations may live on inbox; skip if that route is not shipped yet.
+        const res = await fetch('/v1/org/inbox', { credentials:'same-origin', headers: { 'content-type':'application/json' } });
+        if (res.status !== 404 && res.ok) addLines(solicitNotices(await res.json()));
+      } catch {}
+      try {
+        const act = await api('/v1/activity');
+        for (const b of act.bots || []) {
+          const text = String((b.lastMessage && b.lastMessage.body) || b.doing || '');
+          const m = /Org (.+) tried to send mail/i.exec(text);
+          if (m) addLines(['Org ' + m[1] + ' tried to send mail']);
+        }
+      } catch {}
+      if (!lines.length) { wrap.hidden = true; return; }
+      wrap.hidden = false;
+      box.innerHTML = lines.map(s => '<li>' + escapeHtml(s) + '</li>').join('');
+    }
+    void refreshPeers();
+    void refreshSolicits();
     bindInferenceSelects(overlay, '#set-model', '#set-effort');
     overlay.querySelector('#save').onclick = async () => {
       const key = overlay.querySelector('#set-key').value.trim();
