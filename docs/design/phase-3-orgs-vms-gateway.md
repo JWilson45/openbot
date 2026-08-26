@@ -908,6 +908,8 @@ Remote Ada is **not** a participant on Org A. Attribution: `messages.remote_org_
 
 ### Runtime: host or VM
 
+Operator walkthrough (install, origin, `org init` with zero users, first login, `gateway on` on both, A→B and B→A `peers add`, Open WebUI, RAM, hop=1): [docs/host-service.md](../host-service.md#two-vms-two-orgs-federation). Defaults in this section are unchanged.
+
 No new supervisor:
 
 ```

@@ -16,11 +16,12 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 ## Honesty (read this)
 
 - **Closing this browser tab does not stop your teammate.**
-- **Stopping `openbot server` / `openbot demo` does.**
+- **Stopping `openbot server` / `openbot demo` does.** Stopping the **VM** that runs it also does: that org is gone until it boots again. Peers see timeouts, not a hosted retry.
 - If you want work to continue while a laptop is closed, run the server on a machine that stays up (VPS, home server, systemd) — not on the laptop you are about to shut.
-- `$OPENBOT_HOME/desk` is a **shared computer**. It is **not** a security boundary. Every bot on the account can read and write the desk the way you can. There is **one Chromium** for the whole team.
-- Vault files (`master.key`, credentials) live **outside** `desk/`. Do not copy secrets into the workspace Grok can see.
+- `$OPENBOT_HOME/desk` is a **shared computer**. It is **not** a security boundary **inside** an org. Every bot on the account can read and write the desk the way you can. There is **one Chromium** for the whole team. Cross-org is messages only (hop=1).
+- Vault files (`master.key`, `org.ed25519`, credentials) live **outside** `desk/`. Do not copy secrets into the workspace Grok can see.
 - Restarting the server starts a new Grok ACP process. Chat history is in SQLite; OpenBot injects a thread digest on the next turn so the bot continues instead of announcing amnesia.
+- **Federation is off until you turn it on** on **both** sides. OpenBot does not provision Fly Machines.
 
 ---
 
@@ -28,7 +29,7 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 
 | Capability | What it means |
 | --- | --- |
-| Named bots | Up to **six** active teammates. Unique names. Archive frees a slot. |
+| Named bots | Up to **six** active desk teammates. Unique names. Archive frees a slot. Gateway is extra. |
 | Human DM | Each bot has a 1:1 thread with you. |
 | `SendMessage` | The **only** way a bot talks to you. Assistant rambling is a private work log unless it fails to call the tool (then you get a fallback). |
 | `SendToAgent` | Async mailbox to another bot. Does **not** write your DM. Handoffs in the UI show the A2A thread. |
@@ -39,6 +40,7 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 | Takeover | You grab the shared Chromium (screencast + input). Esc / Close ends it. |
 | Archive | Soft-delete folder. Restore, or type `DELETE` to purge. Expired archives (30 days) are removed automatically. |
 | OpenAI-compatible API | Open WebUI (and similar) can use a bot as `openbot/<Name>` with a `sk-ob_…` key. Two connections = two orgs (mint the key on that VM). |
+| Org / Gateway | One process is one org. Auto-provisioned **Gateway** diplomat (not a seventh desk slot). Federation **off** until `openbot gateway on` on both peers. |
 | Auth | Local demo login on loopback, or GitHub OAuth + allowlist. Optional vaulted `XAI_API_KEY`; `grok login` is enough. |
 
 ---
@@ -66,6 +68,12 @@ The CLI is `bun run openbot -- <command>` (or `bun run apps/server/src/cli.ts`).
 openbot demo    [--port 8787] [--home ~/.openbot] [--host 127.0.0.1] [--fake]
 openbot server  [--port 8787] [--home ~/.openbot] [--host 127.0.0.1] [--origin http://127.0.0.1:8787]
 openbot install [--user] [--home ~/.openbot] [--port 8787] [--start]
+openbot org [--home ~/.openbot]
+openbot org init [--home ~/.openbot] [--slug acme] [--name "Acme"]
+openbot gateway on | off [--home ~/.openbot]
+openbot peers [--home ~/.openbot]
+openbot peers add --slug beta --url https://beta.example.com --pubkey <b64> --org-id <uuid>
+openbot peers remove --id <orgId>
 openbot version | -v | --version
 openbot allowlist add <github-login>
 openbot allowlist
@@ -91,7 +99,7 @@ launchctl bootstrap gui/$UID ~/Library/LaunchAgents/ai.openbot.plist
 systemctl --user daemon-reload && systemctl --user enable --now openbot
 ```
 
-`grok login` must be done as the **same user** the service runs as. Full operator notes: [docs/host-service.md](docs/host-service.md).
+`grok login` must be done as the **same user** the service runs as. Full operator notes (including the two-VM federation runbook): [docs/host-service.md](docs/host-service.md).
 
 ---
 
@@ -139,7 +147,7 @@ Ada's DM gets “I asked Bob”. Bob's DM gets the draft. **Handoffs** shows the
 bun run openbot server --port 8787
 ```
 
-Bind is `127.0.0.1`. Put it behind your own TLS reverse proxy if you need a hostname. GitHub OAuth:
+Bind is `127.0.0.1`. Put it behind your own TLS reverse proxy if you need a hostname (Caddy must 404 `/mcp/v1`). Two VMs = two orgs: [docs/host-service.md](docs/host-service.md#two-vms-two-orgs-federation). GitHub OAuth:
 
 ```bash
 bun run openbot allowlist add your-github-login
@@ -192,12 +200,12 @@ Default `$OPENBOT_HOME` = `~/.openbot`.
 
 | Path | Role |
 | --- | --- |
-| `openbot.sqlite` | Bots, threads, turns, messages, live-work, sessions, `org_meta`, `org_peers` |
+| `openbot.sqlite` | Bots, threads, turns, messages, live-work, sessions, `org_meta`, `org_peers`, `org_inbox` |
 | `org.json` | Optional org slug/name/origin. DB wins once written; `org init` rewrites this file. |
 | `org.ed25519` | Sealed Ed25519 org key (mode 0600). Not under `desk/`. Not a `credentials` row. |
 | `master.key` | Vault master (mode 0600). Not under `desk/` |
 | `allowlist` | GitHub logins, one per line |
-| `desk/` | Shared computer. Chromium profile under `desk/.openbot/chromium`. |
+| `desk/` | Shared computer. Chromium profile under `desk/.openbot/chromium`. Gateway cwd `desk/.openbot/gateway/`. |
 | `desk/projects/<botId>/` | That bot's ACP cwd. Purge deletes this folder only. Bots can still `../` into siblings. |
 | `grok-home/` | Isolated Grok config (no user MCP servers). Auth is linked from `~/.grok/auth.json` |
 
@@ -216,7 +224,10 @@ Default `$OPENBOT_HOME` = `~/.openbot`.
 | `OPENBOT_ORG_ID` | Stable org UUID. Generated on first boot if unset. A **different** value than `org_meta.org_id` refuses to boot. |
 | `OPENBOT_ORG_SLUG` | Org slug (single DNS label). May update the stored slug. FQDN origins such as `desk.example.com` do **not** auto-slug — they become `local` unless you set this, `org.json`, or `openbot org init --slug`. |
 | `OPENBOT_ORG_NAME` | Display name. May update the stored name. |
-| `OPENBOT_ACP_IDLE_MS` | Kill idle Grok ACP children after this many ms. Default **600000** (10 minutes). `0` disables. Cold start on the next message is a few seconds plus a thread digest — not a full amnesia. |
+| `OPENBOT_ACP_IDLE_MS` | Kill idle **desk** Grok ACP children after this many ms. Default **600000** (10 minutes). `0` disables desk idle kill only (not Gateway). Cold start on the next message is a few seconds plus a thread digest — not a full amnesia. |
+| `OPENBOT_GATEWAY_ACP_IDLE_MS` | Gateway ACP idle TTL. Default **1800000** (30 minutes). `0` disables Gateway idle kill only. |
+| `OPENBOT_FEDERATION` | Panic **off:** `0` forces federation off even if the DB flag is on. Unset/`1` does **not** force on. Restart the unit so the process sees env. |
+| `OPENBOT_FED_ALLOW_HTTP` | `1` allows RFC1918 `http://` peer URLs. Default is https + loopback http. |
 | `OPENBOT_GITHUB_CLIENT_ID` / `OPENBOT_GITHUB_CLIENT_SECRET` | GitHub OAuth |
 | `OPENBOT_GITHUB_ALLOWLIST` | Extra comma-separated GitHub logins |
 | `OPENBOT_DEV_LOGIN` | `1` enables `/auth/local` (loopback only). `demo` sets this. |
@@ -243,6 +254,11 @@ Cookie session (`openbot_session`) or `Authorization: Bearer` (session token or 
 | --- | --- | --- |
 | `GET` | `/v1/healthz` `/v1/readyz` | Liveness / SQLite + desk writable |
 | `GET` | `/v1/me` | Current user |
+| `GET` | `/fed/v1/info` | Public-ish org identity + pubkey. Rate-limited. No cookies. |
+| `GET`/`PATCH` | `/v1/org` | Member snapshot; `{ federationEnabled }` (cookie, not `sk-ob_`) |
+| `GET`/`POST`/`DELETE` | `/v1/org/peers` | Allowlist. `POST /v1/org/peers/from-info` is preview only |
+| `GET` | `/v1/org/inbox` | Recent federation rows (`pending` / `held` / …) |
+| `POST` | `/fed/v1/messages` | Signed inbound mail (JWS). 403 when federation is off (trusted → `held`) |
 | `POST` | `/v1/bots` | Create. Body `{ name, description, model?, reasoningEffort? }` |
 | `GET` | `/v1/bots` | Desk `bots[]` + archived; Gateway is a sidecar, not a seventh slot |
 | `POST` | `/v1/bots/:id/archive` `/restore` | Soft-delete / undo |
@@ -286,6 +302,16 @@ OpenBot speaks OpenAI Chat Completions so Open WebUI (and other OpenAI clients) 
 
 ---
 
+## Two VMs, two orgs
+
+One `openbot server` process is one org. A second host is a second org (own sqlite, `org.ed25519`, allowlist, API keys). OpenBot does **not** provision VMs (no Fly Machines). Stopping a VM stops that org.
+
+Walkthrough — install, origin, `org init` (zero users), first login (Gateway row, federation still **off**), `openbot gateway on` on **both**, A→B **and** B→A `peers add`, Open WebUI second connection, RAM, mention cap, hop=1, off/held/solicit: [docs/host-service.md](docs/host-service.md#two-vms-two-orgs-federation).
+
+Caddy **must** `handle /mcp/v1* { respond 404 }` and **must** proxy `/fed/v1`. Peers are bidirectional; hop is **1** (A→B only, no A→B→C).
+
+---
+
 ## Layout (code)
 
 Bun workspaces.
@@ -297,10 +323,11 @@ packages/runner/      localhost compute: desk, Chromium CDP, per-bot ACP
 packages/db/          SQLite schema + purge / archive
 packages/live-work/   messages, promote(), live-work events, thread digest
 packages/mcp-send-message/  SendMessage + SendToAgent
+packages/federation/  Ed25519 JWS for /fed/v1
 packages/vault/       credential encryption
 packages/auth/        GitHub / local session, allowlist
 packages/compute-protocol/  five-method host contract
-docs/design/          Phase 1 / Phase 2 design notes
+docs/design/          Phase 1 / Phase 2 / Phase 3 design notes
 tests/                bun:test; fake ACP, no live xAI required
 ```
 
@@ -320,18 +347,20 @@ CI (`.github/workflows/ci.yml`) is `bun install --frozen-lockfile` then `bun tes
 
 **Now**
 
-- Six active bots, 1:1 A2A only (no group chat).
+- Six active **desk** bots, 1:1 A2A only (no group chat in this cut). Gateway is extra and does not consume a roster slot.
 - One desk, one Chromium. Two bots editing files will race; two bots scraping will queue on the browser lock. Each bot's cwd is `desk/projects/<id>/`; that is a home folder, not a jail.
-- Idle Grok processes exit after 10 minutes (override `OPENBOT_ACP_IDLE_MS`). The next message cold-starts in a few seconds.
+- Idle desk Grok processes exit after 10 minutes (override `OPENBOT_ACP_IDLE_MS`). Gateway default 30 minutes. The next message cold-starts in a few seconds.
+- Federation default **off**. Hop **1** (no forwards). Group `@mention` cap is 3 when groups ship — still a RAM foot-gun.
 - Codex / OpenCode adapters are not shipped.
-- Bind is 127.0.0.1 by default; you own TLS and exposure.
+- Bind is 127.0.0.1 by default; you own TLS and exposure. Caddy must 404 `/mcp/v1`.
 
 **Not this project (later / never here)**
 
 - Fly Machines / tenant VM provisioning, `cptr`, hosted multi-tenant 6PN.
+- Remote runner (orchestrator on A, grok on B).
 - Mobile / desktop apps, Postgres control plane, per-bot filesystem isolation.
 
-Design background: [docs/design/phase-1-always-on-teammate-loop.md](docs/design/phase-1-always-on-teammate-loop.md), [docs/design/phase-2-team-on-one-desk.md](docs/design/phase-2-team-on-one-desk.md).
+Design background: [docs/design/phase-1-always-on-teammate-loop.md](docs/design/phase-1-always-on-teammate-loop.md), [docs/design/phase-2-team-on-one-desk.md](docs/design/phase-2-team-on-one-desk.md), [docs/design/phase-3-orgs-vms-gateway.md](docs/design/phase-3-orgs-vms-gateway.md).
 
 ---
 
@@ -345,6 +374,8 @@ Design background: [docs/design/phase-1-always-on-teammate-loop.md](docs/design/
 | Purge / delete fails | Archive first. Permanent delete is archived-only and body `{ "confirm": "DELETE" }`. |
 | `FOREIGN KEY constraint failed` on purge | Fixed in current `deleteBotPermanently` (A2A / live-work / cross-thread `turn_id`). Update and retry. |
 | Open WebUI 401 | Use `sk-ob_…` minted **on that VM**, base URL ending in `/v1`, model `openbot/<Name>` (or `openbot/Gateway`). Another org is another connection, not an OpenAI `organization` header. |
+| Peer `401 unknown_peer` | Add **both** directions (`peers add` A→B and B→A) and `openbot gateway on` on **both**. One-way allowlist is not enough. |
+| `403 federation_disabled` | Federation is off (or `OPENBOT_FEDERATION=0`). Trusted mail is `held`, no Gateway ACP. `openbot gateway on` (unless env panic). |
 | Takeover is a black `about:blank` | No page is open in the shared browser yet. That is idle Chromium, not a hang. |
 
 ---

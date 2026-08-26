@@ -10,6 +10,8 @@
 #
 # Caddy upgrades WebSockets for /v1/push and /v1/takeover by default.
 # MCP is loopback-only (Grok talks to 127.0.0.1, not through this proxy).
+# /fed/v1 is the public federation surface — proxy it (do not 404).
+# Two-VM walkthrough: docs/host-service.md
 
 desk.example.com {
 	handle /mcp/v1* {
