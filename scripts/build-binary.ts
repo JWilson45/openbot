@@ -18,8 +18,24 @@ function currentOut(): string {
   return `openbot-${os}-${arch}`;
 }
 
-const currentOnly = process.argv.includes("--current");
-const wanted = currentOnly ? TARGETS.filter((t) => t.out === currentOut()) : [...TARGETS];
+function parseWanted(): (typeof TARGETS)[number][] {
+  const currentOnly = process.argv.includes("--current");
+  const names = process.argv.filter((a) => a.startsWith("bun-") || a.startsWith("openbot-"));
+  if (currentOnly) return TARGETS.filter((t) => t.out === currentOut());
+  if (names.length > 0) {
+    return names.map((n) => {
+      const hit = TARGETS.find((t) => t.bunTarget === n || t.out === n);
+      if (!hit) {
+        console.error(`unknown target ${n}`);
+        process.exit(1);
+      }
+      return hit;
+    });
+  }
+  return [...TARGETS];
+}
+
+const wanted = parseWanted();
 if (wanted.length === 0) {
   console.error(`no compile target for ${process.platform}/${process.arch}`);
   process.exit(1);

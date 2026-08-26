@@ -8,6 +8,12 @@ on:
         description: Release tag (e.g. v0.3.0)
         required: true
         type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (e.g. v0.3.0)
+        required: true
+        type: string
 permissions:
   contents: write
 jobs:
@@ -16,32 +22,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # macos-13 (Intel) images are gone; cross-compile x64 from arm64.
           - os: macos-14
-            artifact: openbot-darwin-arm64
-          - os: macos-13
-            artifact: openbot-darwin-x64
+            bun_targets: bun-darwin-arm64 bun-darwin-x64
+            artifact: darwin
           - os: ubuntu-latest
-            artifact: openbot-linux-x64
-          - os: ubuntu-24.04-arm
-            artifact: openbot-linux-arm64
+            bun_targets: bun-linux-x64 bun-linux-arm64
+            artifact: linux
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2.2.0
       - run: bun install --frozen-lockfile
-      - run: bun run scripts/build-binary.ts --current
-      - uses: actions/upload-artifact@v4
+      - run: bun run scripts/build-binary.ts ${{ matrix.bun_targets }}
+      - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}
+          path: dist/openbot-*
   publish:
     needs: build
     runs-on: ubuntu-latest
     env:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
         with:
           path: artifacts
       - name: flatten binaries
@@ -57,7 +62,14 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            echo "release ${RELEASE_TAG} already exists"
+            echo "release ${RELEASE_TAG} already exists; uploading assets"
+            gh release upload "${RELEASE_TAG}" \
+              dist/openbot-darwin-arm64 \
+              dist/openbot-darwin-x64 \
+              dist/openbot-linux-x64 \
+              dist/openbot-linux-arm64 \
+              dist/install.sh \
+              --clobber
             exit 0
           fi
           gh release create "${RELEASE_TAG}" \
