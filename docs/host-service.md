@@ -471,7 +471,7 @@ Mint the key in that VM’s Settings (or `POST /v1/api-keys` with **that** origi
 | Trusted (allowlisted + valid JWS + `hop=1`) | `org_inbox` `pending`, at most one Gateway turn | `org_inbox` `held`, **403** `federation_disabled`, **no** ACP |
 | Untrusted (unknown peer, bad sig, `hop ≠ 1`, oversize, …) | **Not mail.** 401/400. Capped solicitation notice. No inbox pending. | Same (untrusted never becomes `held`) |
 
-Solicitation notices (no Grok): `origin='system'` on the Gateway human thread and `GET /v1/org/inbox` — this cut has no SPA Gateway rail; Open WebUI `openbot/Gateway` is the diplomat surface. Coalesced **one per (peer org id or IP /24) per hour**. Copy looks like: `Org acme (https://…) tried to send mail. Not on your peer list — ignored.` Bad signature on a claimed peer: `Claimed acme but the signature failed — ignored.` `GET /fed/v1/info` is not a solicitation.
+Untrusted solicits are **not mail** (no `org_inbox` row). They are a capped Gateway-DM `origin='system'` notice (Open WebUI `openbot/Gateway`; Settings → Peers/Trust when that UI exists) plus `audit_events` `fed.solicit` / `org_solicit`. Coalesced **one per (peer org id or IP /24) per hour**. Copy looks like: `Org acme (https://…) tried to send mail. Not on your peer list — ignored.` Bad signature on a claimed peer: `Claimed acme but the signature failed — ignored.` `GET /v1/org/inbox` is **trusted** `pending`/`held` only — it will not show “not on your peer list” notices. `GET /fed/v1/info` is not a solicitation.
 
 Turn federation **off** anytime: `openbot gateway off`, `PATCH /v1/org { "federationEnabled": false }`, or `OPENBOT_FEDERATION=0`. Schema, Gateway row, peers, and keys stay. Held mail waits until you turn it on.
 

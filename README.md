@@ -257,7 +257,7 @@ Cookie session (`openbot_session`) or `Authorization: Bearer` (session token or 
 | `GET` | `/fed/v1/info` | Public-ish org identity + pubkey. Rate-limited. No cookies. |
 | `GET`/`PATCH` | `/v1/org` | Member snapshot; `{ federationEnabled }` (cookie, not `sk-ob_`) |
 | `GET`/`POST`/`DELETE` | `/v1/org/peers` | Allowlist. `POST /v1/org/peers/from-info` is preview only |
-| `GET` | `/v1/org/inbox` | Recent federation rows (`pending` / `held` / …) |
+| `GET` | `/v1/org/inbox` | Trusted mail only (`pending` / `held`). Untrusted solicits are Gateway-DM `origin=system` + `fed.solicit` |
 | `POST` | `/fed/v1/messages` | Signed inbound mail (JWS). 403 when federation is off (trusted → `held`) |
 | `POST` | `/v1/bots` | Create. Body `{ name, description, model?, reasoningEffort? }` |
 | `GET` | `/v1/bots` | Desk `bots[]` + archived; Gateway is a sidecar, not a seventh slot |
