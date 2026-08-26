@@ -22,6 +22,7 @@ test("schema applies on a fresh sqlite file", () => {
     "api_keys",
     "org_meta",
     "thread_participants",
+    "org_members",
   ]) {
     expect(names).toContain(required);
   }
@@ -62,4 +63,10 @@ test("schema applies on a fresh sqlite file", () => {
   const fed = orgCols.find((c) => c.name === "federation_enabled");
   expect(fed?.notnull).toBe(1);
   expect(String(fed?.dflt_value)).toBe("0");
+  const memberCols = db.all<{ name: string }>("PRAGMA table_info(org_members)").map((c) => c.name);
+  for (const col of ["id", "org_id", "user_id", "account_id", "role", "created_at"]) {
+    expect(memberCols).toContain(col);
+  }
+  const indexes = db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index'").map((i) => i.name);
+  expect(indexes).toContain("org_members_user");
 });

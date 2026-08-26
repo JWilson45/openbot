@@ -192,6 +192,16 @@ CREATE TABLE IF NOT EXISTS org_meta (
   federation_enabled integer NOT NULL DEFAULT 0,
   created_at integer NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS org_members (
+  id text PRIMARY KEY,
+  org_id text NOT NULL,
+  user_id text NOT NULL REFERENCES users(id),
+  account_id text NOT NULL REFERENCES accounts(id),
+  role text NOT NULL DEFAULT 'member',
+  created_at integer NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS org_members_user ON org_members(user_id);
 `;
 
 export type SqlValue = string | number | bigint | boolean | null | Uint8Array;

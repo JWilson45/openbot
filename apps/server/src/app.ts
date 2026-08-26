@@ -35,6 +35,7 @@ import { mountOpenAiCompat } from "./openai.ts";
 import {
   clientRateKey,
   currentOrgMeta,
+  ensureOrgAccount,
   ensureOrgMeta,
   fedInfoPayload,
   FED_INFO_RATE_LIMIT,
@@ -123,6 +124,7 @@ export function createApp(cfg: HomeConfig): {
   const master = loadOrCreateMasterKey(cfg.home, process.env.OPENBOT_MASTER_KEY);
   const allowlist = loadAllowlist(cfg.home, process.env.OPENBOT_GITHUB_ALLOWLIST);
   const log = cfg.logger ?? new RedactingLogger();
+  ensureOrgAccount(db, log);
   const inflight = new McpInflight();
   const push = new Map<string, Set<ServerWebSocket>>();
   const fedInfoLimiter = new SlidingWindowRateLimiter(FED_INFO_RATE_LIMIT, FED_INFO_RATE_WINDOW_MS);
@@ -190,6 +192,7 @@ export function createApp(cfg: HomeConfig): {
     throw err;
   });
 
+  // Cookie or bearer session — not sk-ob_ keys (org credential for OpenAI clients).
   function requireSession(c: { req: { header: (n: string) => string | undefined } }): SessionInfo {
     const s =
       sessionFromToken(db, cookies(c)) ?? sessionFromToken(db, parseBearer(c.req.header("authorization")));
@@ -300,10 +303,17 @@ export function createApp(cfg: HomeConfig): {
   app.get("/v1/me", (c) => {
     try {
       const s = requireSession(c);
+      const org = currentOrgMeta(db);
+      const member = db.get<{ role: string }>("SELECT role FROM org_members WHERE user_id = ?", [s.userId]);
       return c.json({
         githubLogin: s.githubLogin,
         accountId: s.accountId,
         userId: s.userId,
+        orgId: org?.org_id ?? "",
+        orgSlug: org?.slug ?? "",
+        orgName: org?.name ?? "",
+        pubkey: org?.pubkey ?? "",
+        role: member?.role ?? "member",
       });
     } catch {
       return c.json({ error: "unauthorized" }, 401);

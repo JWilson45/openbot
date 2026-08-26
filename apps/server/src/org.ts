@@ -117,6 +117,53 @@ export function currentOrgMeta(db: OpenbotDb): OrgMetaRow | undefined {
   return row;
 }
 
+function insertFoundingMember(db: OpenbotDb, orgId: string, userId: string, accountId: string): void {
+  const member = db.get<{ id: string }>("SELECT id FROM org_members WHERE user_id = ?", [userId]);
+  if (member != null) return;
+  db.run(
+    `INSERT INTO org_members (id, org_id, user_id, account_id, role, created_at)
+     VALUES (?, ?, ?, ?, 'member', ?)`,
+    [id(), orgId, userId, accountId, now()],
+  );
+}
+
+/** Bind the oldest account to this instance when org_meta.account_id is still empty. */
+export function ensureOrgAccount(
+  db: OpenbotDb,
+  log?: { info: (msg: string, extra?: Record<string, unknown>) => void },
+): void {
+  db.immediate(() => {
+    const org = currentOrgMeta(db);
+    if (org == null) return;
+
+    let accountId = org.account_id;
+    if (accountId == null) {
+      const accounts = db.all<{ id: string; auth_user_id: string }>(
+        "SELECT id, auth_user_id FROM accounts ORDER BY created_at ASC, id ASC",
+      );
+      const oldest = accounts[0];
+      if (oldest == null) return;
+      accountId = oldest.id;
+      db.run("UPDATE org_meta SET account_id = ? WHERE id = 'current' AND account_id IS NULL", [accountId]);
+      insertFoundingMember(db, org.org_id, oldest.auth_user_id, accountId);
+      if (accounts.length > 1) {
+        log?.info("multiple accounts on this instance; extra account bots remain", {
+          orgAccountId: accountId,
+          extra: accounts.length - 1,
+        });
+      }
+      return;
+    }
+
+    const account = db.get<{ id: string; auth_user_id: string }>(
+      "SELECT id, auth_user_id FROM accounts WHERE id = ?",
+      [accountId],
+    );
+    if (account == null) return;
+    insertFoundingMember(db, org.org_id, account.auth_user_id, account.id);
+  });
+}
+
 export function ensureOrgMeta(db: OpenbotDb, opts: EnsureOrgMetaOpts = {}): OrgMetaRow {
   const env = opts.env ?? process.env;
   const file = opts.file ? readOrgFile(opts.file) : {};
