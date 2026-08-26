@@ -3,6 +3,7 @@ import {
   FED_RATE_INSTANCE_HOUR,
   FED_RATE_PEER_HOUR,
   FED_RATE_WINDOW_MS,
+  getThreadBridgeByLocal,
   getThreadBridgeByPeerThread,
   humanThread,
   id,
@@ -222,14 +223,18 @@ function resolveInboundBridgeThread(
     }
   };
 
+  // Echo of an id we already sent: fill peer_thread_id. Do not INSERT on an unbridged group.
   if (claimedLocal) {
-    const thread = db.get<{ id: string; kind: string; account_id: string }>(
-      "SELECT id, kind, account_id FROM threads WHERE id = ?",
-      [claimedLocal],
-    );
-    if (thread && thread.kind === "group" && thread.account_id === opts.accountId) {
-      const mapped = pair(thread.id);
-      if (mapped) return mapped;
+    const existing = getThreadBridgeByLocal(db, claimedLocal);
+    if (existing && existing.peer_org_id.toLowerCase() === opts.fromOrgId.toLowerCase()) {
+      const thread = db.get<{ id: string; kind: string; account_id: string }>(
+        "SELECT id, kind, account_id FROM threads WHERE id = ?",
+        [claimedLocal],
+      );
+      if (thread && thread.kind === "group" && thread.account_id === opts.accountId) {
+        const mapped = pair(thread.id);
+        if (mapped) return mapped;
+      }
     }
   }
 
@@ -238,10 +243,13 @@ function resolveInboundBridgeThread(
     if (byPeer) return byPeer.local_thread_id;
   }
 
-  const open = listOpenPeerBridges(db, opts.fromOrgId);
-  if (open.length === 1) {
-    const mapped = pair(open[0]!.local_thread_id);
-    if (mapped) return mapped;
+  // Open outbound is only a handshake when the peer did not name their own thread.
+  if (!peerThreadId) {
+    const open = listOpenPeerBridges(db, opts.fromOrgId);
+    if (open.length === 1) {
+      const mapped = pair(open[0]!.local_thread_id);
+      if (mapped) return mapped;
+    }
   }
 
   const humanUserId = foundingUserId(db, opts.accountId);

@@ -11,7 +11,7 @@ import {
   type OrgInboxRow,
   type ThreadBridgeRow,
 } from "@openbot/db";
-import { generateEd25519 } from "@openbot/federation";
+import { generateEd25519, signFedJws } from "@openbot/federation";
 import { insertMessage } from "@openbot/live-work";
 import { persistMcpToken, sendToOrg, McpInflight } from "@openbot/mcp-send-message";
 import { loadOrCreateMasterKey } from "@openbot/vault";
@@ -69,6 +69,47 @@ async function bootOrg(slug: string): Promise<OrgHome> {
     headers,
     gwId: listed.gateway?.id ?? "",
   };
+}
+
+function envelope(from: OrgHome, to: OrgHome, extra?: Record<string, unknown>) {
+  const msgId = typeof extra?.id === "string" ? extra.id : id();
+  return {
+    id: msgId,
+    fromOrg: from.orgId,
+    fromSlug: from.slug,
+    fromActor: { type: "gateway" as const, name: "Gateway" },
+    toOrg: to.orgId,
+    urgency: "normal",
+    hop: 1,
+    createdAt: Date.now(),
+    body: "hello from peer",
+    ...extra,
+    id: msgId,
+  };
+}
+
+async function postFed(
+  from: { orgId: string; privateKey: OrgHome["privateKey"] },
+  toOrigin: string,
+  body: Record<string, unknown>,
+) {
+  const raw = JSON.stringify(body);
+  const token = signFedJws({
+    privateKey: from.privateKey,
+    fromOrgId: from.orgId,
+    toOrgId: String(body.toOrg),
+    messageId: String(body.id),
+    rawBody: raw,
+  });
+  return fetch(`${toOrigin}/fed/v1/messages`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      "idempotency-key": String(body.id),
+    },
+    body: raw,
+  });
 }
 
 async function addPeer(from: OrgHome, to: OrgHome) {
@@ -273,6 +314,164 @@ describe("SendToOrg thread bridges", () => {
           [bGroup!.id],
         )?.n,
       ).toBe(1);
+
+      const bToken = armGatewayTurn(b, bGroup!.id);
+      const reply = await sendToOrg(
+        b.ctx.db,
+        new McpInflight(),
+        `Bearer ${bToken}`,
+        { org: "alpha", body: "pair-reply", threadId: bGroup!.id },
+        { orgPrivateKey: () => b.privateKey, fetchFed: fetch },
+      );
+      expect(reply.hop).toBe(1);
+
+      const aRows = await waitInbox(a.ctx.db, (r) => r.some((x) => x.body === "pair-reply"));
+      const aMail = aRows.find((x) => x.body === "pair-reply")!;
+      expect(aMail.hop).toBe(1);
+      const replyEnv = JSON.parse(aMail.envelope) as {
+        hop: number;
+        threadHint?: { kind: string; localThreadId?: string; peerThreadId?: string };
+      };
+      expect(replyEnv.hop).toBe(1);
+      expect(replyEnv.threadHint?.kind).toBe("bridge");
+      expect(replyEnv.threadHint?.localThreadId).toBe(bGroup!.id);
+      expect(replyEnv.threadHint?.peerThreadId).toBe(groupId);
+
+      const aFed = a.ctx.db.get<{ thread_id: string }>(
+        "SELECT thread_id FROM messages WHERE origin = 'federation' AND body LIKE ? ORDER BY created_at DESC LIMIT 1",
+        ["%pair-reply%"],
+      );
+      expect(aFed?.thread_id).toBe(groupId);
+      const aAfter = a.ctx.db.get<ThreadBridgeRow>(
+        "SELECT * FROM thread_bridges WHERE local_thread_id = ?",
+        [groupId],
+      );
+      expect(aAfter?.peer_thread_id).toBe(bGroup!.id);
+      expect(aAfter?.auto_forward).toBe(0);
+      expect(a.ctx.db.all("SELECT id FROM threads WHERE kind = 'group'").length).toBe(1);
+      expect(b.ctx.db.all("SELECT id FROM threads WHERE kind = 'group'").length).toBe(1);
+    } finally {
+      a.server.stop(true);
+      b.server.stop(true);
+    }
+  });
+
+  test("claimedLocal does not bridge an unbridged local group", async () => {
+    const a = await bootOrg("alpha");
+    const b = await bootOrg("beta");
+    try {
+      await addPeer(a, b);
+      await addPeer(b, a);
+      const ada = await fetch(`${a.origin}/v1/bots`, {
+        method: "POST",
+        headers: a.headers,
+        body: JSON.stringify({ name: "Ada" }),
+      });
+      expect(ada.status).toBe(200);
+      const adaBody = (await ada.json()) as { bot: { id: string } };
+      const created = await fetch(`${a.origin}/v1/threads`, {
+        method: "POST",
+        headers: a.headers,
+        body: JSON.stringify({ kind: "group", title: "standup", botIds: [a.gwId, adaBody.bot.id] }),
+      });
+      expect([200, 201]).toContain(created.status);
+      const groupId = ((await created.json()) as { thread: { id: string } }).thread.id;
+      const peerThread = id();
+      const res = await postFed(
+        b,
+        a.origin,
+        envelope(b, a, {
+          body: "inject",
+          threadHint: { kind: "bridge", localThreadId: peerThread, peerThreadId: groupId },
+        }),
+      );
+      expect(res.status).toBe(202);
+      expect(
+        a.ctx.db.get<ThreadBridgeRow>("SELECT * FROM thread_bridges WHERE local_thread_id = ?", [groupId]),
+      ).toBeFalsy();
+      const bridgeGroup = a.ctx.db.get<{ id: string; title: string }>(
+        "SELECT id, title FROM threads WHERE kind = 'group' AND title = ? ORDER BY created_at DESC LIMIT 1",
+        ["Bridge · beta"],
+      );
+      expect(bridgeGroup?.id).toBeTruthy();
+      expect(bridgeGroup?.id).not.toBe(groupId);
+      const mapped = a.ctx.db.get<ThreadBridgeRow>(
+        "SELECT * FROM thread_bridges WHERE local_thread_id = ?",
+        [bridgeGroup!.id],
+      );
+      expect(mapped?.peer_org_id).toBe(b.orgId);
+      expect(mapped?.peer_thread_id).toBe(peerThread);
+      expect(mapped?.auto_forward).toBe(0);
+      expect(
+        a.ctx.db.get<{ thread_id: string }>(
+          "SELECT thread_id FROM messages WHERE origin = 'federation' ORDER BY created_at DESC LIMIT 1",
+        )?.thread_id,
+      ).toBe(bridgeGroup!.id);
+    } finally {
+      a.server.stop(true);
+      b.server.stop(true);
+    }
+  });
+
+  test("open outbound is not reused when inbound names a peer thread", async () => {
+    const a = await bootOrg("alpha");
+    const b = await bootOrg("beta");
+    try {
+      await addPeer(a, b);
+      await addPeer(b, a);
+      const ada = await fetch(`${a.origin}/v1/bots`, {
+        method: "POST",
+        headers: a.headers,
+        body: JSON.stringify({ name: "Ada" }),
+      });
+      expect(ada.status).toBe(200);
+      const adaBody = (await ada.json()) as { bot: { id: string } };
+      const created = await fetch(`${a.origin}/v1/threads`, {
+        method: "POST",
+        headers: a.headers,
+        body: JSON.stringify({ kind: "group", title: "project-x", botIds: [a.gwId, adaBody.bot.id] }),
+      });
+      expect([200, 201]).toContain(created.status);
+      const groupId = ((await created.json()) as { thread: { id: string } }).thread.id;
+      const token = armGatewayTurn(a, groupId);
+      await sendToOrg(
+        a.ctx.db,
+        new McpInflight(),
+        `Bearer ${token}`,
+        { org: "beta", body: "from-x", threadId: groupId },
+        { orgPrivateKey: () => a.privateKey, fetchFed: fetch },
+      );
+      expect(
+        a.ctx.db.get<ThreadBridgeRow>("SELECT * FROM thread_bridges WHERE local_thread_id = ?", [groupId])
+          ?.peer_thread_id,
+      ).toBeNull();
+
+      const otherPeerThread = id();
+      const res = await postFed(
+        b,
+        a.origin,
+        envelope(b, a, {
+          body: "from-y",
+          threadHint: { kind: "bridge", localThreadId: otherPeerThread },
+        }),
+      );
+      expect(res.status).toBe(202);
+      const stillOpen = a.ctx.db.get<ThreadBridgeRow>(
+        "SELECT * FROM thread_bridges WHERE local_thread_id = ?",
+        [groupId],
+      );
+      expect(stillOpen?.peer_thread_id).toBeNull();
+      const extra = a.ctx.db.get<{ id: string; title: string }>(
+        "SELECT id, title FROM threads WHERE kind = 'group' AND title = ?",
+        ["Bridge · beta"],
+      );
+      expect(extra?.id).toBeTruthy();
+      expect(extra?.id).not.toBe(groupId);
+      expect(
+        a.ctx.db.get<ThreadBridgeRow>("SELECT * FROM thread_bridges WHERE local_thread_id = ?", [extra!.id])
+          ?.peer_thread_id,
+      ).toBe(otherPeerThread);
+      expect(a.ctx.db.all("SELECT id FROM threads WHERE kind = 'group'").length).toBe(2);
     } finally {
       a.server.stop(true);
       b.server.stop(true);
