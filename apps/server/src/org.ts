@@ -1,6 +1,9 @@
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createPublicKey, type KeyObject } from "node:crypto";
+import { lookup as dnsLookup } from "node:dns/promises";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { id, now, type OpenbotDb } from "@openbot/db";
 import { open, seal } from "@openbot/vault";
 import {
@@ -553,57 +556,148 @@ export function insertOrgPeer(
 }
 
 export function getOrgPeer(db: OpenbotDb, peerOrgId: string): OrgPeerRow | undefined {
-  return db.get<OrgPeerRow>("SELECT * FROM org_peers WHERE peer_org_id = ?", [peerOrgId.trim().toLowerCase()]);
+  return (
+    db.get<OrgPeerRow>("SELECT * FROM org_peers WHERE peer_org_id = ?", [peerOrgId.trim().toLowerCase()]) ?? undefined
+  );
 }
 
 export function deleteOrgPeer(db: OpenbotDb, peerOrgId: string): boolean {
   const row = getOrgPeer(db, peerOrgId);
   if (!row) return false;
-  db.run("DELETE FROM org_peers WHERE peer_org_id = ?", [peerOrgId]);
-  return true;
+  db.run("DELETE FROM org_peers WHERE peer_org_id = ?", [row.peer_org_id]);
+  return getOrgPeer(db, row.peer_org_id) == null;
 }
 
 export function disableOrgPeer(db: OpenbotDb, peerOrgId: string): OrgPeerRow | undefined {
   const row = getOrgPeer(db, peerOrgId);
   if (!row) return undefined;
-  db.run("UPDATE org_peers SET status = 'disabled' WHERE peer_org_id = ?", [peerOrgId]);
-  return getOrgPeer(db, peerOrgId);
+  db.run("UPDATE org_peers SET status = 'disabled' WHERE peer_org_id = ?", [row.peer_org_id]);
+  const after = getOrgPeer(db, row.peer_org_id);
+  if (!after || after.status !== "disabled") return undefined;
+  return after;
 }
 
-export async function fetchPeerFedInfo(origin: string): Promise<unknown> {
-  const res = await fetch(`${origin}/fed/v1/info`, {
-    method: "GET",
-    redirect: "error",
-    signal: AbortSignal.timeout(FED_INFO_FETCH_TIMEOUT_MS),
-    headers: { accept: "application/json" },
-  });
-  if (!res.ok) throw new OrgPeerError("info_failed", "info_failed");
-  const cl = res.headers.get("content-length");
-  if (cl && Number(cl) > FED_INFO_FETCH_MAX_BYTES) throw new OrgPeerError("info_too_large", "info_too_large");
-  const reader = res.body?.getReader();
-  if (!reader) throw new OrgPeerError("info_failed", "info_failed");
-  const chunks: Uint8Array[] = [];
-  let n = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    n += value.byteLength;
-    if (n > FED_INFO_FETCH_MAX_BYTES) {
-      try {
-        await reader.cancel();
-      } catch {
-        /* ignore */
-      }
-      throw new OrgPeerError("info_too_large", "info_too_large");
-    }
-    chunks.push(value);
+export type PeerDnsLookup = (hostname: string) => Promise<Array<{ address: string; family: number }>>;
+
+export async function resolvePeerAddresses(
+  host: string,
+  lookup: PeerDnsLookup = defaultPeerLookup,
+): Promise<string[]> {
+  const normalized = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (!normalized) throw new OrgPeerError("invalid_peer_url", "invalid_peer_url");
+  if (parseIpv4(normalized) || expandIpv6(normalized)) {
+    if (isBlockedPeerHost(normalized)) throw new OrgPeerError("invalid_peer_url", "invalid_peer_url");
+    return [normalized];
   }
-  const buf = Buffer.concat(chunks.map((c) => Buffer.from(c)));
+  let records: Array<{ address: string; family: number }>;
   try {
-    return JSON.parse(buf.toString("utf8"));
+    records = await lookup(normalized);
+  } catch {
+    throw new OrgPeerError("invalid_peer_url", "invalid_peer_url");
+  }
+  if (!records.length) throw new OrgPeerError("invalid_peer_url", "invalid_peer_url");
+  const addrs = records.map((r) => r.address.trim().toLowerCase().replace(/^\[|\]$/g, ""));
+  for (const addr of addrs) {
+    if (!addr || isBlockedPeerHost(addr)) throw new OrgPeerError("invalid_peer_url", "invalid_peer_url");
+  }
+  return addrs;
+}
+
+export async function fetchPeerFedInfo(
+  origin: string,
+  opts?: { lookup?: PeerDnsLookup },
+): Promise<unknown> {
+  let url: URL;
+  try {
+    url = new URL(origin);
+  } catch {
+    throw new OrgPeerError("invalid_peer_url", "invalid_peer_url");
+  }
+  const host = url.hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  const addrs = await resolvePeerAddresses(host, opts?.lookup ?? defaultPeerLookup);
+  const pin = addrs[0]!;
+  const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
+  if (!Number.isInteger(port) || port <= 0) throw new OrgPeerError("invalid_peer_url", "invalid_peer_url");
+  const { status, body } = await pinnedFedInfoGet({
+    https: url.protocol === "https:",
+    connectIp: pin,
+    port,
+    hostHeader: url.host,
+    servername: host,
+  });
+  if (status < 200 || status >= 300) throw new OrgPeerError("info_failed", "info_failed");
+  try {
+    return JSON.parse(body.toString("utf8"));
   } catch {
     throw new OrgPeerError("info_failed", "info_failed");
   }
+}
+
+async function defaultPeerLookup(hostname: string): Promise<Array<{ address: string; family: number }>> {
+  return dnsLookup(hostname, { all: true });
+}
+
+function pinnedFedInfoGet(opts: {
+  https: boolean;
+  connectIp: string;
+  port: number;
+  hostHeader: string;
+  servername: string;
+}): Promise<{ status: number; body: Buffer }> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const fail = (err: OrgPeerError) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+    const family = expandIpv6(opts.connectIp) ? 6 : 4;
+    const reqFn = opts.https ? httpsRequest : httpRequest;
+    const req = reqFn(
+      {
+        hostname: opts.connectIp,
+        port: opts.port,
+        path: "/fed/v1/info",
+        method: "GET",
+        family,
+        headers: { accept: "application/json", host: opts.hostHeader },
+        timeout: FED_INFO_FETCH_TIMEOUT_MS,
+        ...(opts.https ? { servername: opts.servername } : {}),
+      },
+      (res) => {
+        const cl = res.headers["content-length"];
+        if (cl && Number(cl) > FED_INFO_FETCH_MAX_BYTES) {
+          req.destroy();
+          fail(new OrgPeerError("info_too_large", "info_too_large"));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        let n = 0;
+        res.on("data", (chunk: Buffer | string) => {
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          n += buf.length;
+          if (n > FED_INFO_FETCH_MAX_BYTES) {
+            req.destroy();
+            fail(new OrgPeerError("info_too_large", "info_too_large"));
+            return;
+          }
+          chunks.push(buf);
+        });
+        res.on("end", () => {
+          if (settled) return;
+          settled = true;
+          resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks) });
+        });
+        res.on("error", () => fail(new OrgPeerError("info_failed", "info_failed")));
+      },
+    );
+    req.on("timeout", () => {
+      req.destroy();
+      fail(new OrgPeerError("info_failed", "info_failed"));
+    });
+    req.on("error", () => fail(new OrgPeerError("info_failed", "info_failed")));
+    req.end();
+  });
 }
 
 function parseIpv4(host: string): [number, number, number, number] | null {
@@ -626,7 +720,13 @@ function expandIpv6(host: string): number[] | null {
     const v4 = parseIpv4(s.slice(7));
     if (v4) return [0, 0, 0, 0, 0, 0xffff, (v4[0] << 8) | v4[1], (v4[2] << 8) | v4[3]];
   }
-  if (s.includes(".")) return null;
+  if (s.includes(".")) {
+    const idx = s.lastIndexOf(":");
+    if (idx < 0) return null;
+    const v4 = parseIpv4(s.slice(idx + 1));
+    if (!v4) return null;
+    s = `${s.slice(0, idx)}:${((v4[0] << 8) | v4[1]).toString(16)}:${((v4[2] << 8) | v4[3]).toString(16)}`;
+  }
   const halves = s.split("::");
   if (halves.length > 2) return null;
   const parseHalf = (h: string): number[] | null => {
@@ -658,14 +758,20 @@ function isRfc1918Host(host: string): boolean {
   return false;
 }
 
+function isBlockedIpv4(v4: [number, number, number, number]): boolean {
+  if (v4[0] === 0 && v4[1] === 0 && v4[2] === 0 && v4[3] === 0) return true;
+  if (v4[0] === 169 && v4[1] === 254) return true;
+  return false;
+}
+
+function v6ToV4(hi: number, lo: number): [number, number, number, number] {
+  return [(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff];
+}
+
 function isBlockedPeerHost(host: string): boolean {
   if (host === "0.0.0.0") return true;
   const v4 = parseIpv4(host);
-  if (v4) {
-    if (v4[0] === 0 && v4[1] === 0 && v4[2] === 0 && v4[3] === 0) return true;
-    if (v4[0] === 169 && v4[1] === 254) return true;
-    return false;
-  }
+  if (v4) return isBlockedIpv4(v4);
   const v6 = expandIpv6(host);
   if (!v6) return false;
   if (v6.every((g) => g === 0)) return true;
@@ -683,11 +789,11 @@ function isBlockedPeerHost(host: string): boolean {
     return true;
   }
   if (v6[0] === 0 && v6[1] === 0 && v6[2] === 0 && v6[3] === 0 && v6[4] === 0 && v6[5] === 0xffff) {
-    const hi = v6[6]!;
-    const lo = v6[7]!;
-    const mapped: [number, number, number, number] = [(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff];
-    if (mapped[0] === 0 && mapped[1] === 0 && mapped[2] === 0 && mapped[3] === 0) return true;
-    if (mapped[0] === 169 && mapped[1] === 254) return true;
+    if (isBlockedIpv4(v6ToV4(v6[6]!, v6[7]!))) return true;
+  }
+  // NAT64 well-known prefix 64:ff9b::/96
+  if (v6[0] === 0x64 && v6[1] === 0xff9b && v6[2] === 0 && v6[3] === 0 && v6[4] === 0 && v6[5] === 0) {
+    if (isBlockedIpv4(v6ToV4(v6[6]!, v6[7]!))) return true;
   }
   return false;
 }

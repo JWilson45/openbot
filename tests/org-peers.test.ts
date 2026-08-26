@@ -4,6 +4,10 @@ import { generateEd25519 } from "@openbot/federation";
 import { id } from "@openbot/db";
 import { mintApiKey } from "@openbot/auth";
 import {
+  deleteOrgPeer,
+  disableOrgPeer,
+  fetchPeerFedInfo,
+  getOrgPeer,
   insertOrgPeer,
   listOrgPeers,
   OrgPeerError,
@@ -74,6 +78,35 @@ describe("peer URL policy", () => {
     expect(parsePeerBaseUrl("http://172.16.0.1", { OPENBOT_FED_ALLOW_HTTP: "1" })).toBe("http://172.16.0.1");
     expectPeerUrlThrows("http://172.15.0.1", { OPENBOT_FED_ALLOW_HTTP: "1" });
     expectPeerUrlThrows("http://8.8.8.8", { OPENBOT_FED_ALLOW_HTTP: "1" });
+    expectPeerUrlThrows("https://2852039166");
+    expectPeerUrlThrows("https://[64:ff9b::a9fe:a9fe]");
+    expectPeerUrlThrows("https://[64:ff9b::169.254.169.254]");
+  });
+
+  test("from-info rejects names that resolve to metadata/NAT64/link-local", async () => {
+    const lookup =
+      (address: string, family: number): ((hostname: string) => Promise<Array<{ address: string; family: number }>>) =>
+      async () => [{ address, family }];
+    await expect(
+      fetchPeerFedInfo("https://imds.test", { lookup: lookup("169.254.169.254", 4) }),
+    ).rejects.toMatchObject({ code: "invalid_peer_url" });
+    await expect(
+      fetchPeerFedInfo("https://imds.test", { lookup: lookup("64:ff9b::a9fe:a9fe", 6) }),
+    ).rejects.toMatchObject({ code: "invalid_peer_url" });
+    await expect(
+      fetchPeerFedInfo("https://imds.test", { lookup: lookup("fe80::1", 6) }),
+    ).rejects.toMatchObject({ code: "invalid_peer_url" });
+    await expect(
+      fetchPeerFedInfo("https://imds.test", { lookup: lookup("fd00:ec2::254", 6) }),
+    ).rejects.toMatchObject({ code: "invalid_peer_url" });
+    await expect(
+      fetchPeerFedInfo("https://imds.test", {
+        lookup: async () => [
+          { address: "203.0.113.9", family: 4 },
+          { address: "169.254.1.1", family: 4 },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: "invalid_peer_url" });
   });
 });
 
@@ -126,6 +159,20 @@ describe("org peers HTTP", () => {
         }),
       });
       expect(dup.status).toBe(409);
+      expect(((await dup.json()) as { error: string }).error).toBe("duplicate_slug");
+
+      const dupOrg = await fetch(`${origin}/v1/org/peers`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          slug: "gamma",
+          orgId,
+          baseUrl: "https://gamma.example.com",
+          pubkey: generateEd25519().publicKeyRawB64,
+        }),
+      });
+      expect(dupOrg.status).toBe(409);
+      expect(((await dupOrg.json()) as { error: string }).error).toBe("duplicate_org");
 
       const listed = await fetch(`${origin}/v1/org/peers`, { headers: { cookie } });
       expect(listed.status).toBe(200);
@@ -175,6 +222,70 @@ describe("org peers HTTP", () => {
 
       const missing = await fetch(`${origin}/v1/org/peers/${orgId}`, { method: "DELETE", headers: { cookie } });
       expect(missing.status).toBe(404);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("uppercase orgId disables and deletes the stored row", async () => {
+    const { server, origin, ctx } = startTestServer({ home: tempHome(), env: {} });
+    try {
+      const { cookie } = loginCookie({ ctx }, "alice");
+      const headers = { cookie, "content-type": "application/json" };
+      const disableId = id();
+      const created = await fetch(`${origin}/v1/org/peers`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          slug: "beta",
+          orgId: disableId,
+          baseUrl: "https://beta.example.com",
+          pubkey: generateEd25519().publicKeyRawB64,
+        }),
+      });
+      expect(created.status).toBe(200);
+      const disabled = await fetch(`${origin}/v1/org/peers/${disableId.toUpperCase()}/disable`, {
+        method: "POST",
+        headers: { cookie },
+      });
+      expect(disabled.status).toBe(200);
+      expect(((await disabled.json()) as { status: string }).status).toBe("disabled");
+      expect(getOrgPeer(ctx.db, disableId)?.status).toBe("disabled");
+      expect(disableOrgPeer(ctx.db, disableId.toUpperCase())?.status).toBe("disabled");
+
+      const deleteId = id();
+      const createdDel = await fetch(`${origin}/v1/org/peers`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          slug: "gamma",
+          orgId: deleteId,
+          baseUrl: "https://gamma.example.com",
+          pubkey: generateEd25519().publicKeyRawB64,
+        }),
+      });
+      expect(createdDel.status).toBe(200);
+      expect(deleteOrgPeer(ctx.db, deleteId.toUpperCase())).toBe(true);
+      expect(getOrgPeer(ctx.db, deleteId)).toBeUndefined();
+
+      const httpDelId = id();
+      const createdHttpDel = await fetch(`${origin}/v1/org/peers`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          slug: "delta",
+          orgId: httpDelId,
+          baseUrl: "https://delta.example.com",
+          pubkey: generateEd25519().publicKeyRawB64,
+        }),
+      });
+      expect(createdHttpDel.status).toBe(200);
+      const del = await fetch(`${origin}/v1/org/peers/${httpDelId.toUpperCase()}`, {
+        method: "DELETE",
+        headers: { cookie },
+      });
+      expect(del.status).toBe(200);
+      expect(getOrgPeer(ctx.db, httpDelId)).toBeUndefined();
     } finally {
       server.stop(true);
     }
@@ -268,21 +379,37 @@ describe("insertOrgPeer uniqueness", () => {
   test("slug and peer_org_id unique", async () => {
     const { ctx, server } = startTestServer({ home: tempHome(), env: {} });
     try {
-      const kp = generateEd25519();
+      const orgId = id();
       insertOrgPeer(ctx.db, {
         slug: "beta",
-        orgId: id(),
+        orgId,
         baseUrl: "https://beta.example.com",
-        pubkey: kp.publicKeyRawB64,
+        pubkey: generateEd25519().publicKeyRawB64,
       });
-      expect(() =>
+      try {
         insertOrgPeer(ctx.db, {
           slug: "beta",
           orgId: id(),
           baseUrl: "https://other.example.com",
           pubkey: generateEd25519().publicKeyRawB64,
-        }),
-      ).toThrow(OrgPeerError);
+        });
+        throw new Error("expected duplicate_slug");
+      } catch (err) {
+        expect(err).toBeInstanceOf(OrgPeerError);
+        expect((err as OrgPeerError).code).toBe("duplicate_slug");
+      }
+      try {
+        insertOrgPeer(ctx.db, {
+          slug: "gamma",
+          orgId,
+          baseUrl: "https://gamma.example.com",
+          pubkey: generateEd25519().publicKeyRawB64,
+        });
+        throw new Error("expected duplicate_org");
+      } catch (err) {
+        expect(err).toBeInstanceOf(OrgPeerError);
+        expect((err as OrgPeerError).code).toBe("duplicate_org");
+      }
     } finally {
       server.stop(true);
     }
