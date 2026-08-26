@@ -16,7 +16,7 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 ## Honesty (read this)
 
 - **Closing this browser tab does not stop your teammate.**
-- **Stopping `openbot server` / `openbot demo` does.** Stopping the **VM** that runs it also does: that org is gone until it boots again. Peers see timeouts, not a hosted retry.
+- **Stopping `openbot server` / `openbot demo` does.** Stopping the **VM** that runs it makes that org **unreachable** until it boots again. Peers see timeouts, not a hosted retry. sqlite, `org.ed25519`, and inbox rows stay on disk.
 - If you want work to continue while a laptop is closed, run the server on a machine that stays up (VPS, home server, systemd) — not on the laptop you are about to shut.
 - `$OPENBOT_HOME/desk` is a **shared computer**. It is **not** a security boundary **inside** an org. Every bot on the account can read and write the desk the way you can. There is **one Chromium** for the whole team. Cross-org is messages only (hop=1).
 - Vault files (`master.key`, `org.ed25519`, credentials) live **outside** `desk/`. Do not copy secrets into the workspace Grok can see.
@@ -304,9 +304,9 @@ OpenBot speaks OpenAI Chat Completions so Open WebUI (and other OpenAI clients) 
 
 ## Two VMs, two orgs
 
-One `openbot server` process is one org. A second host is a second org (own sqlite, `org.ed25519`, allowlist, API keys). OpenBot does **not** provision VMs (no Fly Machines). Stopping a VM stops that org.
+One `openbot server` process is one org. A second host is a second org (own sqlite, `org.ed25519`, allowlist, API keys). OpenBot does **not** provision VMs (no Fly Machines). Stopping a VM makes that org unreachable; disk identity and inbox remain.
 
-Walkthrough — install, origin, `org init` (zero users), first login (Gateway row, federation still **off**), `openbot gateway on` on **both**, A→B **and** B→A `peers add`, Open WebUI second connection, RAM, mention cap, hop=1, off/held/solicit: [docs/host-service.md](docs/host-service.md#two-vms-two-orgs-federation).
+Walkthrough — install, origin, `org init` (zero users), first login (Gateway row, federation still **off**), `openbot gateway on` on **both**, A→B **and** B→A `peers add`, Open WebUI second connection, RAM, mention cap (when groups ship), hop=1, off/held/solicit: [docs/host-service.md](docs/host-service.md#two-vms-two-orgs-federation).
 
 Caddy **must** `handle /mcp/v1* { respond 404 }` and **must** proxy `/fed/v1`. Peers are bidirectional; hop is **1** (A→B only, no A→B→C).
 
@@ -374,8 +374,8 @@ Design background: [docs/design/phase-1-always-on-teammate-loop.md](docs/design/
 | Purge / delete fails | Archive first. Permanent delete is archived-only and body `{ "confirm": "DELETE" }`. |
 | `FOREIGN KEY constraint failed` on purge | Fixed in current `deleteBotPermanently` (A2A / live-work / cross-thread `turn_id`). Update and retry. |
 | Open WebUI 401 | Use `sk-ob_…` minted **on that VM**, base URL ending in `/v1`, model `openbot/<Name>` (or `openbot/Gateway`). Another org is another connection, not an OpenAI `organization` header. |
-| Peer `401 unknown_peer` | Add **both** directions (`peers add` A→B and B→A) and `openbot gateway on` on **both**. One-way allowlist is not enough. |
-| `403 federation_disabled` | Federation is off (or `OPENBOT_FEDERATION=0`). Trusted mail is `held`, no Gateway ACP. `openbot gateway on` (unless env panic). |
+| Peer `401 unknown_peer` | Missing reverse allowlist. `peers add` **both** directions (A→B and B→A). Independent of `gateway on`. |
+| `403 federation_disabled` | Federation is off (or `OPENBOT_FEDERATION=0`). Trusted mail is `held`, no Gateway ACP. `openbot gateway on` on **both** (unless env panic). |
 | Takeover is a black `about:blank` | No page is open in the shared browser yet. That is idle Chromium, not a hang. |
 
 ---
