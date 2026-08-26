@@ -21,6 +21,7 @@ test("schema applies on a fresh sqlite file", () => {
     "takeover_tickets",
     "api_keys",
     "org_meta",
+    "thread_participants",
   ]) {
     expect(names).toContain(required);
   }

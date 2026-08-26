@@ -63,6 +63,17 @@ CREATE TABLE IF NOT EXISTS threads (
 CREATE UNIQUE INDEX IF NOT EXISTS threads_one_human_per_bot ON threads(bot_id) WHERE kind = 'human';
 CREATE UNIQUE INDEX IF NOT EXISTS threads_a2a_pair ON threads(account_id, bot_id, peer_bot_id) WHERE kind = 'a2a';
 
+CREATE TABLE IF NOT EXISTS thread_participants (
+  id text PRIMARY KEY,
+  thread_id text NOT NULL REFERENCES threads(id),
+  kind text NOT NULL,
+  user_id text REFERENCES users(id),
+  bot_id text REFERENCES bots(id),
+  created_at integer NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS tp_bot ON thread_participants(thread_id, bot_id) WHERE bot_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS tp_user ON thread_participants(thread_id, user_id) WHERE user_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS harness_sessions (
   id text PRIMARY KEY,
   compute_id text NOT NULL REFERENCES compute_instances(id),
@@ -322,6 +333,12 @@ export const ARCHIVE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 export function deleteBotPermanently(db: OpenbotDb, botId: string): void {
   db.immediate(() => {
+    // Membership rows FK to bots and to threads this bot still owns.
+    db.run(`DELETE FROM thread_participants WHERE bot_id = ?`, [botId]);
+    db.run(
+      `DELETE FROM thread_participants WHERE thread_id IN (SELECT id FROM threads WHERE bot_id = ?)`,
+      [botId],
+    );
     // Detach FKs first. SendMessage on another bot's human thread can point
     // turn_id at this bot's A2A turn; those rows must be unlinked, not deleted.
     db.run(

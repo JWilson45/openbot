@@ -35,6 +35,23 @@ export const postMessageInput = z.object({
   body: z.string().min(1).max(32_000),
 });
 
+export const createGroupThreadInput = z.object({
+  kind: z.literal("group"),
+  title: z.string().max(200).optional(),
+  botIds: z.array(z.string()).default([]),
+  userIds: z.array(z.string()).optional(),
+  addCaller: z.boolean().optional(),
+});
+
+export type CreateGroupThreadInput = z.infer<typeof createGroupThreadInput>;
+
+export const addThreadParticipantInput = z.object({
+  botId: z.string().min(1).optional(),
+  userId: z.string().min(1).optional(),
+});
+
+export type AddThreadParticipantInput = z.infer<typeof addThreadParticipantInput>;
+
 export const credentialInput = z.object({
   key: z.string().min(8).max(4096),
 });

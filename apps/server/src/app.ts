@@ -25,7 +25,7 @@ import {
 } from "@openbot/auth";
 import { loadOrCreateMasterKey, open, seal, RedactingLogger } from "@openbot/vault";
 import { approveMessage, handleMcpJsonRpc, McpInflight, rejectMessage } from "@openbot/mcp-send-message";
-import { McpError } from "@openbot/api-types";
+import { McpError, addThreadParticipantInput, createGroupThreadInput } from "@openbot/api-types";
 import { insertMessage, parseLivePayload, promote, summarizeLiveEvent } from "@openbot/live-work";
 import { sha256Hex } from "@openbot/db";
 import { detectCliLogins, listGrokModels, resolveBotInference } from "@openbot/acp-grok";
@@ -75,6 +75,35 @@ function cookies(c: { req: { header: (n: string) => string | undefined } }): str
   return parseCookie(c.req.header("cookie"));
 }
 
+const GROUP_MENTION_CAP = 3;
+const VISIBLE_MESSAGES_SQL =
+  "SELECT * FROM messages WHERE thread_id = ? AND origin != 'prompt' ORDER BY created_at";
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function parseGroupMentions<T extends { name: string }>(
+  body: string,
+  members: T[],
+): { mentioned: T[]; truncated: boolean } {
+  const hits: { member: T; index: number }[] = [];
+  for (const member of members) {
+    if (!member.name || /\s/.test(member.name)) continue;
+    const match = new RegExp(`(?:^|\\s)@${escapeRegExp(member.name)}\\b`, "i").exec(body);
+    if (match) hits.push({ member, index: match.index });
+  }
+  hits.sort((a, b) => a.index - b.index);
+  return {
+    mentioned: hits.slice(0, GROUP_MENTION_CAP).map((h) => h.member),
+    truncated: hits.length > GROUP_MENTION_CAP,
+  };
+}
+
+function groupMeetsMinimum(botCount: number, principalCount: number): boolean {
+  return botCount >= 2 || principalCount >= 3;
+}
+
 export function createApp(cfg: HomeConfig): {
   app: Hono;
   ctx: AppContext;
@@ -115,6 +144,11 @@ export function createApp(cfg: HomeConfig): {
   };
 
   const onPush = (accountId: string, event: unknown) => {
+    if (event && typeof event === "object") {
+      const ev = event as { type?: string; message?: { origin?: string } };
+      // Group prompt clones are per-turn engine input, not transcript bubbles.
+      if (ev.type === "message.created" && ev.message?.origin === "prompt") return;
+    }
     const set = push.get(accountId);
     if (!set) return;
     const payload = JSON.stringify(event);
@@ -520,6 +554,69 @@ export function createApp(cfg: HomeConfig): {
     return c.json({ models: listGrokModels(cfg.home) });
   });
 
+  app.post("/v1/threads", async (c) => {
+    const s = requireSession(c);
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      return c.json({ error: "bad_request" }, 400);
+    }
+    const parsed = createGroupThreadInput.safeParse(raw);
+    if (!parsed.success) return c.json({ error: "bad_request" }, 400);
+    const body = parsed.data;
+    if ((body.userIds ?? []).some((uid) => uid !== s.userId)) {
+      return c.json({ error: "org_members_required" }, 400);
+    }
+    const addCaller = body.addCaller !== false;
+    const bots: { id: string; name: string }[] = [];
+    const seen = new Set<string>();
+    for (const botId of body.botIds) {
+      if (seen.has(botId)) continue;
+      seen.add(botId);
+      const bot = db.get<{ id: string; name: string; status: string }>(
+        "SELECT id, name, status FROM bots WHERE id = ? AND account_id = ?",
+        [botId, s.accountId],
+      );
+      if (!bot || bot.status !== "active") continue;
+      bots.push(bot);
+    }
+    const principalCount = bots.length + (addCaller ? 1 : 0);
+    if (bots.length === 0 || !groupMeetsMinimum(bots.length, principalCount)) {
+      return c.json({ error: "too_small" }, 400);
+    }
+    const title = (body.title ?? "").trim() || "New thread";
+    const threadId = db.immediate(() => {
+      const createdId = id();
+      const t = now();
+      db.run(
+        `INSERT INTO threads (id, account_id, bot_id, title, kind, created_at)
+         VALUES (?, ?, ?, ?, 'group', ?)`,
+        [createdId, s.accountId, bots[0]!.id, title, t],
+      );
+      if (addCaller) {
+        db.run(
+          `INSERT INTO thread_participants (id, thread_id, kind, user_id, bot_id, created_at)
+           VALUES (?, ?, 'human', ?, NULL, ?)`,
+          [id(), createdId, s.userId, t],
+        );
+      }
+      for (const bot of bots) {
+        db.run(
+          `INSERT INTO thread_participants (id, thread_id, kind, user_id, bot_id, created_at)
+           VALUES (?, ?, 'bot', NULL, ?, ?)`,
+          [id(), createdId, bot.id, t],
+        );
+      }
+      return createdId;
+    });
+    const thread = db.get("SELECT * FROM threads WHERE id = ?", [threadId]);
+    const participants = db.all("SELECT * FROM thread_participants WHERE thread_id = ? ORDER BY created_at", [
+      threadId,
+    ]);
+    return c.json({ thread, participants }, 201);
+  });
+
   app.get("/v1/threads", (c) => {
     const s = requireSession(c);
     const botId = c.req.query("botId");
@@ -532,6 +629,13 @@ export function createApp(cfg: HomeConfig): {
       );
       return c.json({ threads });
     }
+    if (kind === "group") {
+      const threads = db.all(
+        `SELECT * FROM threads WHERE account_id = ? AND kind = 'group' ORDER BY created_at DESC`,
+        [s.accountId],
+      );
+      return c.json({ threads });
+    }
     const thread = botId
       ? db.get(
           "SELECT * FROM threads WHERE account_id = ? AND bot_id = ? AND IFNULL(kind,'human') = 'human'",
@@ -541,9 +645,7 @@ export function createApp(cfg: HomeConfig): {
           "SELECT * FROM threads WHERE account_id = ? AND IFNULL(kind,'human') = 'human' ORDER BY created_at LIMIT 1",
           [s.accountId],
         );
-    const messages = thread
-      ? db.all("SELECT * FROM messages WHERE thread_id = ? ORDER BY created_at", [(thread as { id: string }).id])
-      : [];
+    const messages = thread ? db.all(VISIBLE_MESSAGES_SQL, [(thread as { id: string }).id]) : [];
     const latestTurn = thread
       ? db.get<{ id: string }>(
           "SELECT id FROM turns WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1",
@@ -560,7 +662,7 @@ export function createApp(cfg: HomeConfig): {
       s.accountId,
     ]);
     if (!thread) return c.json({ error: "not_found" }, 404);
-    const messages = db.all("SELECT * FROM messages WHERE thread_id = ? ORDER BY created_at", [c.req.param("id")]);
+    const messages = db.all(VISIBLE_MESSAGES_SQL, [c.req.param("id")]);
     const latestTurn = db.get<{ id: string }>(
       "SELECT id FROM turns WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1",
       [c.req.param("id")],
@@ -568,40 +670,217 @@ export function createApp(cfg: HomeConfig): {
     return c.json({ thread, messages, latestTurnId: latestTurn?.id ?? null });
   });
 
+  type GroupThread = { id: string; bot_id: string; kind: string; title: string };
+
+  function requireGroupThread(s: SessionInfo, threadId: string): GroupThread | { error: string; status: 400 | 404 } {
+    const thread = db.get<GroupThread>("SELECT id, bot_id, kind, title FROM threads WHERE id = ? AND account_id = ?", [
+      threadId,
+      s.accountId,
+    ]);
+    if (!thread) return { error: "not_found", status: 404 };
+    if (thread.kind !== "group") return { error: "not_group", status: 400 };
+    return thread;
+  }
+
+  function removeGroupParticipant(
+    thread: GroupThread,
+    participant: { id: string; bot_id: string | null },
+  ): { error: string } | { ok: true } {
+    const remaining = db.all<{ id: string; bot_id: string | null }>(
+      "SELECT id, bot_id FROM thread_participants WHERE thread_id = ? AND id != ?",
+      [thread.id, participant.id],
+    );
+    const remainingBots = remaining.filter((p) => p.bot_id);
+    if (remainingBots.length === 0 || !groupMeetsMinimum(remainingBots.length, remaining.length)) {
+      return { error: "too_small" };
+    }
+    db.immediate(() => {
+      if (participant.bot_id && participant.bot_id === thread.bot_id) {
+        db.run("UPDATE threads SET bot_id = ? WHERE id = ?", [remainingBots[0]!.bot_id, thread.id]);
+      }
+      db.run("DELETE FROM thread_participants WHERE id = ?", [participant.id]);
+    });
+    return { ok: true };
+  }
+
+  app.post("/v1/threads/:id/participants", async (c) => {
+    const s = requireSession(c);
+    const thread = requireGroupThread(s, c.req.param("id"));
+    if ("error" in thread) return c.json({ error: thread.error }, thread.status);
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      return c.json({ error: "bad_request" }, 400);
+    }
+    const parsed = addThreadParticipantInput.safeParse(raw);
+    if (!parsed.success) return c.json({ error: "bad_request" }, 400);
+    const botId = parsed.data.botId;
+    const userId = parsed.data.userId;
+    if (Boolean(botId) === Boolean(userId)) return c.json({ error: "bad_request" }, 400);
+    if (userId) {
+      if (userId !== s.userId) return c.json({ error: "org_members_required" }, 400);
+      const existing = db.get("SELECT id FROM thread_participants WHERE thread_id = ? AND user_id = ?", [
+        thread.id,
+        userId,
+      ]);
+      if (existing) return c.json({ error: "duplicate" }, 409);
+      const participantId = id();
+      db.run(
+        `INSERT INTO thread_participants (id, thread_id, kind, user_id, bot_id, created_at)
+         VALUES (?, ?, 'human', ?, NULL, ?)`,
+        [participantId, thread.id, userId, now()],
+      );
+      return c.json({ ok: true, participant: { id: participantId, kind: "human", userId, botId: null } });
+    }
+    const bot = db.get<{ id: string; status: string }>(
+      "SELECT id, status FROM bots WHERE id = ? AND account_id = ?",
+      [botId!, s.accountId],
+    );
+    if (!bot || bot.status !== "active") return c.json({ error: "not_found" }, 404);
+    const existing = db.get("SELECT id FROM thread_participants WHERE thread_id = ? AND bot_id = ?", [
+      thread.id,
+      bot.id,
+    ]);
+    if (existing) return c.json({ error: "duplicate" }, 409);
+    const participantId = id();
+    db.run(
+      `INSERT INTO thread_participants (id, thread_id, kind, user_id, bot_id, created_at)
+       VALUES (?, ?, 'bot', NULL, ?, ?)`,
+      [participantId, thread.id, bot.id, now()],
+    );
+    return c.json({ ok: true, participant: { id: participantId, kind: "bot", userId: null, botId: bot.id } });
+  });
+
+  app.delete("/v1/threads/:id/participants/:participantId", (c) => {
+    const s = requireSession(c);
+    const thread = requireGroupThread(s, c.req.param("id"));
+    if ("error" in thread) return c.json({ error: thread.error }, thread.status);
+    const participant = db.get<{ id: string; bot_id: string | null }>(
+      "SELECT id, bot_id FROM thread_participants WHERE id = ? AND thread_id = ?",
+      [c.req.param("participantId"), thread.id],
+    );
+    if (!participant) return c.json({ error: "not_found" }, 404);
+    const result = removeGroupParticipant(thread, participant);
+    if ("error" in result) return c.json({ error: result.error }, 400);
+    return c.json({ ok: true });
+  });
+
+  app.delete("/v1/threads/:id/participants", (c) => {
+    const s = requireSession(c);
+    const thread = requireGroupThread(s, c.req.param("id"));
+    if ("error" in thread) return c.json({ error: thread.error }, thread.status);
+    const botId = c.req.query("botId");
+    if (!botId) return c.json({ error: "bad_request" }, 400);
+    const participant = db.get<{ id: string; bot_id: string | null }>(
+      "SELECT id, bot_id FROM thread_participants WHERE thread_id = ? AND bot_id = ?",
+      [thread.id, botId],
+    );
+    if (!participant) return c.json({ error: "not_found" }, 404);
+    const result = removeGroupParticipant(thread, participant);
+    if ("error" in result) return c.json({ error: result.error }, 400);
+    return c.json({ ok: true });
+  });
+
   app.post("/v1/threads/:id/messages", async (c) => {
     const s = requireSession(c);
-    const thread = db.get<{ id: string; bot_id: string; kind: string }>(
+    const thread = db.get<{ id: string; bot_id: string; kind: string; title: string }>(
       "SELECT * FROM threads WHERE id = ? AND account_id = ?",
       [c.req.param("id"), s.accountId],
     );
     if (!thread) return c.json({ error: "not_found" }, 404);
-    if (thread.kind === "a2a") return c.json({ error: "a2a_readonly" }, 403);
-    const queued = db.get<{ n: number }>(
-      "SELECT COUNT(*) as n FROM turns WHERE bot_id = ? AND status = 'queued'",
-      [thread.bot_id],
-    );
-    if ((queued?.n ?? 0) >= 5) return c.json({ error: "queue_full" }, 429);
-    const body = (await c.req.json()) as { body?: string };
-    const text = String(body.body ?? "").trim();
-    if (!text) return c.json({ error: "empty" }, 400);
-    const turnId = id();
-    const userMessage = db.immediate(() => {
-      const turnCreated = now();
-      db.run(
-        `INSERT INTO turns (id, thread_id, bot_id, status, sent_message_count, assistant_text, deadline_at, created_at)
-         VALUES (?, ?, ?, 'queued', 0, '', ?, ?)`,
-        [turnId, thread.id, thread.bot_id, turnCreated + 2 * 60 * 60 * 1000, turnCreated],
-      );
-      return insertMessage(db, {
-        threadId: thread.id,
-        turnId,
-        role: "user",
-        origin: "user",
-        body: text,
-      });
-    });
-    ctx.engine.kick();
-    return c.json({ turnId, userMessageId: userMessage.id }, 202);
+    switch (thread.kind) {
+      case "a2a":
+        return c.json({ error: "a2a_readonly" }, 403);
+      case "group": {
+        const raw = (await c.req.json()) as { body?: string };
+        const text = String(raw.body ?? "").trim();
+        if (!text) return c.json({ error: "empty" }, 400);
+        const posted = db.immediate(() => {
+          const userMessage = insertMessage(db, {
+            threadId: thread.id,
+            turnId: null,
+            role: "user",
+            origin: "user",
+            body: text,
+          });
+          const members = db.all<{ id: string; name: string }>(
+            `SELECT b.id, b.name FROM thread_participants tp
+             JOIN bots b ON b.id = tp.bot_id
+             WHERE tp.thread_id = ? AND tp.bot_id IS NOT NULL AND b.status = 'active'`,
+            [thread.id],
+          );
+          const { mentioned, truncated } = parseGroupMentions(text, members);
+          const turnIds: string[] = [];
+          for (const bot of mentioned) {
+            const queued = db.get<{ n: number }>(
+              "SELECT COUNT(*) as n FROM turns WHERE bot_id = ? AND status = 'queued'",
+              [bot.id],
+            );
+            if ((queued?.n ?? 0) >= 5) continue;
+            const turnId = id();
+            const t = now();
+            db.run(
+              `INSERT INTO turns (id, thread_id, bot_id, status, sent_message_count, assistant_text, deadline_at, created_at)
+               VALUES (?, ?, ?, 'queued', 0, '', ?, ?)`,
+              [turnId, thread.id, bot.id, t + 2 * 60 * 60 * 1000, t],
+            );
+            insertMessage(db, {
+              threadId: thread.id,
+              turnId,
+              role: "user",
+              origin: "prompt",
+              body: `You were @mentioned in ${thread.title}.\n${text}`,
+            });
+            turnIds.push(turnId);
+          }
+          return {
+            userMessageId: userMessage.id,
+            turnIds,
+            mentioned: mentioned.map((m) => m.name),
+            mentionedTruncated: truncated,
+          };
+        });
+        if (posted.turnIds.length) ctx.engine.kick();
+        return c.json(
+          {
+            turnIds: posted.turnIds,
+            mentioned: posted.mentioned,
+            userMessageId: posted.userMessageId,
+            ...(posted.mentionedTruncated ? { mentionedTruncated: true } : {}),
+          },
+          202,
+        );
+      }
+      default: {
+        const queued = db.get<{ n: number }>(
+          "SELECT COUNT(*) as n FROM turns WHERE bot_id = ? AND status = 'queued'",
+          [thread.bot_id],
+        );
+        if ((queued?.n ?? 0) >= 5) return c.json({ error: "queue_full" }, 429);
+        const body = (await c.req.json()) as { body?: string };
+        const text = String(body.body ?? "").trim();
+        if (!text) return c.json({ error: "empty" }, 400);
+        const turnId = id();
+        const userMessage = db.immediate(() => {
+          const turnCreated = now();
+          db.run(
+            `INSERT INTO turns (id, thread_id, bot_id, status, sent_message_count, assistant_text, deadline_at, created_at)
+             VALUES (?, ?, ?, 'queued', 0, '', ?, ?)`,
+            [turnId, thread.id, thread.bot_id, turnCreated + 2 * 60 * 60 * 1000, turnCreated],
+          );
+          return insertMessage(db, {
+            threadId: thread.id,
+            turnId,
+            role: "user",
+            origin: "user",
+            body: text,
+          });
+        });
+        ctx.engine.kick();
+        return c.json({ turnId, userMessageId: userMessage.id }, 202);
+      }
+    }
   });
 
   app.post("/v1/turns/:id/cancel", (c) => {
