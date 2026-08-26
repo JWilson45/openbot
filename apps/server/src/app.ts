@@ -121,12 +121,12 @@ export function createApp(cfg: HomeConfig): {
     publicOrigin: cfg.publicOrigin,
     advertisedOrigin,
   });
+  const log = cfg.logger ?? new RedactingLogger();
+  ensureOrgAccount(db, log);
   provisionOrgGateway(db, cfg.home);
   const master = loadOrCreateMasterKey(cfg.home, process.env.OPENBOT_MASTER_KEY);
   ensureOrgKeypair(cfg.home, master, db);
   const allowlist = loadAllowlist(cfg.home, process.env.OPENBOT_GITHUB_ALLOWLIST);
-  const log = cfg.logger ?? new RedactingLogger();
-  ensureOrgAccount(db, log);
   const inflight = new McpInflight();
   const push = new Map<string, Set<ServerWebSocket>>();
   const fedInfoLimiter = new SlidingWindowRateLimiter(FED_INFO_RATE_LIMIT, FED_INFO_RATE_WINDOW_MS);

@@ -149,7 +149,8 @@ describe("org members + one account per instance", () => {
       expect(json.orgId).toBe(org.org_id);
       expect(json.orgSlug).toBe(org.slug);
       expect(json.orgName).toBe(org.name);
-      expect(json.pubkey).toBe("");
+      expect(typeof json.pubkey).toBe("string");
+      expect(Buffer.from(String(json.pubkey), "base64").length).toBe(32);
       expect(json.role).toBe("member");
       expect(json).not.toHaveProperty("privateKey");
       expect(JSON.stringify(json)).not.toContain("BEGIN");
