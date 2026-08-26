@@ -25,7 +25,7 @@ import {
 } from "@openbot/auth";
 import { loadOrCreateMasterKey, open, seal, RedactingLogger } from "@openbot/vault";
 import { approveMessage, handleMcpJsonRpc, McpInflight, rejectMessage } from "@openbot/mcp-send-message";
-import { McpError, addThreadParticipantInput, createGroupThreadInput } from "@openbot/api-types";
+import { McpError, addThreadParticipantInput, createGroupThreadInput, postMessageInput } from "@openbot/api-types";
 import { insertMessage, parseLivePayload, promote, summarizeLiveEvent } from "@openbot/live-work";
 import { sha256Hex } from "@openbot/db";
 import { detectCliLogins, listGrokModels, resolveBotInference } from "@openbot/acp-grok";
@@ -686,21 +686,22 @@ export function createApp(cfg: HomeConfig): {
     thread: GroupThread,
     participant: { id: string; bot_id: string | null },
   ): { error: string } | { ok: true } {
-    const remaining = db.all<{ id: string; bot_id: string | null }>(
-      "SELECT id, bot_id FROM thread_participants WHERE thread_id = ? AND id != ?",
-      [thread.id, participant.id],
-    );
-    const remainingBots = remaining.filter((p) => p.bot_id);
-    if (remainingBots.length === 0 || !groupMeetsMinimum(remainingBots.length, remaining.length)) {
-      return { error: "too_small" };
-    }
-    db.immediate(() => {
-      if (participant.bot_id && participant.bot_id === thread.bot_id) {
+    return db.immediate(() => {
+      const remaining = db.all<{ id: string; bot_id: string | null }>(
+        "SELECT id, bot_id FROM thread_participants WHERE thread_id = ? AND id != ?",
+        [thread.id, participant.id],
+      );
+      const remainingBots = remaining.filter((p) => p.bot_id);
+      if (remainingBots.length === 0 || !groupMeetsMinimum(remainingBots.length, remaining.length)) {
+        return { error: "too_small" };
+      }
+      const current = db.get<{ bot_id: string }>("SELECT bot_id FROM threads WHERE id = ?", [thread.id]);
+      if (participant.bot_id && participant.bot_id === current?.bot_id) {
         db.run("UPDATE threads SET bot_id = ? WHERE id = ?", [remainingBots[0]!.bot_id, thread.id]);
       }
       db.run("DELETE FROM thread_participants WHERE id = ?", [participant.id]);
+      return { ok: true as const };
     });
-    return { ok: true };
   }
 
   app.post("/v1/threads/:id/participants", async (c) => {
@@ -793,8 +794,15 @@ export function createApp(cfg: HomeConfig): {
       case "a2a":
         return c.json({ error: "a2a_readonly" }, 403);
       case "group": {
-        const raw = (await c.req.json()) as { body?: string };
-        const text = String(raw.body ?? "").trim();
+        let raw: unknown;
+        try {
+          raw = await c.req.json();
+        } catch {
+          return c.json({ error: "bad_request" }, 400);
+        }
+        const parsed = postMessageInput.safeParse(raw);
+        if (!parsed.success) return c.json({ error: "bad_request" }, 400);
+        const text = parsed.data.body.trim();
         if (!text) return c.json({ error: "empty" }, 400);
         const posted = db.immediate(() => {
           const userMessage = insertMessage(db, {
@@ -835,18 +843,19 @@ export function createApp(cfg: HomeConfig): {
             turnIds.push(turnId);
           }
           return {
-            userMessageId: userMessage.id,
+            userMessage,
             turnIds,
             mentioned: mentioned.map((m) => m.name),
             mentionedTruncated: truncated,
           };
         });
+        onPush(s.accountId, { type: "message.created", message: posted.userMessage });
         if (posted.turnIds.length) ctx.engine.kick();
         return c.json(
           {
             turnIds: posted.turnIds,
             mentioned: posted.mentioned,
-            userMessageId: posted.userMessageId,
+            userMessageId: posted.userMessage.id,
             ...(posted.mentionedTruncated ? { mentionedTruncated: true } : {}),
           },
           202,

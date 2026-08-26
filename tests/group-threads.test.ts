@@ -128,6 +128,25 @@ describe("group threads", () => {
     server.stop(true);
   });
 
+  test("group POST with invalid JSON is 400 bad_request", async () => {
+    const { server, origin, headers } = startWorld();
+    const ada = await createBot(origin, headers, "Ada");
+    const bob = await createBot(origin, headers, "Bob");
+    const created = (await fetch(`${origin}/v1/threads`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ kind: "group", title: "chat", botIds: [ada.bot.id, bob.bot.id] }),
+    }).then((r) => r.json())) as { thread: { id: string } };
+    const posted = await fetch(`${origin}/v1/threads/${created.thread.id}/messages`, {
+      method: "POST",
+      headers,
+      body: "not-json",
+    });
+    expect(posted.status).toBe(400);
+    expect(((await posted.json()) as { error: string }).error).toBe("bad_request");
+    server.stop(true);
+  });
+
   test("human POST hello queues nobody", async () => {
     const { ctx, server, origin, headers } = startWorld();
     const ada = await createBot(origin, headers, "Ada");
@@ -403,14 +422,20 @@ describe("group threads", () => {
       `INSERT INTO thread_participants (id, thread_id, kind, user_id, bot_id, created_at) VALUES (?, ?, 'bot', NULL, ?, ?)`,
       [id(), groupId, bobId, t],
     );
-    deleteBotPermanently(db, bobId);
-    expect(db.get("SELECT id FROM bots WHERE id = ?", [bobId])).toBeNull();
-    expect(
-      db.get("SELECT id FROM thread_participants WHERE thread_id = ? AND bot_id = ?", [groupId, bobId]),
-    ).toBeNull();
-    expect(db.all("PRAGMA foreign_key_check")).toEqual([]);
     deleteBotPermanently(db, w.botId);
     expect(db.get("SELECT id FROM bots WHERE id = ?", [w.botId])).toBeNull();
+    expect(
+      db.get("SELECT id FROM thread_participants WHERE thread_id = ? AND bot_id = ?", [groupId, w.botId]),
+    ).toBeNull();
+    const rehomed = db.get<{ id: string; bot_id: string }>("SELECT id, bot_id FROM threads WHERE id = ?", [groupId]);
+    expect(rehomed?.id).toBe(groupId);
+    expect(rehomed?.bot_id).toBe(bobId);
+    expect(
+      db.get("SELECT id FROM thread_participants WHERE thread_id = ? AND bot_id = ?", [groupId, bobId]),
+    ).toBeTruthy();
+    expect(db.all("PRAGMA foreign_key_check")).toEqual([]);
+    deleteBotPermanently(db, bobId);
+    expect(db.get("SELECT id FROM bots WHERE id = ?", [bobId])).toBeNull();
     expect(db.get("SELECT id FROM threads WHERE id = ?", [groupId])).toBeNull();
     expect(db.all("PRAGMA foreign_key_check")).toEqual([]);
     db.close();

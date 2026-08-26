@@ -333,12 +333,8 @@ export const ARCHIVE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 export function deleteBotPermanently(db: OpenbotDb, botId: string): void {
   db.immediate(() => {
-    // Membership rows FK to bots and to threads this bot still owns.
+    // Membership rows FK to bots; drop this bot before the bots DELETE.
     db.run(`DELETE FROM thread_participants WHERE bot_id = ?`, [botId]);
-    db.run(
-      `DELETE FROM thread_participants WHERE thread_id IN (SELECT id FROM threads WHERE bot_id = ?)`,
-      [botId],
-    );
     // Detach FKs first. SendMessage on another bot's human thread can point
     // turn_id at this bot's A2A turn; those rows must be unlinked, not deleted.
     db.run(
@@ -363,7 +359,27 @@ export function deleteBotPermanently(db: OpenbotDb, botId: string): void {
     );
     db.run(`UPDATE threads SET peer_bot_id = NULL WHERE peer_bot_id = ?`, [botId]);
 
-    // Remaining threads are this bot's human DM (and any orphaned A2A).
+    // bot_id is only the convening pointer; keep the group if another member bot remains.
+    db.run(
+      `UPDATE threads SET bot_id = (
+         SELECT tp.bot_id FROM thread_participants tp
+         WHERE tp.thread_id = threads.id AND tp.bot_id IS NOT NULL
+         LIMIT 1
+       )
+       WHERE bot_id = ? AND kind = 'group'
+         AND EXISTS (
+           SELECT 1 FROM thread_participants tp
+           WHERE tp.thread_id = threads.id AND tp.bot_id IS NOT NULL
+         )`,
+      [botId],
+    );
+    // Leftover members of threads we still own (groups with no bot left).
+    db.run(
+      `DELETE FROM thread_participants WHERE thread_id IN (SELECT id FROM threads WHERE bot_id = ?)`,
+      [botId],
+    );
+
+    // Remaining threads are this bot's human DM (and any orphaned A2A / empty group).
     db.run(
       `DELETE FROM mcp_tokens WHERE thread_id IN (SELECT id FROM threads WHERE bot_id = ?)`,
       [botId],
