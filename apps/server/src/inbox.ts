@@ -297,6 +297,7 @@ export function handleFedInbound(
     authorization: string | undefined;
     idempotencyKey: string | undefined;
     clientIp: string;
+    takeUntrusted?: () => boolean;
   },
 ): FedInboundResult {
   const org = currentOrgMeta(db);
@@ -305,6 +306,7 @@ export function handleFedInbound(
   const gwThread = gw ? humanThread(db, gw.id) : undefined;
   const push: MessageRow[] = [];
   const host = opts.clientIp || "unknown";
+  const takeUntrusted = opts.takeUntrusted ?? (() => true);
 
   const empty = (status: number, error: string, extra?: Record<string, unknown>): FedInboundResult => ({
     status,
@@ -316,12 +318,13 @@ export function handleFedInbound(
 
   const parsed = parseEnvelope(opts.json);
   const fromSlug = parsed.ok ? parsed.envelope.fromSlug : undefined;
-  const fromOrgBody = parsed.ok ? canon(parsed.envelope.fromOrg) : undefined;
 
   const solicit = (reason: string, iss?: string, claimedPeer?: OrgPeerRow) => {
-    const bucket = iss ? `org:${canon(iss)}` : fromOrgBody ? `org:${fromOrgBody}` : ipBucket(host);
-    const label = peerLabel(claimedPeer, fromSlug, iss ?? fromOrgBody);
-    const originHint = claimedPeer?.base_url ? ` (${claimedPeer.base_url})` : "";
+    // Org bucket only after iss hits a real org_peers row. Claimed fromOrg/iss is attacker-controlled until then.
+    const peer = claimedPeer ?? (iss ? getOrgPeer(db, iss) : undefined);
+    const bucket = peer ? `org:${peer.peer_org_id}` : ipBucket(host);
+    const label = peerLabel(peer, fromSlug, iss);
+    const originHint = peer?.base_url ? ` (${peer.base_url})` : "";
     const msg = recordSolicit(db, {
       bucket,
       reason,
@@ -346,7 +349,7 @@ export function handleFedInbound(
     });
     if (msg) push.push(msg);
     writeAudit(db, accountId, "fed.solicit", {
-      fromOrg: iss ?? fromOrgBody ?? null,
+      fromOrg: peer ? peer.peer_org_id : null,
       host,
       reason,
       count: db.get<OrgSolicitRow>("SELECT * FROM org_solicit WHERE bucket = ? AND reason = ?", [
@@ -356,15 +359,26 @@ export function handleFedInbound(
     });
   };
 
+  const rejectUntrusted = (
+    status: number,
+    error: string,
+    reason?: string,
+    iss?: string,
+    claimedPeer?: OrgPeerRow,
+  ): FedInboundResult => {
+    if (!takeUntrusted()) return empty(429, "rate_limited");
+    if (reason) solicit(reason, iss, claimedPeer);
+    return empty(status, error);
+  };
+
   if (!parsed.ok) {
-    return empty(400, parsed.error);
+    return rejectUntrusted(400, parsed.error);
   }
   const envelope = parsed.envelope;
 
   const bearer = parseBearer(opts.authorization);
   if (!bearer) {
-    solicit("unauthorized", fromOrgBody);
-    return empty(401, "unauthorized");
+    return rejectUntrusted(401, "unauthorized", "unauthorized");
   }
 
   let decoded: ReturnType<typeof decodeFedJws>;
@@ -372,31 +386,26 @@ export function handleFedInbound(
     decoded = decodeFedJws(bearer);
   } catch (err) {
     const code = err instanceof FedJwsError ? jwsHttpError(err) : "unauthorized";
-    solicit(code === "bind" ? "bind" : "unauthorized", fromOrgBody);
-    return empty(401, code);
+    return rejectUntrusted(401, code, code === "bind" ? "bind" : "unauthorized");
   }
 
   const iss = decoded.payload.iss;
   const kid = decoded.kid;
   if (canon(iss) !== canon(kid) || canon(iss) !== canon(envelope.fromOrg)) {
-    solicit("bind", iss);
-    return empty(401, "bind");
+    return rejectUntrusted(401, "bind", "bind", iss);
   }
   if (!org || canon(decoded.payload.aud) !== canon(envelope.toOrg) || canon(envelope.toOrg) !== canon(org.org_id)) {
-    solicit("audience", iss);
-    return empty(401, "audience");
+    return rejectUntrusted(401, "audience", "audience", iss);
   }
   const idem = (opts.idempotencyKey ?? "").trim();
   if (!idem || canon(decoded.payload.jti) !== canon(envelope.id) || canon(envelope.id) !== canon(idem)) {
-    solicit("bind", iss);
-    return empty(401, "bind");
+    return rejectUntrusted(401, "bind", "bind", iss);
   }
 
   const peer = getOrgPeer(db, iss);
   const allowed = peer?.status === "allowed" ? peer : undefined;
   if (!allowed) {
-    solicit("unknown_peer", iss, peer);
-    return empty(401, "unknown_peer");
+    return rejectUntrusted(401, "unknown_peer", "unknown_peer", iss, peer);
   }
 
   try {
@@ -409,17 +418,17 @@ export function handleFedInbound(
   } catch (err) {
     if (err instanceof FedJwsError) {
       const code = jwsHttpError(err);
-      if (code === "bad_signature") solicit("bad_signature", iss, allowed);
-      else if (code === "bind" || code === "audience" || code === "body_hash") solicit(code, iss, allowed);
-      return empty(401, code);
+      if (code === "bad_signature") return rejectUntrusted(401, code, "bad_signature", iss, allowed);
+      if (code === "bind" || code === "audience" || code === "body_hash") {
+        return rejectUntrusted(401, code, code, iss, allowed);
+      }
+      return rejectUntrusted(401, code);
     }
-    solicit("bad_signature", iss, allowed);
-    return empty(401, "bad_signature");
+    return rejectUntrusted(401, "bad_signature", "bad_signature", iss, allowed);
   }
 
   if (envelope.hop !== 1) {
-    solicit("hop", iss, allowed);
-    return empty(400, "hop_limit");
+    return rejectUntrusted(400, "hop_limit", "hop", iss, allowed);
   }
 
   const fromOrgId = allowed.peer_org_id;

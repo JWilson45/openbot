@@ -129,6 +129,7 @@ export function createApp(cfg: HomeConfig): {
   const inflight = new McpInflight();
   const push = new Map<string, Set<ServerWebSocket>>();
   const fedInfoLimiter = new SlidingWindowRateLimiter(FED_INFO_RATE_LIMIT, FED_INFO_RATE_WINDOW_MS);
+  const fedUntrustedLimiter = new SlidingWindowRateLimiter(FED_INFO_RATE_LIMIT, FED_INFO_RATE_WINDOW_MS);
 
   const ctx: AppContext = {
     db,
@@ -238,14 +239,20 @@ export function createApp(cfg: HomeConfig): {
     try {
       json = JSON.parse(rawBody);
     } catch {
+      json = null;
+      const key = clientRateKey(bunRequestIp(c.env, c.req.raw), c.req.header("x-forwarded-for"));
+      if (!fedUntrustedLimiter.take(key)) return c.json({ error: "rate_limited" }, 429);
       return c.json({ error: "invalid_json" }, 400);
     }
+    const clientIp = bunRequestIp(c.env, c.req.raw);
+    const rateKey = clientRateKey(clientIp, c.req.header("x-forwarded-for"));
     const result = handleFedInbound(db, {
       rawBody,
       json,
       authorization: c.req.header("authorization"),
       idempotencyKey: c.req.header("idempotency-key"),
-      clientIp: bunRequestIp(c.env, c.req.raw),
+      clientIp,
+      takeUntrusted: () => fedUntrustedLimiter.take(rateKey),
     });
     for (const msg of result.push) {
       if (msg.origin === "prompt") continue;
@@ -1095,11 +1102,20 @@ export function createApp(cfg: HomeConfig): {
       [c.req.param("id"), s.accountId],
     );
     if (!turn) return c.json({ error: "not_found" }, 404);
+    let cancelled = false;
     if (turn.status === "running") {
       void ctx.engine.runnerFor(s.accountId).acpFor(turn.bot_id)?.cancel();
       promote(db, turn.id, { kind: "cancel" });
+      cancelled = true;
     } else if (turn.status === "queued") {
       db.run("UPDATE turns SET status = 'cancelled', finished_at = ? WHERE id = ?", [now(), turn.id]);
+      cancelled = true;
+    }
+    if (cancelled) {
+      const bot = db.get<{ role: string | null }>("SELECT role FROM bots WHERE id = ?", [turn.bot_id]);
+      if (isGatewayRole(bot?.role) && federationEffective(currentOrgMeta(db))) {
+        ctx.engine.maybeKickGatewayDrain(turn.bot_id);
+      }
     }
     return c.json({ ok: true });
   });

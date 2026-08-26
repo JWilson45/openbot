@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { generateEd25519, signFedJws } from "@openbot/federation";
 import { FED_RATE_PEER_HOUR, id, now, purgeExpiredOrgInbox } from "@openbot/db";
 import { loadOrCreateMasterKey } from "@openbot/vault";
-import { insertOrgPeer, loadOrgKeypair } from "../apps/server/src/org.ts";
+import { FED_INFO_RATE_LIMIT, insertOrgPeer, loadOrgKeypair } from "../apps/server/src/org.ts";
 import { loginCookie, startTestServer } from "../apps/server/src/test-helpers.ts";
 import { fakeAgentCommand, tempHome } from "./helpers.ts";
 
@@ -671,6 +671,151 @@ describe("federation inbox POST /fed/v1/messages", () => {
       expect(json.inbox.length).toBe(1);
       expect(json.inbox[0]?.status).toBe("held");
       expect(json.inbox[0]?.body).toBe("listed");
+    } finally {
+      a.server.stop(true);
+      b.server.stop(true);
+    }
+  });
+
+  test("untrusted unique fromOrg UUIDs coalesce on IP /24, not claimed iss", async () => {
+    const b = await bootOrg("beta", { federationOn: true });
+    try {
+      const sendUnknown = async () => {
+        const kp = generateEd25519();
+        const org = id();
+        const msgId = id();
+        const body = {
+          id: msgId,
+          fromOrg: org,
+          fromSlug: "eve",
+          fromActor: { type: "gateway" as const, name: "Gateway" },
+          toOrg: b.orgId,
+          urgency: "normal",
+          hop: 1,
+          createdAt: Date.now(),
+          body: "scan",
+        };
+        const raw = JSON.stringify(body);
+        const token = signFedJws({
+          privateKey: kp.privateKey,
+          fromOrgId: org,
+          toOrgId: b.orgId,
+          messageId: msgId,
+          rawBody: raw,
+        });
+        return fetch(`${b.origin}/fed/v1/messages`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+            "idempotency-key": msgId,
+          },
+          body: raw,
+        });
+      };
+      expect((await sendUnknown()).status).toBe(401);
+      expect((await sendUnknown()).status).toBe(401);
+      const rows = b.ctx.db.all<{ bucket: string; count: number }>(
+        "SELECT bucket, count FROM org_solicit WHERE reason = 'unknown_peer'",
+      );
+      expect(rows.length).toBe(1);
+      expect(rows[0]?.bucket.startsWith("ip:")).toBe(true);
+      expect(rows[0]?.count).toBe(2);
+      expect(b.ctx.db.all("SELECT id FROM org_inbox").length).toBe(0);
+      expect(b.ctx.db.all("SELECT id FROM messages WHERE origin = 'system'").length).toBe(1);
+    } finally {
+      b.server.stop(true);
+    }
+  });
+
+  test("untrusted POSTs are capped 30/min like GET /fed/v1/info", async () => {
+    const b = await bootOrg("beta", { federationOn: true });
+    try {
+      let last = 0;
+      for (let i = 0; i < FED_INFO_RATE_LIMIT + 1; i++) {
+        const res = await fetch(`${b.origin}/fed/v1/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "idempotency-key": id() },
+          body: JSON.stringify({
+            id: id(),
+            fromOrg: id(),
+            fromSlug: "scan",
+            fromActor: { type: "gateway", name: "Gateway" },
+            toOrg: b.orgId,
+            urgency: "normal",
+            hop: 1,
+            createdAt: Date.now(),
+            body: "x",
+          }),
+        });
+        last = res.status;
+        if (i < FED_INFO_RATE_LIMIT) expect(res.status).toBe(401);
+      }
+      expect(last).toBe(429);
+      expect(((await (await fetch(`${b.origin}/fed/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "idempotency-key": id() },
+        body: JSON.stringify({
+          id: id(),
+          fromOrg: id(),
+          fromSlug: "scan",
+          fromActor: { type: "gateway", name: "Gateway" },
+          toOrg: b.orgId,
+          urgency: "normal",
+          hop: 1,
+          createdAt: Date.now(),
+          body: "x",
+        }),
+      })).json()) as { error: string }).error).toBe("rate_limited");
+      expect(b.ctx.db.all("SELECT id FROM messages WHERE origin = 'system'").length).toBe(1);
+    } finally {
+      b.server.stop(true);
+    }
+  });
+
+  test("cancelling a queued Gateway turn drains pending inbox", async () => {
+    const a = await bootOrg("alpha", { federationOn: true });
+    const b = await bootOrg("beta", { federationOn: true });
+    try {
+      await addPeer(a, b);
+      await addPeer(b, a);
+      const thread = b.ctx.db.get<{ id: string }>(
+        "SELECT id FROM threads WHERE bot_id = ? AND IFNULL(kind,'human') = 'human'",
+        [b.gwId],
+      );
+      expect(thread).toBeTruthy();
+      const occupy = id();
+      b.ctx.db.run(
+        `INSERT INTO turns (id, thread_id, bot_id, status, sent_message_count, assistant_text, created_at)
+         VALUES (?, ?, ?, 'queued', 0, '', ?)`,
+        [occupy, thread!.id, b.gwId, now()],
+      );
+      const res = await postFed(a, b.origin, envelope(a, b, { body: "while queued" }));
+      expect(res.status).toBe(202);
+      expect(((await res.json()) as { queued: boolean }).queued).toBe(false);
+      expect(b.ctx.db.get<{ status: string }>("SELECT status FROM org_inbox")?.status).toBe("pending");
+      expect(b.ctx.db.get<{ turn_id: string | null }>("SELECT turn_id FROM messages WHERE origin = 'federation'")?.turn_id).toBeNull();
+
+      const cancel = await fetch(`${b.origin}/v1/turns/${occupy}/cancel`, {
+        method: "POST",
+        headers: b.headers,
+      });
+      expect(cancel.status).toBe(200);
+      await waitTurns(b.ctx.db, b.gwId, (t) =>
+        t.some((x) => {
+          const prompt = b.ctx.db.get<{ origin: string }>(
+            "SELECT origin FROM messages WHERE turn_id = ? AND role = 'user'",
+            [x.id],
+          );
+          return prompt?.origin === "prompt";
+        }),
+      );
+      const drain = b.ctx.db.get<{ body: string }>(
+        "SELECT body FROM messages WHERE origin = 'prompt' ORDER BY created_at DESC LIMIT 1",
+      );
+      expect(drain?.body).toContain("pending");
+      const pendingId = b.ctx.db.get<{ id: string }>("SELECT id FROM org_inbox")!.id;
+      expect(drain?.body).toContain(pendingId);
     } finally {
       a.server.stop(true);
       b.server.stop(true);
