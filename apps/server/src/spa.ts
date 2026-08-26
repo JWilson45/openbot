@@ -1,3 +1,16 @@
+export function parseHttpUrl(raw: unknown): URL | null {
+  try {
+    const url = new URL(String(raw ?? "").trim());
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    if (!url.hostname) return null;
+    url.username = "";
+    url.password = "";
+    return url;
+  } catch {
+    return null;
+  }
+}
+
 export const SPA_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -307,7 +320,7 @@ export const SPA_HTML = `<!DOCTYPE html>
         const name = String(item.name || '').trim();
         const url = parseHttpUrl(item.baseUrl);
         if (!name || !url) continue;
-        out.push({ name, baseUrl: url.href });
+        out.push({ name, baseUrl: url.origin });
       }
       return out;
     } catch { return []; }
@@ -320,6 +333,17 @@ export const SPA_HTML = `<!DOCTYPE html>
     if (!url) { announce('Only http and https org URLs are allowed'); return; }
     if (url.origin === location.origin) return;
     location.href = url.href;
+  }
+  function addOrgBookmark(name, baseUrl) {
+    const url = parseHttpUrl(baseUrl);
+    if (!url) return 'Only http and https org URLs are allowed';
+    const list = loadOrgBookmarks();
+    if (list.some(o => { const u = parseHttpUrl(o.baseUrl); return u && u.origin === url.origin; })) {
+      return 'Already bookmarked';
+    }
+    list.push({ name: String(name || '').trim() || url.hostname, baseUrl: url.origin });
+    saveOrgBookmarks(list);
+    return '';
   }
   async function copyText(text, btn, doneMsg) {
     const label = btn ? btn.textContent : '';
@@ -1771,8 +1795,13 @@ export const SPA_HTML = `<!DOCTYPE html>
       <p class="muted">Where this browser can open a desk. Not the Gateway peer allowlist — that lives in Settings.</p>
       <p><strong>This instance</strong> · \${escapeHtml(thisOrgName())} · <span class="mono">\${escapeHtml(location.origin)}</span></p>
       <ul id="org-list"></ul>
+      <label for="org-add-name">Name (optional)</label>
+      <input id="org-add-name" placeholder="defaults to hostname" autocomplete="off" />
+      <label for="org-url">Org URL</label>
+      <input id="org-url" placeholder="https://beta.example.com" autocomplete="off" />
       <p class="err" id="org-err" hidden></p>
       <div class="modal-actions">
+        <button type="button" id="add-org">Add org</button>
         <button type="button" class="primary" id="bookmark-org">Bookmark this URL</button>
         <button type="button" id="close-orgs">Close</button>
       </div>
@@ -1786,7 +1815,7 @@ export const SPA_HTML = `<!DOCTYPE html>
       err.hidden = true;
       const list = loadOrgBookmarks();
       if (!list.length) {
-        box.innerHTML = '<li class="muted">No bookmarks yet. Bookmark this URL, then open the other org and bookmark there too.</li>';
+        box.innerHTML = '<li class="muted">No bookmarks yet. Bookmark this URL, or paste another org http(s) URL.</li>';
         return;
       }
       box.innerHTML = list.map(o => {
@@ -1815,20 +1844,17 @@ export const SPA_HTML = `<!DOCTYPE html>
         };
       });
     }
-    overlay.querySelector('#bookmark-org').onclick = () => {
+    function rememberOrg(name, baseUrl) {
       const err = overlay.querySelector('#org-err');
-      const url = parseHttpUrl(location.origin);
-      if (!url) { err.hidden = false; err.textContent = 'Only http and https org URLs are allowed'; return; }
-      const name = thisOrgName();
-      const list = loadOrgBookmarks();
-      if (list.some(o => { const u = parseHttpUrl(o.baseUrl); return u && u.origin === url.origin; })) {
-        err.hidden = false; err.textContent = 'Already bookmarked'; return;
-      }
-      list.push({ name, baseUrl: url.origin });
-      saveOrgBookmarks(list);
+      const fail = addOrgBookmark(name, baseUrl);
+      if (fail) { err.hidden = false; err.textContent = fail; return; }
       err.hidden = true;
-      announce('Bookmarked ' + name);
+      announce('Bookmarked');
       paintBookmarks();
+    }
+    overlay.querySelector('#bookmark-org').onclick = () => rememberOrg(thisOrgName(), location.origin);
+    overlay.querySelector('#add-org').onclick = () => {
+      rememberOrg(overlay.querySelector('#org-add-name').value, overlay.querySelector('#org-url').value);
     };
     paintBookmarks();
   }
@@ -2024,16 +2050,23 @@ export const SPA_HTML = `<!DOCTYPE html>
     overlay.querySelector('#peer-from-info').onclick = async () => {
       const err = overlay.querySelector('#peer-err');
       const box = overlay.querySelector('#peer-preview-box');
-      const typed = overlay.querySelector('#peer-url').value;
-      const url = parseHttpUrl(typed);
-      if (!url) { err.hidden = false; err.textContent = 'Only http and https peer URLs are allowed'; box.hidden = true; return; }
+      const url = parseHttpUrl(overlay.querySelector('#peer-url').value);
+      if (!url) { err.hidden = false; err.textContent = 'Only http and https peer URLs are allowed'; box.hidden = true; peerPreview = null; return; }
+      const origin = url.origin;
       try {
-        peerPreview = await api('/v1/org/peers/from-info', { method:'POST', body: JSON.stringify({ baseUrl: typed }) });
+        const info = await api('/v1/org/peers/from-info', { method:'POST', body: JSON.stringify({ baseUrl: origin }) });
+        peerPreview = {
+          orgId: info.orgId,
+          pubkey: info.pubkey,
+          slug: info.slug,
+          name: info.name,
+          baseUrl: origin,
+        };
+        overlay.querySelector('#peer-url').value = origin;
         overlay.querySelector('#peer-slug').value = peerPreview.slug || '';
         overlay.querySelector('#peer-name').value = peerPreview.name || '';
         overlay.querySelector('#peer-preview-meta').textContent =
-          (peerPreview.orgId || '') + ' · ' + (peerPreview.pubkey || '') +
-          (peerPreview.publicOrigin ? ' · ' + peerPreview.publicOrigin : '');
+          (peerPreview.orgId || '') + ' · ' + (peerPreview.pubkey || '') + ' · ' + origin;
         box.hidden = false;
         err.hidden = true;
       } catch (e) {
@@ -2052,7 +2085,7 @@ export const SPA_HTML = `<!DOCTYPE html>
           name: overlay.querySelector('#peer-name').value,
           orgId: peerPreview.orgId,
           pubkey: peerPreview.pubkey,
-          baseUrl: overlay.querySelector('#peer-url').value,
+          baseUrl: peerPreview.baseUrl,
         }) });
         overlay.querySelector('#peer-preview-box').hidden = true;
         peerPreview = null;
@@ -2082,11 +2115,15 @@ export const SPA_HTML = `<!DOCTYPE html>
         if (res.status !== 404 && res.ok) addLines(solicitNotices(await res.json()));
       } catch {}
       try {
-        const act = await api('/v1/activity');
-        for (const b of act.bots || []) {
-          const text = String((b.lastMessage && b.lastMessage.body) || b.doing || '');
-          const m = /Org (.+) tried to send mail/i.exec(text);
-          if (m) addLines(['Org ' + m[1] + ' tried to send mail']);
+        if (state.gateway && state.gateway.id) {
+          const t = await api('/v1/threads?botId=' + encodeURIComponent(state.gateway.id));
+          for (const m of t.messages || []) {
+            if (m.origin !== 'system') continue;
+            const text = String(m.body || '');
+            const named = /Org (.+) tried to send mail/i.exec(text);
+            if (named) addLines(['Org ' + named[1] + ' tried to send mail']);
+            else if (/solicit|untrusted|tried to send/i.test(text) && text.trim()) addLines([text.trim()]);
+          }
         }
       } catch {}
       if (!lines.length) { wrap.hidden = true; return; }
