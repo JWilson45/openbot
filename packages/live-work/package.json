@@ -1,0 +1,12 @@
+{
+  "name": "@openbot/live-work",
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "@openbot/api-types": "workspace:*",
+    "@openbot/db": "workspace:*"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

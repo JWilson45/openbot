@@ -1,0 +1,12 @@
+node_modules
+.DS_Store
+dist
+*.log
+.openbot
+.playwright
+coverage
+.env
+.env.*
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

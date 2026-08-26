@@ -1,0 +1,12 @@
+{
+  "name": "@openbot/runner",
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "@openbot/acp-grok": "workspace:*",
+    "@openbot/compute-protocol": "workspace:*"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

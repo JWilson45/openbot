@@ -1,0 +1,22 @@
+{
+  "name": "@openbot/server",
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "@openbot/acp-grok": "workspace:*",
+    "@openbot/api-types": "workspace:*",
+    "@openbot/auth": "workspace:*",
+    "@openbot/db": "workspace:*",
+    "@openbot/live-work": "workspace:*",
+    "@openbot/mcp-send-message": "workspace:*",
+    "@openbot/runner": "workspace:*",
+    "@openbot/vault": "workspace:*",
+    "hono": "^4.7.7"
+  },
+  "bin": {
+    "openbot": "./src/cli.ts"
+  },
+  "exports": {
+    ".": "./src/app.ts"
+  }
+}

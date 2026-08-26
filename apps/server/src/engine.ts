@@ -1,0 +1,322 @@
+import { join } from "node:path";
+import { id, now, purgeExpiredArchivedBots, type OpenbotDb, type TurnRow } from "@openbot/db";
+import { appendLiveWork, buildThreadDigest, insertMessage, promote, wrapPromptWithDigest } from "@openbot/live-work";
+import { mintMcpToken, persistMcpToken, type McpInflight } from "@openbot/mcp-send-message";
+import { open, type Envelope } from "@openbot/vault";
+import { LocalHostRunner } from "@openbot/runner";
+import { DEFAULT_GROK_MODEL, DEFAULT_REASONING_EFFORT, grokCliSignedIn } from "@openbot/acp-grok";
+
+export type EngineOpts = {
+  db: OpenbotDb;
+  home: string;
+  inflight: McpInflight;
+  master: Buffer;
+  mcpPort: () => number;
+  onPush: (accountId: string, event: unknown) => void;
+};
+
+export class TurnEngine {
+  runners = new Map<string, LocalHostRunner>();
+  busy = false;
+  private looping = false;
+  private loopAgain = false;
+  private runningBots = new Set<string>();
+
+  constructor(public readonly opts: EngineOpts) {}
+
+  runnerFor(accountId: string): LocalHostRunner {
+    let r = this.runners.get(accountId);
+    if (!r) {
+      r = new LocalHostRunner(this.opts.home, accountId);
+      r.onLiveWork = (ev, botId) => {
+        const turn = this.opts.db.get<TurnRow>(
+          botId
+            ? "SELECT * FROM turns WHERE status = 'running' AND bot_id = ? ORDER BY created_at DESC LIMIT 1"
+            : "SELECT * FROM turns WHERE status = 'running' AND bot_id IN (SELECT id FROM bots WHERE account_id = ?) ORDER BY created_at DESC LIMIT 1",
+          [botId ?? accountId],
+        );
+        if (!turn) return;
+        appendLiveWork(this.opts.db, turn.id, ev.kind, ev.payload);
+        this.opts.onPush(accountId, { type: "live_work", turnId: turn.id, event: ev });
+        if (ev.kind === "permission_request") {
+          const reqId = String((ev.payload as { reqId?: string }).reqId ?? "");
+          if (r.permissionMode === "ask") {
+            this.opts.onPush(accountId, {
+              type: "permission_request",
+              turnId: turn.id,
+              reqId,
+              payload: ev.payload,
+            });
+          } else {
+            r.respondPermission(reqId, true);
+          }
+        }
+      };
+      this.runners.set(accountId, r);
+    }
+    return r;
+  }
+
+  kick(): void {
+    this.reapOrphans();
+    purgeExpiredArchivedBots(this.opts.db);
+    void this.loop();
+  }
+
+  /** Turns left `running` after a process crash/restart would block the bot's queue forever. */
+  reapOrphans(): void {
+    const orphans = this.opts.db.all<TurnRow>(
+      "SELECT * FROM turns WHERE status = 'running' ORDER BY created_at",
+    );
+    for (const turn of orphans) {
+      if (this.runningBots.has(turn.bot_id)) continue;
+      const note =
+        "OpenBot restarted before this turn finished. Send the message again if you still need a reply.";
+      this.opts.db.run("UPDATE turns SET error = ? WHERE id = ?", [note, turn.id]);
+      promote(this.opts.db, turn.id, { kind: "crash", assistantText: note });
+      if (turn.harness_session_id) {
+        this.opts.db.run(
+          "UPDATE harness_sessions SET state = 'ended', ended_at = ? WHERE id = ? AND ended_at IS NULL",
+          [now(), turn.harness_session_id],
+        );
+      }
+      const bot = this.opts.db.get<{ account_id: string }>("SELECT account_id FROM bots WHERE id = ?", [
+        turn.bot_id,
+      ]);
+      if (bot) {
+        this.opts.onPush(bot.account_id, { type: "turn.updated", turnId: turn.id, status: "failed" });
+        const msgs = this.opts.db.all("SELECT * FROM messages WHERE turn_id = ? ORDER BY created_at", [
+          turn.id,
+        ]);
+        for (const m of msgs) {
+          this.opts.onPush(bot.account_id, { type: "message.created", message: m });
+        }
+      }
+    }
+  }
+
+  private async loop(): Promise<void> {
+    if (this.looping) {
+      this.loopAgain = true;
+      await this.startIdleBots();
+      return;
+    }
+    this.looping = true;
+    try {
+      do {
+        this.loopAgain = false;
+        await this.startIdleBots();
+      } while (this.loopAgain);
+    } finally {
+      this.looping = false;
+    }
+  }
+
+  private async startIdleBots(): Promise<void> {
+    const idleBots = this.opts.db.all<{ bot_id: string }>(
+      `SELECT DISTINCT bot_id FROM turns t
+       WHERE status = 'queued'
+         AND NOT EXISTS (
+           SELECT 1 FROM turns r
+           WHERE r.bot_id = t.bot_id AND r.status = 'running'
+         )`,
+    );
+    const toRun = idleBots.filter((b) => !this.runningBots.has(b.bot_id));
+    if (toRun.length === 0) return;
+    await Promise.all(
+      toRun.map(async (b) => {
+        this.runningBots.add(b.bot_id);
+        try {
+          const turn = this.opts.db.get<TurnRow>(
+            "SELECT * FROM turns WHERE bot_id = ? AND status = 'queued' ORDER BY created_at ASC LIMIT 1",
+            [b.bot_id],
+          );
+          if (turn) await this.runTurn(turn);
+        } finally {
+          this.runningBots.delete(b.bot_id);
+        }
+      }),
+    );
+  }
+
+  private async runTurn(turn: TurnRow): Promise<void> {
+    const bot = this.opts.db.get<{
+      id: string;
+      account_id: string;
+      name: string;
+      description: string;
+      permission_mode: string;
+      model: string | null;
+      reasoning_effort: string | null;
+    }>("SELECT * FROM bots WHERE id = ?", [turn.bot_id]);
+    if (!bot) return;
+
+    const thread = this.opts.db.get<{ id: string; account_id: string }>(
+      "SELECT * FROM threads WHERE id = ?",
+      [turn.thread_id],
+    );
+    if (!thread) return;
+
+    const compute = this.opts.db.get<{ id: string; workspace_path: string }>(
+      "SELECT * FROM compute_instances WHERE account_id = ?",
+      [bot.account_id],
+    );
+    const runner = this.runnerFor(bot.account_id);
+    runner.permissionMode = (bot.permission_mode as typeof runner.permissionMode) || "auto";
+    await runner.ensure(bot.account_id);
+
+    const cred = this.opts.db.get<{ ciphertext: Uint8Array; dek_wrapped: Uint8Array; key_id: string }>(
+      "SELECT ciphertext, dek_wrapped, key_id FROM credentials WHERE account_id = ? AND kind = 'xai_api_key'",
+      [bot.account_id],
+    );
+
+    const model = bot.model || DEFAULT_GROK_MODEL;
+    const reasoningEffort = bot.reasoning_effort || DEFAULT_REASONING_EFFORT;
+    const warm = runner.matchesHarness(bot.id, model, reasoningEffort);
+    let harnessId = turn.harness_session_id;
+    if (!warm) {
+      this.opts.db.run(
+        "UPDATE harness_sessions SET state = 'ended', ended_at = ? WHERE bot_id = ? AND ended_at IS NULL",
+        [now(), bot.id],
+      );
+      harnessId = id();
+      this.opts.db.run(
+        `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at)
+         VALUES (?, ?, ?, 'active', ?)`,
+        [harnessId, compute?.id ?? bot.account_id, bot.id, now()],
+      );
+    } else if (!harnessId) {
+      const existingHs = this.opts.db.get<{ id: string }>(
+        "SELECT id FROM harness_sessions WHERE bot_id = ? AND state = 'active' AND ended_at IS NULL ORDER BY created_at DESC LIMIT 1",
+        [bot.id],
+      );
+      if (existingHs) harnessId = existingHs.id;
+      else {
+        harnessId = id();
+        this.opts.db.run(
+          `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at)
+           VALUES (?, ?, ?, 'active', ?)`,
+          [harnessId, compute?.id ?? bot.account_id, bot.id, now()],
+        );
+      }
+    }
+
+    this.opts.db.run(
+      "UPDATE turns SET status = 'running', started_at = ?, harness_session_id = ? WHERE id = ?",
+      [now(), harnessId, turn.id],
+    );
+    if (!warm) {
+      appendLiveWork(this.opts.db, turn.id, "harness_session_reset", { reason: "cold_start" });
+    }
+    this.opts.onPush(bot.account_id, { type: "turn.updated", turnId: turn.id, status: "running" });
+
+    const fakeHarness = Boolean(process.env.OPENBOT_ACP_COMMAND);
+    const cliSignedIn = grokCliSignedIn();
+    if (!cred && !fakeHarness && !cliSignedIn) {
+      insertMessage(this.opts.db, {
+        threadId: turn.thread_id,
+        turnId: turn.id,
+        role: "system",
+        origin: "system",
+        body: "No Grok login on this machine. Run `grok login` (your SuperGrok/Cursor subscription) or paste an API key in Settings.",
+      });
+      this.opts.db.run("UPDATE turns SET status = 'running' WHERE id = ?", [turn.id]);
+      promote(this.opts.db, turn.id, { kind: "crash", assistantText: "" });
+      this.opts.onPush(bot.account_id, { type: "turn.updated", turnId: turn.id, status: "failed" });
+      return;
+    }
+
+    let apiKey = "";
+    if (cred) {
+      const envelope: Envelope = {
+        ciphertext: Buffer.from(cred.ciphertext),
+        dekWrapped: Buffer.from(cred.dek_wrapped),
+        keyId: cred.key_id,
+        lastFour: "",
+      };
+      apiKey = open(this.opts.master, envelope);
+    }
+
+    let token = "";
+    if (!warm) {
+      const minted = mintMcpToken();
+      token = minted.token;
+      persistMcpToken(
+        this.opts.db,
+        {
+          accountId: bot.account_id,
+          botId: bot.id,
+          threadId: turn.thread_id,
+          harnessSessionId: harnessId,
+        },
+        minted.hash,
+      );
+    }
+
+    const mcpUrl = `http://127.0.0.1:${this.opts.mcpPort()}/mcp/v1`;
+    runner.harnessSessionId = harnessId;
+
+    try {
+      await runner.ensureHarness({
+        botId: bot.id,
+        env: apiKey ? { XAI_API_KEY: apiKey } : {},
+        mcpUrl,
+        mcpToken: token,
+        cwd: runner.desk,
+        botName: bot.name,
+        botDescription: bot.description,
+        permissionMode: bot.permission_mode as "ask" | "auto" | "always-approve",
+        model,
+        reasoningEffort,
+      });
+      this.opts.db.run("UPDATE harness_sessions SET acp_session_id = ? WHERE id = ?", [
+        runner.acpSessionId ?? null,
+        harnessId,
+      ]);
+
+      const userMsg = this.opts.db.get<{ body: string }>(
+        "SELECT body FROM messages WHERE turn_id = ? AND role = 'user' ORDER BY created_at DESC LIMIT 1",
+        [turn.id],
+      );
+      let prompt = userMsg?.body ?? "";
+      if (!warm) {
+        const digest = buildThreadDigest(this.opts.db, {
+          threadId: turn.thread_id,
+          botId: bot.id,
+          botName: bot.name,
+          excludeTurnId: turn.id,
+        });
+        prompt = wrapPromptWithDigest(digest, prompt);
+      }
+      const result = await runner.prompt(prompt, bot.id);
+      promote(this.opts.db, turn.id, {
+        kind: "acp_done",
+        stopReason: result.stopReason,
+        assistantText: result.assistantText,
+        telemetrySentMessageCount: 0,
+      });
+    } catch (err) {
+      const stderr = runner.acpFor(bot.id)?.lastStderr ?? "";
+      const text = (err instanceof Error ? err.message : String(err)) + (stderr ? `\n${stderr.slice(-1500)}` : "");
+      this.opts.db.run("UPDATE turns SET error = ? WHERE id = ?", [text, turn.id]);
+      this.opts.db.run("UPDATE turns SET status = 'running' WHERE id = ?", [turn.id]);
+      promote(this.opts.db, turn.id, { kind: "crash", assistantText: text });
+    }
+
+    await this.opts.inflight.drain(harnessId, 2000);
+    const updated = this.opts.db.get<TurnRow>("SELECT * FROM turns WHERE id = ?", [turn.id]);
+    this.opts.onPush(bot.account_id, {
+      type: "turn.updated",
+      turnId: turn.id,
+      status: updated?.status,
+    });
+    const msgs = this.opts.db.all("SELECT * FROM messages WHERE turn_id = ? ORDER BY created_at", [turn.id]);
+    for (const m of msgs) {
+      this.opts.onPush(bot.account_id, { type: "message.created", message: m });
+    }
+  }
+}
+
+export function deskPath(home: string): string {
+  return join(home, "desk");
+}

@@ -1,0 +1,138 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "openbot",
+      "dependencies": {
+        "@openbot/acp-grok": "workspace:*",
+        "@openbot/api-types": "workspace:*",
+        "@openbot/auth": "workspace:*",
+        "@openbot/compute-protocol": "workspace:*",
+        "@openbot/db": "workspace:*",
+        "@openbot/live-work": "workspace:*",
+        "@openbot/mcp-send-message": "workspace:*",
+        "@openbot/runner": "workspace:*",
+        "@openbot/server": "workspace:*",
+        "@openbot/vault": "workspace:*",
+        "hono": "^4.7.7",
+        "zod": "^3.24.2",
+      },
+      "devDependencies": {
+        "@types/bun": "^1.2.5",
+        "playwright-core": "^1.52.0",
+      },
+    },
+    "apps/server": {
+      "name": "@openbot/server",
+      "version": "0.1.0",
+      "bin": {
+        "openbot": "./src/cli.ts",
+      },
+      "dependencies": {
+        "@openbot/acp-grok": "workspace:*",
+        "@openbot/api-types": "workspace:*",
+        "@openbot/auth": "workspace:*",
+        "@openbot/db": "workspace:*",
+        "@openbot/live-work": "workspace:*",
+        "@openbot/mcp-send-message": "workspace:*",
+        "@openbot/runner": "workspace:*",
+        "@openbot/vault": "workspace:*",
+        "hono": "^4.7.7",
+      },
+    },
+    "packages/acp-grok": {
+      "name": "@openbot/acp-grok",
+      "version": "0.1.0",
+      "dependencies": {
+        "@openbot/compute-protocol": "workspace:*",
+      },
+    },
+    "packages/api-types": {
+      "name": "@openbot/api-types",
+      "version": "0.1.0",
+      "dependencies": {
+        "zod": "^3.24.2",
+      },
+    },
+    "packages/auth": {
+      "name": "@openbot/auth",
+      "version": "0.1.0",
+      "dependencies": {
+        "@openbot/db": "workspace:*",
+      },
+    },
+    "packages/compute-protocol": {
+      "name": "@openbot/compute-protocol",
+      "version": "0.1.0",
+    },
+    "packages/db": {
+      "name": "@openbot/db",
+      "version": "0.1.0",
+    },
+    "packages/live-work": {
+      "name": "@openbot/live-work",
+      "version": "0.1.0",
+      "dependencies": {
+        "@openbot/api-types": "workspace:*",
+        "@openbot/db": "workspace:*",
+      },
+    },
+    "packages/mcp-send-message": {
+      "name": "@openbot/mcp-send-message",
+      "version": "0.1.0",
+      "dependencies": {
+        "@openbot/api-types": "workspace:*",
+        "@openbot/db": "workspace:*",
+        "@openbot/live-work": "workspace:*",
+      },
+    },
+    "packages/runner": {
+      "name": "@openbot/runner",
+      "version": "0.1.0",
+      "dependencies": {
+        "@openbot/acp-grok": "workspace:*",
+        "@openbot/compute-protocol": "workspace:*",
+      },
+    },
+    "packages/vault": {
+      "name": "@openbot/vault",
+      "version": "0.1.0",
+    },
+  },
+  "packages": {
+    "@openbot/acp-grok": ["@openbot/acp-grok@workspace:packages/acp-grok"],
+
+    "@openbot/api-types": ["@openbot/api-types@workspace:packages/api-types"],
+
+    "@openbot/auth": ["@openbot/auth@workspace:packages/auth"],
+
+    "@openbot/compute-protocol": ["@openbot/compute-protocol@workspace:packages/compute-protocol"],
+
+    "@openbot/db": ["@openbot/db@workspace:packages/db"],
+
+    "@openbot/live-work": ["@openbot/live-work@workspace:packages/live-work"],
+
+    "@openbot/mcp-send-message": ["@openbot/mcp-send-message@workspace:packages/mcp-send-message"],
+
+    "@openbot/runner": ["@openbot/runner@workspace:packages/runner"],
+
+    "@openbot/server": ["@openbot/server@workspace:apps/server"],
+
+    "@openbot/vault": ["@openbot/vault@workspace:packages/vault"],
+
+    "@types/bun": ["@types/bun@1.4.0", "", { "dependencies": { "bun-types": "1.4.0" } }, "sha512-K+lZULY23vRgK/CfTjFIV+tyifaNdSMlPh9j+6mQ/cLfpOznLyAuzgV/JQysyECpkBQLVMSyvjlr2fBUSA9wFQ=="],
+
+    "@types/node": ["@types/node@26.3.0", "", { "dependencies": { "undici-types": "~8.3.0" } }, "sha512-L3fgrnchriRC2ExBflb8j4uZZURHZfQsmQeyVzhjcHW4kkwVyo8/0h1B2MVzMTrYUJYu6G7EWs14hW/L9putqw=="],
+
+    "bun-types": ["bun-types@1.4.0", "", { "dependencies": { "@types/node": "*" } }, "sha512-iIKw23BspnQQYd3prITOBxeUsxBHnwzX6YJfGMuNOZzeNcMmVqzIIVGRm1l69ogaPQmb4wB6BN8mA5bE9YuC5Q=="],
+
+    "hono": ["hono@4.13.4", "", {}, "sha512-AGEwKIyRMHRv1t8Wjwa3LHxQ61X5CqrdFT+4BRNTpqS5aJNnpl5WLjADb7vFlJzI/8uK7T5QLVApCMQKNa3LgQ=="],
+
+    "playwright-core": ["playwright-core@1.62.1", "", { "bin": { "playwright-core": "cli.js" } }, "sha512-wPYSwEBJY9GHraISXqyqtx0na0LpO3XEX7jNDhntbex7tzUS7kLnZsOlFruFJB4Hi/rhDMjXGqHewDZ68nYZVw=="],
+
+    "undici-types": ["undici-types@8.3.0", "", {}, "sha512-j375ScV60dom+YkPFIfTLcOiPxkN/buHz5GobjLhixFuANaNs3C9l4GmrWqejgXWJ7BbJcFYpTEUkS1Ge8bpZQ=="],
+
+    "zod": ["zod@3.25.76", "", {}, "sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ=="],
+  }
+}

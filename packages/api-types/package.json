@@ -1,0 +1,11 @@
+{
+  "name": "@openbot/api-types",
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "zod": "^3.24.2"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

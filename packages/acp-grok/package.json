@@ -1,0 +1,11 @@
+{
+  "name": "@openbot/acp-grok",
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "@openbot/compute-protocol": "workspace:*"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

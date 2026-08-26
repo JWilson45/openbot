@@ -1,0 +1,39 @@
+{
+  "name": "openbot",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "bin": {
+    "openbot": "./apps/server/src/cli.ts"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "start": "bun run apps/server/src/cli.ts server",
+    "openbot": "bun run apps/server/src/cli.ts"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  },
+  "dependencies": {
+    "@openbot/acp-grok": "workspace:*",
+    "@openbot/api-types": "workspace:*",
+    "@openbot/auth": "workspace:*",
+    "@openbot/compute-protocol": "workspace:*",
+    "@openbot/db": "workspace:*",
+    "@openbot/live-work": "workspace:*",
+    "@openbot/mcp-send-message": "workspace:*",
+    "@openbot/runner": "workspace:*",
+    "@openbot/server": "workspace:*",
+    "@openbot/vault": "workspace:*",
+    "hono": "^4.7.7",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.5",
+    "playwright-core": "^1.52.0"
+  }
+}
