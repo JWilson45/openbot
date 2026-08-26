@@ -38,7 +38,7 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 | Live work | Collapsible thinking and tool calls in a resizable sidebar. Activity board for the whole team. |
 | Takeover | You grab the shared Chromium (screencast + input). Esc / Close ends it. |
 | Archive | Soft-delete folder. Restore, or type `DELETE` to purge. Expired archives (30 days) are removed automatically. |
-| OpenAI-compatible API | Open WebUI (and similar) can use a bot as `openbot/<Name>` with a `sk-ob_…` key. |
+| OpenAI-compatible API | Open WebUI (and similar) can use a bot as `openbot/<Name>` with a `sk-ob_…` key. Two connections = two orgs (mint the key on that VM). |
 | Auth | Local demo login on loopback, or GitHub OAuth + allowlist. Optional vaulted `XAI_API_KEY`; `grok login` is enough. |
 
 ---
@@ -244,7 +244,7 @@ Cookie session (`openbot_session`) or `Authorization: Bearer` (session token or 
 | `GET` | `/v1/healthz` `/v1/readyz` | Liveness / SQLite + desk writable |
 | `GET` | `/v1/me` | Current user |
 | `POST` | `/v1/bots` | Create. Body `{ name, description, model?, reasoningEffort? }` |
-| `GET` | `/v1/bots` | Active + archived |
+| `GET` | `/v1/bots` | Desk `bots[]` + archived; Gateway is a sidecar, not a seventh slot |
 | `POST` | `/v1/bots/:id/archive` `/restore` | Soft-delete / undo |
 | `POST` | `/v1/bots/:id/purge` | Body `{ confirm: "DELETE" }`. Archived only |
 | `PATCH` | `/v1/bots/:id/settings` | `permissionMode`, `requireHumanApproval`, `model`, `reasoningEffort` |
@@ -264,7 +264,7 @@ WebSockets: `/v1/push` (live UI events), `/v1/takeover` (JPEG frames + input).
 
 ## Open WebUI
 
-OpenBot speaks OpenAI Chat Completions so Open WebUI (and other OpenAI clients) can treat each bot as a model.
+OpenBot speaks OpenAI Chat Completions so Open WebUI (and other OpenAI clients) can treat each bot as a model. **One `openbot server` process is one org.** Switching org is another Open WebUI connection: that VM’s `/v1` base URL plus a `sk-ob_…` key minted **on that VM**. This server has no OpenAI `organization` object.
 
 1. Run the server and sign in.
 2. Settings → **Create API key**, or:
@@ -274,13 +274,15 @@ OpenBot speaks OpenAI Chat Completions so Open WebUI (and other OpenAI clients) 
      -d '{"name":"open-webui"}' http://127.0.0.1:8787/v1/api-keys
    ```
 
-   Copy `token` (`sk-ob_…`). It is shown **once**.
+   Copy `token` (`sk-ob_…`). It is shown **once**. Mint it on the VM you will point at.
 3. Open WebUI → Admin → Connections (provider **OpenAI**):
    - **Base URL**: `http://127.0.0.1:8787/v1` (or `…/openai/v1`)
-   - **API key**: the `sk-ob_…` secret
-4. Model `openbot/<BotName>` (e.g. `openbot/Ada`). Bot UUIDs work too.
+   - **API key**: the `sk-ob_…` secret minted on **that** process
+4. Model `openbot/<BotName>` (e.g. `openbot/Ada`). Bot UUIDs work too. When Gateway exists it is listed as `openbot/Gateway`.
 
-`GET /v1/models` lists **active bots**, not Grok model IDs. Completions send the last user message into that bot's human thread and wait for the turn. Streaming is supported.
+`GET /v1/models` lists **active bots** (desk teammates plus Gateway when present), not Grok model IDs. Completions send the last user message into that bot's human thread and wait for the turn. Streaming is supported. Federation is **off** by default; listing Gateway does not send org mail.
+
+`GET /v1/bots.bots[]` stays desk-only. Gateway is a sidecar on that response, not a seventh roster slot.
 
 ---
 
@@ -342,7 +344,7 @@ Design background: [docs/design/phase-1-always-on-teammate-loop.md](docs/design/
 | UI looks old | Hard-refresh. The SPA is served by the same process; restart `openbot demo`. |
 | Purge / delete fails | Archive first. Permanent delete is archived-only and body `{ "confirm": "DELETE" }`. |
 | `FOREIGN KEY constraint failed` on purge | Fixed in current `deleteBotPermanently` (A2A / live-work / cross-thread `turn_id`). Update and retry. |
-| Open WebUI 401 | Use `sk-ob_…` from Settings, base URL ending in `/v1`, model `openbot/<Name>`. |
+| Open WebUI 401 | Use `sk-ob_…` minted **on that VM**, base URL ending in `/v1`, model `openbot/<Name>` (or `openbot/Gateway`). Another org is another connection, not an OpenAI `organization` header. |
 | Takeover is a black `about:blank` | No page is open in the shared browser yet. That is idle Chromium, not a hang. |
 
 ---

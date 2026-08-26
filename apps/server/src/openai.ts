@@ -212,6 +212,7 @@ async function handleModels(c: Context, ctx: OpenAiCtx) {
   applyCors(c);
   try {
     const s = requireOpenAiAuth(c, ctx.db);
+    // GET /v1/bots hides Gateway in a sidecar; models must still list every active bot.
     const bots = ctx.db.all<BotRow>(
       "SELECT id, account_id, name, created_at FROM bots WHERE account_id = ? AND status = 'active' ORDER BY created_at",
       [s.accountId],

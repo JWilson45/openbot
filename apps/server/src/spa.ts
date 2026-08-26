@@ -1728,6 +1728,7 @@ export const SPA_HTML = `<!DOCTYPE html>
       </div>
       <h2 style="margin-top:16px;font-size:1rem">OpenAI-compatible keys</h2>
       <p class="muted">For Open WebUI or any OpenAI client. Base URL <code>\${location.origin}/v1</code>, model <code>openbot/\${escapeHtml(state.bot?.name || 'Ada')}</code>.</p>
+      <p class="muted">Each OpenBot process is one org. Switch org in Open WebUI by adding another connection (that VM’s base URL + a <code>sk-ob_…</code> key minted there). There is no OpenAI organization field. Models include <code>openbot/Gateway</code> when present. Federation is off until you turn it on.</p>
       <ul id="key-list" class="muted"></ul>
       <p class="err" id="key-err" hidden></p>
       <button type="button" id="mint">Create API key</button>
