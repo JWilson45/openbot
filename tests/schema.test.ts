@@ -26,6 +26,7 @@ test("schema applies on a fresh sqlite file", () => {
     "org_peers",
     "org_inbox",
     "org_solicit",
+    "thread_bridges",
   ]) {
     expect(names).toContain(required);
   }
@@ -105,6 +106,25 @@ test("schema applies on a fresh sqlite file", () => {
   }
   expect(indexes).toContain("org_inbox_peer_msg");
   expect(indexes).toContain("org_solicit_bucket_reason");
+  expect(indexes).toContain("thread_bridges_local");
+  expect(indexes).toContain("thread_bridges_peer_thread");
+  const bridgeCols = db.all<{ name: string; dflt_value: unknown; notnull: number }>(
+    "PRAGMA table_info(thread_bridges)",
+  );
+  const bridgeNames = bridgeCols.map((c) => c.name);
+  for (const col of [
+    "id",
+    "local_thread_id",
+    "peer_org_id",
+    "peer_thread_id",
+    "auto_forward",
+    "created_at",
+  ]) {
+    expect(bridgeNames).toContain(col);
+  }
+  const autoForward = bridgeCols.find((c) => c.name === "auto_forward");
+  expect(autoForward?.notnull).toBe(1);
+  expect(String(autoForward?.dflt_value)).toBe("0");
   const msgCols = db.all<{ name: string }>("PRAGMA table_info(messages)").map((c) => c.name);
   expect(msgCols).toContain("remote_org_id");
   expect(msgCols).toContain("remote_actor_name");

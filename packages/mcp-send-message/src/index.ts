@@ -1,10 +1,12 @@
 import type { KeyObject } from "node:crypto";
 import {
+  ensureThreadBridge,
   humanThread,
   id,
   now,
   orderedBotPair,
   sha256Hex,
+  ThreadBridgeConflict,
   type McpTokenRow,
   type OpenbotDb,
   type OrgInboxRow,
@@ -499,7 +501,31 @@ export async function sendToOrg(
         });
         return { kind: "no_forward" as const };
       }
-      // threadId is accepted for later thread_bridges (PR-39a); never hop++ or map here.
+      const sourceId = input.threadId ?? turn.thread_id;
+      const source = db.get<{ id: string; kind: string; account_id: string }>(
+        "SELECT id, kind, account_id FROM threads WHERE id = ?",
+        [sourceId],
+      );
+      let threadHint: { kind: "bridge"; localThreadId: string; peerThreadId?: string } | undefined;
+      if (source && source.kind === "group" && source.account_id === claims.accountId) {
+        try {
+          const bridge = ensureThreadBridge(db, {
+            localThreadId: source.id,
+            peerOrgId: peer.peer_org_id,
+          });
+          threadHint = {
+            kind: "bridge",
+            localThreadId: source.id,
+            ...(bridge.peer_thread_id ? { peerThreadId: bridge.peer_thread_id } : {}),
+          };
+        } catch (err) {
+          if (err instanceof ThreadBridgeConflict) {
+            throw new McpError("conflict", err.message, 409);
+          }
+          throw err;
+        }
+      }
+      // hop is a protocol constant; never increment (no A→B→C).
       const envelope = {
         id: id(),
         fromOrg: org.org_id,
@@ -510,6 +536,7 @@ export async function sendToOrg(
         hop: 1 as const,
         createdAt: now(),
         body: input.body,
+        ...(threadHint ? { threadHint } : {}),
       };
       return { kind: "send" as const, envelope, peer, org };
     });

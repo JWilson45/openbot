@@ -233,10 +233,11 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     const deskNames = (
       (deskList.json as { result: { tools: Array<{ name: string }> } }).result.tools ?? []
     ).map((t) => t.name);
-    expect(deskNames).toEqual(["SendMessage", "SendToAgent"]);
+    expect(deskNames).toEqual(["SendMessage", "SendToAgent", "SendToThread"]);
     expect(mcpToolsForRole("desk").map((t) => (t as { name: string }).name)).toEqual([
       "SendMessage",
       "SendToAgent",
+      "SendToThread",
     ]);
 
     db.run("UPDATE bots SET role = 'gateway' WHERE id = ?", [w.botId]);
@@ -248,7 +249,7 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     const gwNames = (
       (gwList.json as { result: { tools: Array<{ name: string }> } }).result.tools ?? []
     ).map((t) => t.name);
-    expect(gwNames).toEqual(["SendMessage", "SendToAgent", "SendToOrg", "Inbox"]);
+    expect(gwNames).toEqual(["SendMessage", "SendToAgent", "SendToThread", "SendToOrg", "Inbox"]);
 
     const init = await handleMcpJsonRpc(db, inflight, undefined, {
       jsonrpc: "2.0",

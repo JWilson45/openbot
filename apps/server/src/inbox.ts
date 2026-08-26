@@ -1,10 +1,14 @@
 import {
+  ensureThreadBridge,
   FED_RATE_INSTANCE_HOUR,
   FED_RATE_PEER_HOUR,
   FED_RATE_WINDOW_MS,
+  getThreadBridgeByPeerThread,
   humanThread,
   id,
+  listOpenPeerBridges,
   now,
+  ThreadBridgeConflict,
   type MessageRow,
   type OpenbotDb,
   type OrgSolicitRow,
@@ -157,6 +161,98 @@ function insertGatewayNotice(db: OpenbotDb, threadId: string, body: string): Mes
     origin: "system",
     body,
   });
+}
+
+function foundingUserId(db: OpenbotDb, accountId: string): string | undefined {
+  return db.get<{ auth_user_id: string }>("SELECT auth_user_id FROM accounts WHERE id = ?", [accountId])
+    ?.auth_user_id;
+}
+
+function createBridgeGroup(
+  db: OpenbotDb,
+  opts: { accountId: string; gatewayId: string; title: string; humanUserId: string },
+): string {
+  const threadId = id();
+  const t = now();
+  db.run(
+    `INSERT INTO threads (id, account_id, bot_id, title, kind, created_at)
+     VALUES (?, ?, ?, ?, 'group', ?)`,
+    [threadId, opts.accountId, opts.gatewayId, opts.title, t],
+  );
+  db.run(
+    `INSERT INTO thread_participants (id, thread_id, kind, user_id, bot_id, created_at)
+     VALUES (?, ?, 'human', ?, NULL, ?)`,
+    [id(), threadId, opts.humanUserId, t],
+  );
+  db.run(
+    `INSERT INTO thread_participants (id, thread_id, kind, user_id, bot_id, created_at)
+     VALUES (?, ?, 'bot', NULL, ?, ?)`,
+    [id(), threadId, opts.gatewayId, t],
+  );
+  return threadId;
+}
+
+/** Pair inbound mail to a local group so replies land there. Never auto-forwards. */
+function resolveInboundBridgeThread(
+  db: OpenbotDb,
+  opts: {
+    envelope: FedMessageEnvelope;
+    fromOrgId: string;
+    peerSlug: string;
+    accountId: string;
+    gatewayId: string;
+  },
+): string | null {
+  const hint = opts.envelope.threadHint;
+  if (!hint || (hint.kind !== "bridge" && hint.kind !== "group")) return null;
+  const peerThreadId = hint.localThreadId?.trim() || null;
+  const claimedLocal = hint.peerThreadId?.trim() || null;
+
+  const pair = (localThreadId: string): string | null => {
+    try {
+      ensureThreadBridge(db, {
+        localThreadId,
+        peerOrgId: opts.fromOrgId,
+        peerThreadId,
+      });
+      return localThreadId;
+    } catch (err) {
+      if (err instanceof ThreadBridgeConflict) return null;
+      throw err;
+    }
+  };
+
+  if (claimedLocal) {
+    const thread = db.get<{ id: string; kind: string; account_id: string }>(
+      "SELECT id, kind, account_id FROM threads WHERE id = ?",
+      [claimedLocal],
+    );
+    if (thread && thread.kind === "group" && thread.account_id === opts.accountId) {
+      const mapped = pair(thread.id);
+      if (mapped) return mapped;
+    }
+  }
+
+  if (peerThreadId) {
+    const byPeer = getThreadBridgeByPeerThread(db, opts.fromOrgId, peerThreadId);
+    if (byPeer) return byPeer.local_thread_id;
+  }
+
+  const open = listOpenPeerBridges(db, opts.fromOrgId);
+  if (open.length === 1) {
+    const mapped = pair(open[0]!.local_thread_id);
+    if (mapped) return mapped;
+  }
+
+  const humanUserId = foundingUserId(db, opts.accountId);
+  if (!humanUserId) return null;
+  const created = createBridgeGroup(db, {
+    accountId: opts.accountId,
+    gatewayId: opts.gatewayId,
+    title: `Bridge · ${opts.peerSlug}`,
+    humanUserId,
+  });
+  return pair(created);
 }
 
 function recordSolicit(
@@ -454,8 +550,9 @@ export function handleFedInbound(
     }
 
     const liveGw = accountId ? findActiveGateway(db, accountId) : undefined;
-    const thread = liveGw ? humanThread(db, liveGw.id) : undefined;
-    if (!liveGw || !thread) return { kind: "no_gateway" as const };
+    const gwDm = liveGw ? humanThread(db, liveGw.id) : undefined;
+    if (!liveGw || !gwDm || !accountId) return { kind: "no_gateway" as const };
+    let thread = gwDm;
 
     const fedOn = federationEffective(currentOrgMeta(db));
     const inboxId = id();
@@ -504,6 +601,15 @@ export function handleFedInbound(
       });
       return { kind: "held" as const, messages: notice ? [notice] : [], id: messageId };
     }
+
+    const bridged = resolveInboundBridgeThread(db, {
+      envelope,
+      fromOrgId,
+      peerSlug: allowed.slug,
+      accountId,
+      gatewayId: liveGw.id,
+    });
+    if (bridged) thread = { id: bridged, bot_id: liveGw.id, account_id: accountId };
 
     const busy = gatewayHasActiveTurn(db, liveGw.id);
     let turnId: string | null = null;

@@ -247,6 +247,19 @@ CREATE TABLE IF NOT EXISTS org_solicit (
   last_notice_message_id text
 );
 CREATE UNIQUE INDEX IF NOT EXISTS org_solicit_bucket_reason ON org_solicit(bucket, reason);
+
+-- 1:1 same-pair; auto_forward stays 0 because hop is always 1
+CREATE TABLE IF NOT EXISTS thread_bridges (
+  id text PRIMARY KEY,
+  local_thread_id text NOT NULL REFERENCES threads(id),
+  peer_org_id text NOT NULL,
+  peer_thread_id text,
+  auto_forward integer NOT NULL DEFAULT 0,
+  created_at integer NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS thread_bridges_local ON thread_bridges(local_thread_id);
+CREATE UNIQUE INDEX IF NOT EXISTS thread_bridges_peer_thread
+  ON thread_bridges(peer_org_id, peer_thread_id) WHERE peer_thread_id IS NOT NULL;
 `;
 
 export type SqlValue = string | number | bigint | boolean | null | Uint8Array;
@@ -417,6 +430,101 @@ export type OrgSolicitRow = {
   last_notice_message_id: string | null;
 };
 
+export type ThreadBridgeRow = {
+  id: string;
+  local_thread_id: string;
+  peer_org_id: string;
+  peer_thread_id: string | null;
+  auto_forward: number;
+  created_at: number;
+};
+
+export class ThreadBridgeConflict extends Error {
+  constructor(message = "local thread is already bridged to another org") {
+    super(message);
+    this.name = "ThreadBridgeConflict";
+  }
+}
+
+function isUniqueConstraint(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /UNIQUE/i.test(msg);
+}
+
+export function getThreadBridgeByLocal(
+  db: OpenbotDb,
+  localThreadId: string,
+): ThreadBridgeRow | undefined {
+  return db.get<ThreadBridgeRow>("SELECT * FROM thread_bridges WHERE local_thread_id = ?", [
+    localThreadId,
+  ]);
+}
+
+export function getThreadBridgeByPeerThread(
+  db: OpenbotDb,
+  peerOrgId: string,
+  peerThreadId: string,
+): ThreadBridgeRow | undefined {
+  return db.get<ThreadBridgeRow>(
+    "SELECT * FROM thread_bridges WHERE peer_org_id = ? AND peer_thread_id = ?",
+    [peerOrgId, peerThreadId],
+  );
+}
+
+export function listOpenPeerBridges(db: OpenbotDb, peerOrgId: string): ThreadBridgeRow[] {
+  return db.all<ThreadBridgeRow>(
+    "SELECT * FROM thread_bridges WHERE peer_org_id = ? AND peer_thread_id IS NULL ORDER BY created_at ASC, id ASC",
+    [peerOrgId],
+  );
+}
+
+/** 1:1 same-pair only. auto_forward stays 0 so this cannot become a hop chain. */
+export function ensureThreadBridge(
+  db: OpenbotDb,
+  opts: { localThreadId: string; peerOrgId: string; peerThreadId?: string | null },
+): ThreadBridgeRow {
+  const peerOrgId = opts.peerOrgId.trim();
+  const peerThreadId = opts.peerThreadId?.trim() || null;
+  const existing = getThreadBridgeByLocal(db, opts.localThreadId);
+  if (existing) {
+    if (existing.peer_org_id.toLowerCase() !== peerOrgId.toLowerCase()) {
+      throw new ThreadBridgeConflict();
+    }
+    if (peerThreadId && !existing.peer_thread_id) {
+      try {
+        db.run("UPDATE thread_bridges SET peer_thread_id = ? WHERE id = ? AND peer_thread_id IS NULL", [
+          peerThreadId,
+          existing.id,
+        ]);
+      } catch (err) {
+        if (isUniqueConstraint(err)) throw new ThreadBridgeConflict();
+        throw err;
+      }
+      return getThreadBridgeByLocal(db, opts.localThreadId) ?? existing;
+    }
+    return existing;
+  }
+  const row: ThreadBridgeRow = {
+    id: id(),
+    local_thread_id: opts.localThreadId,
+    peer_org_id: peerOrgId,
+    peer_thread_id: peerThreadId,
+    auto_forward: 0,
+    created_at: now(),
+  };
+  try {
+    db.run(
+      `INSERT INTO thread_bridges (id, local_thread_id, peer_org_id, peer_thread_id, auto_forward, created_at)
+       VALUES (?, ?, ?, ?, 0, ?)`,
+      [row.id, row.local_thread_id, row.peer_org_id, row.peer_thread_id, row.created_at],
+    );
+  } catch (err) {
+    if (isUniqueConstraint(err)) throw new ThreadBridgeConflict();
+    throw err;
+  }
+  return getThreadBridgeByLocal(db, opts.localThreadId) ?? row;
+}
+
 export const MAX_ACTIVE_BOTS = 6;
 /** Archived bots are purged this long after archive unless restored. */
 export const ARCHIVE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -507,6 +615,11 @@ export function deleteBotPermanently(db: OpenbotDb, botId: string): void {
       [botId],
     );
     db.run(`DELETE FROM turns WHERE thread_id IN (SELECT id FROM threads WHERE bot_id = ?)`, [botId]);
+    // FK: thread_bridges.local_thread_id → threads(id)
+    db.run(
+      `DELETE FROM thread_bridges WHERE local_thread_id IN (SELECT id FROM threads WHERE bot_id = ?)`,
+      [botId],
+    );
     db.run(`DELETE FROM threads WHERE bot_id = ?`, [botId]);
     db.run(`DELETE FROM bots WHERE id = ?`, [botId]);
   });
