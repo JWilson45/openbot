@@ -24,6 +24,8 @@ test("schema applies on a fresh sqlite file", () => {
     "thread_participants",
     "org_members",
     "org_peers",
+    "org_inbox",
+    "org_solicit",
   ]) {
     expect(names).toContain(required);
   }
@@ -79,4 +81,31 @@ test("schema applies on a fresh sqlite file", () => {
   for (const col of ["id", "peer_org_id", "slug", "name", "base_url", "pubkey", "status", "created_at"]) {
     expect(peerCols).toContain(col);
   }
+  const inboxCols = db.all<{ name: string }>("PRAGMA table_info(org_inbox)").map((c) => c.name);
+  for (const col of [
+    "id",
+    "message_id",
+    "from_org_id",
+    "from_slug",
+    "to_org_id",
+    "hop",
+    "urgency",
+    "body",
+    "envelope",
+    "status",
+    "acked_turn_id",
+    "acked_at",
+    "created_at",
+  ]) {
+    expect(inboxCols).toContain(col);
+  }
+  const solicitCols = db.all<{ name: string }>("PRAGMA table_info(org_solicit)").map((c) => c.name);
+  for (const col of ["id", "bucket", "reason", "count", "host", "last_at", "last_notice_message_id"]) {
+    expect(solicitCols).toContain(col);
+  }
+  expect(indexes).toContain("org_inbox_peer_msg");
+  expect(indexes).toContain("org_solicit_bucket_reason");
+  const msgCols = db.all<{ name: string }>("PRAGMA table_info(messages)").map((c) => c.name);
+  expect(msgCols).toContain("remote_org_id");
+  expect(msgCols).toContain("remote_actor_name");
 });

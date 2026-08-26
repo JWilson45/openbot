@@ -36,6 +36,7 @@ import { McpError, addThreadParticipantInput, createGroupThreadInput, postMessag
 import { insertMessage, parseLivePayload, promote, summarizeLiveEvent } from "@openbot/live-work";
 import { sha256Hex } from "@openbot/db";
 import { detectCliLogins, listGrokModels, resolveBotInference } from "@openbot/acp-grok";
+import { FED_MAX_REQUEST_BYTES } from "@openbot/federation";
 import { SPA_HTML } from "./spa.ts";
 import { TurnEngine } from "./engine.ts";
 import { mountOpenAiCompat } from "./openai.ts";
@@ -62,6 +63,7 @@ import {
   SlidingWindowRateLimiter,
 } from "./org.ts";
 import { findActiveGateway, provisionOrgGateway } from "./gateway.ts";
+import { handleFedInbound, parseContentLength, readCappedBody } from "./inbox.ts";
 
 export type HomeConfig = {
   home: string;
@@ -221,6 +223,41 @@ export function createApp(cfg: HomeConfig): {
     return c.json(fedInfoPayload(row, gw ? { name: gw.name } : null));
   });
 
+  app.post("/fed/v1/messages", async (c) => {
+    if (c.req.header("cookie") && !parseBearer(c.req.header("authorization"))) {
+      return c.json({ error: "cookies_not_accepted" }, 401);
+    }
+    const cl = parseContentLength(c.req.header("content-length"));
+    if (cl == null || cl > FED_MAX_REQUEST_BYTES) {
+      return c.json({ error: "too_large" }, 413);
+    }
+    const raw = await readCappedBody(c.req.raw, FED_MAX_REQUEST_BYTES);
+    if (raw === "too_large") return c.json({ error: "too_large" }, 413);
+    const rawBody = Buffer.from(raw).toString("utf8");
+    let json: unknown;
+    try {
+      json = JSON.parse(rawBody);
+    } catch {
+      return c.json({ error: "invalid_json" }, 400);
+    }
+    const result = handleFedInbound(db, {
+      rawBody,
+      json,
+      authorization: c.req.header("authorization"),
+      idempotencyKey: c.req.header("idempotency-key"),
+      clientIp: bunRequestIp(c.env, c.req.raw),
+    });
+    for (const msg of result.push) {
+      if (msg.origin === "prompt") continue;
+      if (result.accountId) onPush(result.accountId, { type: "message.created", message: msg });
+    }
+    if (result.kick) ctx.engine.kick();
+    return c.json(
+      result.body,
+      result.status as 200 | 202 | 400 | 401 | 403 | 413 | 429 | 503,
+    );
+  });
+
   app.get("/", (c) => c.html(SPA_HTML));
 
   app.get("/auth/github", (c) => {
@@ -341,11 +378,50 @@ export function createApp(cfg: HomeConfig): {
         return c.json({ error: "invalid_federation" }, 400);
       }
       setFederationEnabled(db, body.federationEnabled);
-      if (!federationEffective(currentOrgMeta(db))) ctx.engine.stopGatewayAcps();
+      const after = currentOrgMeta(db);
+      if (!federationEffective(after)) ctx.engine.stopGatewayAcps();
+      else if (after?.account_id) {
+        const gw = findActiveGateway(db, after.account_id);
+        if (gw) ctx.engine.maybeKickGatewayDrain(gw.id);
+      }
     }
     const row = currentOrgMeta(db);
     if (!row) return c.json({ error: "no_org" }, 500);
     return c.json(orgMemberSnapshot(row));
+  });
+
+  app.get("/v1/org/inbox", (c) => {
+    requireSession(c);
+    const rows = db.all<{
+      id: string;
+      message_id: string;
+      from_org_id: string;
+      from_slug: string;
+      to_org_id: string;
+      hop: number;
+      urgency: string;
+      body: string;
+      status: string;
+      acked_turn_id: string | null;
+      acked_at: number | null;
+      created_at: number;
+    }>("SELECT * FROM org_inbox ORDER BY created_at DESC, id DESC LIMIT 100");
+    return c.json({
+      inbox: rows.map((r) => ({
+        id: r.id,
+        messageId: r.message_id,
+        fromOrgId: r.from_org_id,
+        fromSlug: r.from_slug,
+        toOrgId: r.to_org_id,
+        hop: r.hop,
+        urgency: r.urgency,
+        body: r.body,
+        status: r.status,
+        ackedTurnId: r.acked_turn_id,
+        ackedAt: r.acked_at,
+        createdAt: r.created_at,
+      })),
+    });
   });
 
   const peerEnv = cfg.env ?? process.env;

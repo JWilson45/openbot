@@ -135,6 +135,8 @@ CREATE TABLE IF NOT EXISTS messages (
   body text NOT NULL,
   urgency text NOT NULL DEFAULT 'normal',
   from_bot_id text,
+  remote_org_id text,
+  remote_actor_name text,
   created_at integer NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_thread_created ON messages(thread_id, created_at);
@@ -215,6 +217,36 @@ CREATE TABLE IF NOT EXISTS org_peers (
   status text NOT NULL DEFAULT 'allowed',
   created_at integer NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS org_inbox (
+  id text PRIMARY KEY,
+  message_id text NOT NULL,
+  from_org_id text NOT NULL,
+  from_slug text NOT NULL DEFAULT '',
+  to_org_id text NOT NULL,
+  hop integer NOT NULL,
+  urgency text NOT NULL DEFAULT 'normal',
+  body text NOT NULL,
+  envelope text NOT NULL,
+  status text NOT NULL DEFAULT 'pending',
+  acked_turn_id text REFERENCES turns(id) ON DELETE SET NULL,
+  acked_at integer,
+  created_at integer NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS org_inbox_peer_msg ON org_inbox(from_org_id, message_id);
+CREATE INDEX IF NOT EXISTS org_inbox_from_created ON org_inbox(from_org_id, created_at);
+CREATE INDEX IF NOT EXISTS org_inbox_created ON org_inbox(created_at);
+
+CREATE TABLE IF NOT EXISTS org_solicit (
+  id text PRIMARY KEY,
+  bucket text NOT NULL,
+  reason text NOT NULL,
+  count integer NOT NULL DEFAULT 1,
+  host text,
+  last_at integer NOT NULL,
+  last_notice_message_id text
+);
+CREATE UNIQUE INDEX IF NOT EXISTS org_solicit_bucket_reason ON org_solicit(bucket, reason);
 `;
 
 export type SqlValue = string | number | bigint | boolean | null | Uint8Array;
@@ -255,6 +287,8 @@ export class OpenbotDb {
     this.ensureColumn("bots", "reasoning_effort", "text NOT NULL DEFAULT 'high'");
     this.ensureColumn("bots", "role", "text NOT NULL DEFAULT 'desk'");
     this.ensureColumn("org_meta", "federation_enabled", "integer NOT NULL DEFAULT 0");
+    this.ensureColumn("messages", "remote_org_id", "text");
+    this.ensureColumn("messages", "remote_actor_name", "text");
     this.raw.exec(
       "UPDATE bots SET archived_at = created_at WHERE status = 'archived' AND archived_at IS NULL",
     );
@@ -352,12 +386,46 @@ export type MessageRow = {
   body: string;
   urgency: string;
   from_bot_id: string | null;
+  remote_org_id: string | null;
+  remote_actor_name: string | null;
   created_at: number;
+};
+
+export type OrgInboxRow = {
+  id: string;
+  message_id: string;
+  from_org_id: string;
+  from_slug: string;
+  to_org_id: string;
+  hop: number;
+  urgency: string;
+  body: string;
+  envelope: string;
+  status: string;
+  acked_turn_id: string | null;
+  acked_at: number | null;
+  created_at: number;
+};
+
+export type OrgSolicitRow = {
+  id: string;
+  bucket: string;
+  reason: string;
+  count: number;
+  host: string | null;
+  last_at: number;
+  last_notice_message_id: string | null;
 };
 
 export const MAX_ACTIVE_BOTS = 6;
 /** Archived bots are purged this long after archive unless restored. */
 export const ARCHIVE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const INBOX_ACKED_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const INBOX_OPEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+export const INBOX_CAP = 10_000;
+export const FED_RATE_PEER_HOUR = 60;
+export const FED_RATE_INSTANCE_HOUR = 200;
+export const FED_RATE_WINDOW_MS = 60 * 60 * 1000;
 
 export function isGatewayRole(role: string | null | undefined): boolean {
   return role === "gateway";
@@ -442,6 +510,28 @@ export function deleteBotPermanently(db: OpenbotDb, botId: string): void {
     db.run(`DELETE FROM threads WHERE bot_id = ?`, [botId]);
     db.run(`DELETE FROM bots WHERE id = ?`, [botId]);
   });
+}
+
+export function purgeExpiredOrgInbox(db: OpenbotDb): number {
+  const t = now();
+  db.run(
+    "DELETE FROM org_inbox WHERE status = 'acked' AND IFNULL(acked_at, created_at) < ?",
+    [t - INBOX_ACKED_TTL_MS],
+  );
+  db.run(
+    "DELETE FROM org_inbox WHERE status IN ('pending', 'dropped', 'held') AND created_at < ?",
+    [t - INBOX_OPEN_TTL_MS],
+  );
+  const n = db.get<{ n: number }>("SELECT COUNT(*) AS n FROM org_inbox")?.n ?? 0;
+  if (n <= INBOX_CAP) return n;
+  const extra = n - INBOX_CAP;
+  db.run(
+    `DELETE FROM org_inbox WHERE id IN (
+       SELECT id FROM org_inbox ORDER BY created_at ASC, id ASC LIMIT ?
+     )`,
+    [extra],
+  );
+  return db.get<{ n: number }>("SELECT COUNT(*) AS n FROM org_inbox")?.n ?? 0;
 }
 
 export function purgeExpiredArchivedBots(db: OpenbotDb, accountId?: string): string[] {

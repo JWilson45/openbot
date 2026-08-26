@@ -7,6 +7,8 @@ import { request as httpsRequest } from "node:https";
 import { id, now, type OpenbotDb } from "@openbot/db";
 import { open, seal } from "@openbot/vault";
 import {
+  FED_MAX_BODY_CHARS,
+  FED_MAX_REQUEST_BYTES,
   generateEd25519,
   parseRawPublicKeyB64,
   privateKeyFromPem,
@@ -198,6 +200,9 @@ export function setFederationEnabled(db: OpenbotDb, enabled: boolean): OrgMetaRo
   db.run("UPDATE org_meta SET federation_enabled = ? WHERE id = 'current'", [enabled ? 1 : 0]);
   const row = currentOrgMeta(db);
   if (!row) throw new Error("org_meta write failed");
+  if (enabled && federationEffective(row)) {
+    db.run("UPDATE org_inbox SET status = 'pending' WHERE status = 'held'");
+  }
   return row;
 }
 
@@ -323,8 +328,8 @@ export function fedInfoPayload(
     caps: {
       protocol: "openbot-fed/1",
       federation: federationEffective(row) ? "on" : "off",
-      maxBodyBytes: 32_000,
-      maxRequestBytes: 65_536,
+      maxBodyBytes: FED_MAX_BODY_CHARS,
+      maxRequestBytes: FED_MAX_REQUEST_BYTES,
       attachments: false,
       groupBridge: true,
       hopLimit: 1,

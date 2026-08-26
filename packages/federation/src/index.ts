@@ -61,6 +61,16 @@ export type FedJwsPayload = {
   bth: string;
 };
 
+export type DecodedFedJws = {
+  kid: string;
+  payload: FedJwsPayload;
+  signingInput: string;
+  signature: Buffer;
+};
+
+export const FED_MAX_REQUEST_BYTES = 65_536;
+export const FED_MAX_BODY_CHARS = 32_000;
+
 export function generateEd25519(): GeneratedEd25519 {
   const pair = generateKeyPairSync("ed25519");
   const privateKeyPem = pair.privateKey.export({ type: "pkcs8", format: "pem" });
@@ -134,7 +144,7 @@ export function signFedJws(opts: SignFedJwsOpts): string {
   );
 }
 
-export function verifyFedJws(token: string, opts: VerifyFedJwsOpts): FedJwsPayload {
+export function decodeFedJws(token: string): DecodedFedJws {
   const parts = token.split(".");
   if (parts.length !== 3 || !parts[0] || !parts[1] || !parts[2]) {
     throw new FedJwsError("malformed", "malformed jws");
@@ -146,18 +156,8 @@ export function verifyFedJws(token: string, opts: VerifyFedJwsOpts): FedJwsPaylo
   const hdr = header as Record<string, unknown>;
   if (hdr.alg !== "EdDSA") throw new FedJwsError("alg", "alg must be EdDSA");
 
-  const sig = Buffer.from(parts[2], "base64url");
-  if (sig.length !== SIG_BYTES) throw new FedJwsError("truncated", "truncated signature");
-
-  const publicKey = typeof opts.publicKey === "string" ? publicKeyFromRawB64(opts.publicKey) : opts.publicKey;
-  const signingInput = `${parts[0]}.${parts[1]}`;
-  let ok = false;
-  try {
-    ok = verify(null, Buffer.from(signingInput, "utf8"), publicKey, sig);
-  } catch {
-    ok = false;
-  }
-  if (!ok) throw new FedJwsError("signature", "bad_signature");
+  const signature = Buffer.from(parts[2], "base64url");
+  if (signature.length !== SIG_BYTES) throw new FedJwsError("truncated", "truncated signature");
 
   const parsed = parseB64urlJson(parts[1]);
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -172,22 +172,41 @@ export function verifyFedJws(token: string, opts: VerifyFedJwsOpts): FedJwsPaylo
   const iat = reqInt(p.iat, "iat");
   const exp = reqInt(p.exp, "exp");
   const kid = reqString(hdr.kid, "kid");
-
   if (iss !== kid) throw new FedJwsError("bind", "iss !== kid");
-  if (jti !== opts.expectedJti) throw new FedJwsError("bind", "jti !== body.id");
-  if (aud !== opts.expectedAud) throw new FedJwsError("aud", "aud mismatch");
-  if (scope !== SCOPE) throw new FedJwsError("scope", "scope must be fed.messages");
-  if (exp <= iat) throw new FedJwsError("ttl", "exp <= iat");
-  if (exp - iat > MAX_TTL_SEC) throw new FedJwsError("ttl", "exp - iat > 120");
+  return {
+    kid,
+    payload: { iss, aud, iat, exp, jti, scope, bth },
+    signingInput: `${parts[0]}.${parts[1]}`,
+    signature,
+  };
+}
+
+export function verifyFedJws(token: string, opts: VerifyFedJwsOpts): FedJwsPayload {
+  const decoded = decodeFedJws(token);
+  const publicKey = typeof opts.publicKey === "string" ? publicKeyFromRawB64(opts.publicKey) : opts.publicKey;
+  let ok = false;
+  try {
+    ok = verify(null, Buffer.from(decoded.signingInput, "utf8"), publicKey, decoded.signature);
+  } catch {
+    ok = false;
+  }
+  if (!ok) throw new FedJwsError("signature", "bad_signature");
+
+  const { payload } = decoded;
+  if (payload.jti !== opts.expectedJti) throw new FedJwsError("bind", "jti !== body.id");
+  if (payload.aud !== opts.expectedAud) throw new FedJwsError("aud", "aud mismatch");
+  if (payload.scope !== SCOPE) throw new FedJwsError("scope", "scope must be fed.messages");
+  if (payload.exp <= payload.iat) throw new FedJwsError("ttl", "exp <= iat");
+  if (payload.exp - payload.iat > MAX_TTL_SEC) throw new FedJwsError("ttl", "exp - iat > 120");
 
   const nowSec = opts.nowSec ?? Math.floor(Date.now() / 1000);
-  if (iat > nowSec + SKEW_SEC) throw new FedJwsError("iat", "iat in the future");
-  if (exp < nowSec - SKEW_SEC) throw new FedJwsError("exp", "expired");
+  if (payload.iat > nowSec + SKEW_SEC) throw new FedJwsError("iat", "iat in the future");
+  if (payload.exp < nowSec - SKEW_SEC) throw new FedJwsError("exp", "expired");
 
   const expectedBth = bodyThumbprint(opts.rawBody);
-  if (bth !== expectedBth) throw new FedJwsError("bth", "bth mismatch");
+  if (payload.bth !== expectedBth) throw new FedJwsError("bth", "bth mismatch");
 
-  return { iss, aud, iat, exp, jti, scope, bth };
+  return payload;
 }
 
 function asBytes(raw: string | Uint8Array): Buffer {

@@ -61,6 +61,35 @@ export const addThreadParticipantInput = z.object({
 
 export type AddThreadParticipantInput = z.infer<typeof addThreadParticipantInput>;
 
+export const fedFromActor = z.object({
+  type: z.enum(["human", "bot", "gateway"]),
+  name: z.string().min(1).max(80),
+  botId: z.string().uuid().optional(),
+});
+
+export const fedThreadHint = z.object({
+  kind: z.enum(["dm", "group", "bridge"]),
+  localThreadId: z.string().optional(),
+  peerThreadId: z.string().optional(),
+});
+
+/** Extra keys are stripped. hop === 1 is enforced after MUST-bind, not here. */
+export const fedMessageEnvelope = z.object({
+  id: z.string().uuid(),
+  fromOrg: z.string().uuid(),
+  fromSlug: z.string().min(1).max(80),
+  fromActor: fedFromActor,
+  toOrg: z.string().uuid(),
+  urgency: z.enum(["normal", "needs_user"]),
+  hop: z.number().int().optional(),
+  createdAt: z.number().int(),
+  inReplyTo: z.string().uuid().optional(),
+  body: z.string().min(1).max(32_000),
+  threadHint: fedThreadHint.optional(),
+});
+
+export type FedMessageEnvelope = z.infer<typeof fedMessageEnvelope>;
+
 export const credentialInput = z.object({
   key: z.string().min(8).max(4096),
 });

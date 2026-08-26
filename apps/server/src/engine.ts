@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { id, now, purgeExpiredArchivedBots, type OpenbotDb, type TurnRow } from "@openbot/db";
+import { id, now, purgeExpiredArchivedBots, purgeExpiredOrgInbox, type OpenbotDb, type TurnRow } from "@openbot/db";
 import { appendLiveWork, buildThreadDigest, insertMessage, promote, wrapPromptWithDigest } from "@openbot/live-work";
 import { mintMcpToken, persistMcpToken, type McpInflight } from "@openbot/mcp-send-message";
 import { open, type Envelope } from "@openbot/vault";
@@ -11,6 +11,7 @@ import {
 } from "@openbot/runner";
 import { DEFAULT_GROK_MODEL, DEFAULT_REASONING_EFFORT, grokCliSignedIn } from "@openbot/acp-grok";
 import { currentOrgMeta, FEDERATION_OFF_NOTICE, federationEffective } from "./org.ts";
+import { maybeEnqueueGatewayDrain } from "./inbox.ts";
 
 export type EngineOpts = {
   db: OpenbotDb;
@@ -78,11 +79,26 @@ export class TurnEngine {
     void this.loop();
   }
 
-  /** Reap orphans, idle ACPs, and archived bots. Does not start turns. */
+  /** Reap orphans, idle ACPs, archived bots, and expired inbox rows. Does not start turns. */
   maintenance(): void {
     this.reapOrphans();
     this.reapIdleHarnesses();
     this.purgeExpiredArchives();
+    purgeExpiredOrgInbox(this.opts.db);
+  }
+
+  maybeKickGatewayDrain(gatewayBotId: string, finishedTurnId?: string): void {
+    const result = maybeEnqueueGatewayDrain(this.opts.db, gatewayBotId, finishedTurnId);
+    const bot = this.opts.db.get<{ account_id: string }>("SELECT account_id FROM bots WHERE id = ?", [
+      gatewayBotId,
+    ]);
+    if (bot) {
+      for (const m of result.push) {
+        if (m.origin === "prompt") continue;
+        this.opts.onPush(bot.account_id, { type: "message.created", message: m });
+      }
+    }
+    if (result.kick) this.kick();
   }
 
   /** DB-purge expired archives, then best-effort delete each `desk/projects/<id>` only (not isolation). */
@@ -247,12 +263,15 @@ export class TurnEngine {
       this.opts.db.run("UPDATE turns SET sent_message_count = 1 WHERE id = ?", [turn.id]);
       promote(this.opts.db, turn.id, { kind: "acp_done", stopReason: "end_turn", assistantText: "" });
       this.opts.onPush(bot.account_id, { type: "turn.updated", turnId: turn.id, status: "completed" });
-      const msgs = this.opts.db.all("SELECT * FROM messages WHERE turn_id = ? ORDER BY created_at", [
-        turn.id,
-      ]);
+      const msgs = this.opts.db.all<{ origin: string }>(
+        "SELECT * FROM messages WHERE turn_id = ? ORDER BY created_at",
+        [turn.id],
+      );
       for (const m of msgs) {
+        if (m.origin === "prompt") continue;
         this.opts.onPush(bot.account_id, { type: "message.created", message: m });
       }
+      this.maybeKickGatewayDrain(bot.id, turn.id);
       return;
     }
 
@@ -314,6 +333,7 @@ export class TurnEngine {
       this.opts.db.run("UPDATE turns SET status = 'running' WHERE id = ?", [turn.id]);
       promote(this.opts.db, turn.id, { kind: "crash", assistantText: "" });
       this.opts.onPush(bot.account_id, { type: "turn.updated", turnId: turn.id, status: "failed" });
+      if (isGateway) this.maybeKickGatewayDrain(bot.id, turn.id);
       return;
     }
 
@@ -414,9 +434,10 @@ export class TurnEngine {
       [turn.id],
     );
     for (const m of msgs) {
-      if (m.origin === "prompt") continue; // per-turn clones, not transcript bubbles
+      if (m.origin === "prompt") continue;
       this.opts.onPush(bot.account_id, { type: "message.created", message: m });
     }
+    if (isGateway) this.maybeKickGatewayDrain(bot.id, turn.id);
   }
 }
 

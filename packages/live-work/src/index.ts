@@ -88,6 +88,8 @@ export function insertMessage(
     body: string;
     urgency?: string;
     fromBotId?: string | null;
+    remoteOrgId?: string | null;
+    remoteActorName?: string | null;
   },
 ): MessageRow {
   const msg: MessageRow = {
@@ -99,11 +101,13 @@ export function insertMessage(
     body: row.body,
     urgency: row.urgency ?? "normal",
     from_bot_id: row.fromBotId ?? null,
+    remote_org_id: row.remoteOrgId ?? null,
+    remote_actor_name: row.remoteActorName ?? null,
     created_at: now(),
   };
   db.run(
-    `INSERT INTO messages (id, thread_id, turn_id, role, origin, body, urgency, from_bot_id, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO messages (id, thread_id, turn_id, role, origin, body, urgency, from_bot_id, remote_org_id, remote_actor_name, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       msg.id,
       msg.thread_id,
@@ -113,6 +117,8 @@ export function insertMessage(
       msg.body,
       msg.urgency,
       msg.from_bot_id,
+      msg.remote_org_id,
+      msg.remote_actor_name,
       msg.created_at,
     ],
   );
