@@ -1,0 +1,18 @@
+# systemd --user unit. Do not install as a system service.
+# Chromium and Grok must run as the same logged-in user (never root).
+[Unit]
+Description=OpenBot always-on teammate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__ROOT__
+ExecStart="__BUN__" "__CLI__" server --home "__HOME__" --port __PORT__ --host 127.0.0.1
+Restart=always
+RestartSec=3
+Environment="OPENBOT_HOME=__HOME__"
+Environment="PATH=__PATH__"
+
+[Install]
+WantedBy=default.target

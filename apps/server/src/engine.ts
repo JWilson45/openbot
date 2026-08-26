@@ -3,7 +3,7 @@ import { id, now, purgeExpiredArchivedBots, type OpenbotDb, type TurnRow } from 
 import { appendLiveWork, buildThreadDigest, insertMessage, promote, wrapPromptWithDigest } from "@openbot/live-work";
 import { mintMcpToken, persistMcpToken, type McpInflight } from "@openbot/mcp-send-message";
 import { open, type Envelope } from "@openbot/vault";
-import { LocalHostRunner } from "@openbot/runner";
+import { deleteBotProject, LocalHostRunner } from "@openbot/runner";
 import { DEFAULT_GROK_MODEL, DEFAULT_REASONING_EFFORT, grokCliSignedIn } from "@openbot/acp-grok";
 
 export type EngineOpts = {
@@ -58,9 +58,41 @@ export class TurnEngine {
   }
 
   kick(): void {
-    this.reapOrphans();
-    purgeExpiredArchivedBots(this.opts.db);
+    this.maintenance();
     void this.loop();
+  }
+
+  /** Reap orphans, idle ACPs, and archived bots. Does not start turns. */
+  maintenance(): void {
+    this.reapOrphans();
+    this.reapIdleHarnesses();
+    this.purgeExpiredArchives();
+  }
+
+  /** DB-purge expired archives, then best-effort delete each `desk/projects/<id>` only (not isolation). */
+  purgeExpiredArchives(accountId?: string): string[] {
+    const ids = purgeExpiredArchivedBots(this.opts.db, accountId);
+    const desk = join(this.opts.home, "desk");
+    for (const botId of ids) {
+      try {
+        deleteBotProject(desk, botId);
+      } catch {
+        /* best-effort; the bot row is already gone */
+      }
+    }
+    return ids;
+  }
+
+  reapIdleHarnesses(): void {
+    for (const runner of this.runners.values()) {
+      const killed = runner.reapIdle();
+      for (const botId of killed) {
+        this.opts.db.run(
+          "UPDATE harness_sessions SET state = 'ended', ended_at = ? WHERE bot_id = ? AND ended_at IS NULL",
+          [now(), botId],
+        );
+      }
+    }
   }
 
   /** Turns left `running` after a process crash/restart would block the bot's queue forever. */
@@ -164,6 +196,7 @@ export class TurnEngine {
     const runner = this.runnerFor(bot.account_id);
     runner.permissionMode = (bot.permission_mode as typeof runner.permissionMode) || "auto";
     await runner.ensure(bot.account_id);
+    const cwd = runner.ensureProject(bot.id, bot.name);
 
     const cred = this.opts.db.get<{ ciphertext: Uint8Array; dek_wrapped: Uint8Array; key_id: string }>(
       "SELECT ciphertext, dek_wrapped, key_id FROM credentials WHERE account_id = ? AND kind = 'xai_api_key'",
@@ -262,7 +295,7 @@ export class TurnEngine {
         env: apiKey ? { XAI_API_KEY: apiKey } : {},
         mcpUrl,
         mcpToken: token,
-        cwd: runner.desk,
+        cwd,
         botName: bot.name,
         botDescription: bot.description,
         permissionMode: bot.permission_mode as "ask" | "auto" | "always-approve",

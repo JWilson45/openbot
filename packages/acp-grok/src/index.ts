@@ -72,6 +72,7 @@ export class AcpClient {
   lastInMethod = "";
   model = "";
   reasoningEffort = "";
+  lastActivityAt = Date.now();
 
   get pid(): number | undefined {
     return this.proc.pid;
@@ -314,6 +315,7 @@ export class AcpClient {
   }
 
   async newSession(req: EnsureHarnessRequest): Promise<string> {
+    this.lastActivityAt = Date.now();
     this.assistantText = "";
     const mcpServers: unknown[] = [];
     if (this.mcpHttp) {
@@ -345,11 +347,13 @@ export class AcpClient {
       90_000,
     );
     this.sessionId = result.sessionId;
+    this.lastActivityAt = Date.now();
     return result.sessionId;
   }
 
   async prompt(text: string): Promise<PromptResult> {
     if (!this.sessionId) throw new Error("no ACP session");
+    this.lastActivityAt = Date.now();
     this.assistantText = "";
     const result = await this.request<{ stopReason?: string }>(
       "session/prompt",
@@ -359,6 +363,7 @@ export class AcpClient {
       },
       10 * 60_000,
     );
+    this.lastActivityAt = Date.now();
     return { stopReason: result.stopReason ?? "end_turn", assistantText: this.assistantText };
   }
 
@@ -402,3 +407,4 @@ export {
   type GrokEffort,
   type GrokModelInfo,
 } from "./models.ts";
+export { PINNED_GROK_CLI, detectGrokCliVersion, grokCliPinStatus } from "./pin.ts";

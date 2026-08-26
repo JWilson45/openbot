@@ -60,16 +60,38 @@ cd openbot
 bun install
 ```
 
-The CLI is `bun run openbot -- <command>` (or `bun run apps/server/src/cli.ts`).
+The CLI is `bun run openbot -- <command>` (or `bun run apps/server/src/cli.ts`). Current version is **0.2.0**. `openbot version` prints `{ openbot, grokPin, grok }`. OpenBot pins **Grok CLI 1.0.5** (warns if missing or older; does not refuse to start).
 
 ```
-openbot demo   [--port 8787] [--home ~/.openbot] [--fake]
-openbot server [--port 8787] [--home ~/.openbot] [--origin http://127.0.0.1:8787]
+openbot demo    [--port 8787] [--home ~/.openbot] [--host 127.0.0.1] [--fake]
+openbot server  [--port 8787] [--home ~/.openbot] [--host 127.0.0.1] [--origin http://127.0.0.1:8787]
+openbot install [--user] [--home ~/.openbot] [--port 8787] [--start]
+openbot version | -v | --version
 openbot allowlist add <github-login>
 openbot allowlist
 ```
 
-Default home is `$OPENBOT_HOME` or `~/.openbot`.
+Default home is `$OPENBOT_HOME` or `~/.openbot`. Bind defaults to **127.0.0.1**. OpenBot does not terminate TLS — put Caddy or nginx in front (see [docs/host-service.md](docs/host-service.md) and `contrib/caddy/Caddyfile.example`).
+
+### Run as a user service
+
+From a git checkout after `bun install`:
+
+```bash
+bun run openbot -- install --user --home ~/.openbot --port 8787
+```
+
+That writes a **LaunchAgent** (`~/Library/LaunchAgents/ai.openbot.plist`) or a **systemd --user** unit (`~/.config/systemd/user/openbot.service`). Never root; Chromium must not run as root. It does not start the unit unless you pass `--start`.
+
+```bash
+# macOS
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/ai.openbot.plist
+
+# Linux
+systemctl --user daemon-reload && systemctl --user enable --now openbot
+```
+
+`grok login` must be done as the **same user** the service runs as. Full operator notes: [docs/host-service.md](docs/host-service.md).
 
 ---
 
@@ -99,7 +121,7 @@ bun run openbot demo --fake --port 8787
 | `[[send:body]]` | Bot `SendMessage`s that body to you |
 | `[[sendto:Name:body]]` | Bot `SendToAgent`s another bot |
 | `[[ramble]]` | Thinks out loud, never calls `SendMessage` (you should see a fallback) |
-| `[[write:file]]` | Writes a file in the desk cwd |
+| `[[write:file]]` | Writes a file in that bot’s project cwd (`desk/projects/<botId>/`) |
 | `[[cwd]]` | Replies with `process.cwd()` |
 | `[[permission]]` | Asks the client for tool permission |
 
@@ -134,7 +156,7 @@ bun run openbot server --origin https://desk.example.com
 ### Team
 
 - **New bot** — name + description (the prompt overlay: “You are Ada…”). Optional model / reasoning.
-- **Archive** — moves the bot to the Archive folder; frees an active slot. Restore from there. **Delete** is archived-only and requires typing `DELETE`. After 30 days an archive is purged unless restored.
+- **Archive** — moves the bot to the Archive folder; frees an active slot. Restore from there. **Delete** is archived-only and requires typing `DELETE`. After 30 days an archive is purged unless restored. Permanent delete also removes that bot’s folder `desk/projects/<botId>/` only. The shared desk stays; this is not filesystem isolation.
 - **Wipe desk** — Settings. Deletes `$OPENBOT_HOME/desk` for **every** bot. Type `DELETE`. Does not uninstall the server or wipe SQLite users.
 
 ### Chat
@@ -170,10 +192,12 @@ Default `$OPENBOT_HOME` = `~/.openbot`.
 
 | Path | Role |
 | --- | --- |
-| `openbot.sqlite` | Bots, threads, turns, messages, live-work, sessions |
+| `openbot.sqlite` | Bots, threads, turns, messages, live-work, sessions, `org_meta` |
+| `org.json` | Optional org slug/name/origin. DB wins once written; `org init` rewrites this file. |
 | `master.key` | Vault master (mode 0600). Not under `desk/` |
 | `allowlist` | GitHub logins, one per line |
-| `desk/` | Grok cwd, `desk/projects/`, Chromium profile |
+| `desk/` | Shared computer. Chromium profile under `desk/.openbot/chromium`. |
+| `desk/projects/<botId>/` | That bot's ACP cwd. Purge deletes this folder only. Bots can still `../` into siblings. |
 | `grok-home/` | Isolated Grok config (no user MCP servers). Auth is linked from `~/.grok/auth.json` |
 
 `--home` / `OPENBOT_HOME` relocate the lot. Wiping the desk does not delete the sqlite DB or vault.
@@ -186,7 +210,12 @@ Default `$OPENBOT_HOME` = `~/.openbot`.
 | --- | --- |
 | `OPENBOT_HOME` | Data root (default `~/.openbot`) |
 | `PORT` | Listen port (default `8787`) |
-| `OPENBOT_PUBLIC_ORIGIN` | Public URL for OAuth redirects and cookies |
+| `OPENBOT_HOST` | Bind address (`127.0.0.1` default; `localhost`; `0.0.0.0` with a warning) |
+| `OPENBOT_PUBLIC_ORIGIN` | Public URL for OAuth redirects and cookies. `--origin` overrides this. If neither is set, `org.json` / stored `org_meta.public_origin` is kept. |
+| `OPENBOT_ORG_ID` | Stable org UUID. Generated on first boot if unset. A **different** value than `org_meta.org_id` refuses to boot. |
+| `OPENBOT_ORG_SLUG` | Org slug (single DNS label). May update the stored slug. FQDN origins such as `desk.example.com` do **not** auto-slug — they become `local` unless you set this, `org.json`, or `openbot org init --slug`. |
+| `OPENBOT_ORG_NAME` | Display name. May update the stored name. |
+| `OPENBOT_ACP_IDLE_MS` | Kill idle Grok ACP children after this many ms. Default **600000** (10 minutes). `0` disables. Cold start on the next message is a few seconds plus a thread digest — not a full amnesia. |
 | `OPENBOT_GITHUB_CLIENT_ID` / `OPENBOT_GITHUB_CLIENT_SECRET` | GitHub OAuth |
 | `OPENBOT_GITHUB_ALLOWLIST` | Extra comma-separated GitHub logins |
 | `OPENBOT_DEV_LOGIN` | `1` enables `/auth/local` (loopback only). `demo` sets this. |
@@ -289,9 +318,10 @@ CI (`.github/workflows/ci.yml`) is `bun install --frozen-lockfile` then `bun tes
 **Now**
 
 - Six active bots, 1:1 A2A only (no group chat).
-- One desk, one Chromium. Two bots editing files will race; two bots scraping will queue on the browser lock.
+- One desk, one Chromium. Two bots editing files will race; two bots scraping will queue on the browser lock. Each bot's cwd is `desk/projects/<id>/`; that is a home folder, not a jail.
+- Idle Grok processes exit after 10 minutes (override `OPENBOT_ACP_IDLE_MS`). The next message cold-starts in a few seconds.
 - Codex / OpenCode adapters are not shipped.
-- Bind is localhost; you own TLS and exposure.
+- Bind is 127.0.0.1 by default; you own TLS and exposure.
 
 **Not this project (later / never here)**
 

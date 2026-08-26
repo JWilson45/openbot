@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- LaunchAgent (user session). Do not install as a LaunchDaemon. Chromium must not run as root. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.openbot</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__BUN__</string>
+		<string>__CLI__</string>
+		<string>server</string>
+		<string>--home</string>
+		<string>__HOME__</string>
+		<string>--port</string>
+		<string>__PORT__</string>
+		<string>--host</string>
+		<string>127.0.0.1</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>__ROOT__</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>OPENBOT_HOME</key>
+		<string>__HOME__</string>
+		<key>HOME</key>
+		<string>__USER_HOME__</string>
+		<key>PATH</key>
+		<string>__PATH__</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+</dict>
+</plist>

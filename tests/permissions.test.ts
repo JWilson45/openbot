@@ -54,10 +54,13 @@ describe("ACP session/request_permission", () => {
     while (Date.now() - start < 10_000 && !reqId) {
       const events = (await fetch(`${origin}/v1/turns/${turnId}/live-work`, { headers }).then((r) =>
         r.json(),
-      )) as { events: Array<{ kind: string; payload: string }> };
+      )) as { events: Array<{ kind: string; payload: { reqId?: string } | string }> };
       const perm = events.events.find((e) => e.kind === "permission_request");
       if (perm) {
-        const payload = JSON.parse(perm.payload) as { reqId?: string };
+        const payload =
+          typeof perm.payload === "string"
+            ? (JSON.parse(perm.payload) as { reqId?: string })
+            : perm.payload;
         reqId = payload.reqId;
       } else await Bun.sleep(50);
     }

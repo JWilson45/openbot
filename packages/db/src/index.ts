@@ -169,6 +169,18 @@ CREATE TABLE IF NOT EXISTS api_keys (
   last_used_at integer,
   revoked_at integer
 );
+
+CREATE TABLE IF NOT EXISTS org_meta (
+  id text PRIMARY KEY,
+  account_id text REFERENCES accounts(id),
+  org_id text NOT NULL UNIQUE,
+  slug text NOT NULL,
+  name text NOT NULL,
+  public_origin text,
+  pubkey text NOT NULL DEFAULT '',
+  federation_enabled integer NOT NULL DEFAULT 0,
+  created_at integer NOT NULL
+);
 `;
 
 export type SqlValue = string | number | bigint | boolean | null | Uint8Array;
@@ -365,7 +377,7 @@ export function deleteBotPermanently(db: OpenbotDb, botId: string): void {
   });
 }
 
-export function purgeExpiredArchivedBots(db: OpenbotDb, accountId?: string): number {
+export function purgeExpiredArchivedBots(db: OpenbotDb, accountId?: string): string[] {
   const cutoff = now() - ARCHIVE_TTL_MS;
   const rows = accountId
     ? db.all<{ id: string }>(
@@ -377,7 +389,7 @@ export function purgeExpiredArchivedBots(db: OpenbotDb, accountId?: string): num
         [cutoff],
       );
   for (const row of rows) deleteBotPermanently(db, row.id);
-  return rows.length;
+  return rows.map((row) => row.id);
 }
 
 export function humanThread(db: OpenbotDb, botId: string): { id: string; bot_id: string; account_id: string } | undefined {

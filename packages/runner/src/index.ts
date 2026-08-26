@@ -9,6 +9,17 @@ import type {
   PromptResult,
 } from "@openbot/compute-protocol";
 import { AcpClient, DEFAULT_GROK_MODEL, DEFAULT_REASONING_EFFORT, prepareIsolatedGrokHome } from "@openbot/acp-grok";
+import { botProjectDir, deleteBotProject, ensureBotProject } from "./workspace.ts";
+
+export const DEFAULT_ACP_IDLE_MS = 10 * 60 * 1000;
+
+export function acpIdleTtlMs(): number {
+  const raw = process.env.OPENBOT_ACP_IDLE_MS;
+  if (raw == null || raw === "") return DEFAULT_ACP_IDLE_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_ACP_IDLE_MS;
+  return n;
+}
 
 type CdpConn = {
   ws: WebSocket;
@@ -57,6 +68,18 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
 
   get desk(): string {
     return join(this.home, "desk");
+  }
+
+  projectDir(botId: string): string {
+    return botProjectDir(this.desk, botId);
+  }
+
+  ensureProject(botId: string, name: string): string {
+    return ensureBotProject(this.desk, botId, name);
+  }
+
+  deleteProject(botId: string): void {
+    deleteBotProject(this.desk, botId);
   }
 
   async ensure(_accountId: string): Promise<{ id: string; workspacePath: string }> {
@@ -319,6 +342,25 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     }
   }
 
+  reapIdle(now = Date.now()): string[] {
+    const ttl = acpIdleTtlMs();
+    if (ttl === 0) return [];
+    const killed: string[] = [];
+    for (const [botId, client] of this.acps) {
+      if (client.closed) continue;
+      if (this.acp === client && this.harness === "in_turn") continue;
+      if (client.lastActivityAt + ttl > now) continue;
+      void client.kill();
+      this.acps.delete(botId);
+      if (this.acp === client) {
+        this.acp = null;
+        this.acpSessionId = undefined;
+      }
+      killed.push(botId);
+    }
+    return killed;
+  }
+
   async ensureHarness(req: EnsureHarnessRequest): Promise<void> {
     await this.ensure(this.accountId);
     const env = { ...req.env };
@@ -331,6 +373,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
       this.acp = existing!;
       this.acpSessionId = existing!.sessionId;
       this.harness = "idle";
+      existing!.lastActivityAt = Date.now();
       for (const k of Object.keys(this.lastEnv)) this.lastEnv[k] = "";
       return;
     }
@@ -383,11 +426,13 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   async prompt(text: string, botId?: string): Promise<PromptResult> {
     const client = botId ? this.acps.get(botId) : this.acp;
     if (!client) throw new Error("harness not started");
+    client.lastActivityAt = Date.now();
     this.harness = "in_turn";
     this.acp = client;
     try {
       const result = await client.prompt(text);
       this.harness = "idle";
+      client.lastActivityAt = Date.now();
       return result;
     } catch (err) {
       this.harness = "crashed";
@@ -674,3 +719,4 @@ async function cdpInput(cdpHttp: string, event: Record<string, unknown>): Promis
 }
 
 export { findChrome };
+export { botProjectDir, deleteBotProject, ensureBotProject, isInsideDesk } from "./workspace.ts";
