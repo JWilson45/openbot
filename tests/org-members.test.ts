@@ -118,6 +118,23 @@ describe("org members + one account per instance", () => {
     }
   });
 
+  test("GET /v1/org and /v1/me reject sk-ob_ bearer and accept session", async () => {
+    const { ctx, server, origin } = startTestServer({ home: tempHome() });
+    try {
+      const { cookie, session } = loginCookie({ ctx }, "alice");
+      const minted = mintApiKey(ctx.db, session.accountId);
+      const keyHeaders = { authorization: `Bearer ${minted.token}` };
+      const sessionHeaders = { authorization: `Bearer ${session.token}` };
+      for (const path of ["/v1/org", "/v1/me"]) {
+        expect((await fetch(`${origin}${path}`, { headers: keyHeaders })).status).toBe(401);
+        expect((await fetch(`${origin}${path}`, { headers: { cookie } })).status).toBe(200);
+        expect((await fetch(`${origin}${path}`, { headers: sessionHeaders })).status).toBe(200);
+      }
+    } finally {
+      server.stop(true);
+    }
+  });
+
   test("GET /v1/me includes org fields and no private key", async () => {
     const { ctx, server, origin } = startTestServer({ home: tempHome() });
     try {

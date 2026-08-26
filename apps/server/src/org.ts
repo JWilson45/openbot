@@ -127,7 +127,7 @@ function insertFoundingMember(db: OpenbotDb, orgId: string, userId: string, acco
   );
 }
 
-/** Bind the oldest account to this instance when org_meta.account_id is still empty. */
+/** Extra Phase 2 accounts keep their bots; founding member is backfilled so unmigrated DBs session after boot. */
 export function ensureOrgAccount(
   db: OpenbotDb,
   log?: { info: (msg: string, extra?: Record<string, unknown>) => void },
