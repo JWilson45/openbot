@@ -90,6 +90,7 @@
       "dependencies": {
         "@openbot/api-types": "workspace:*",
         "@openbot/db": "workspace:*",
+        "@openbot/federation": "workspace:*",
         "@openbot/live-work": "workspace:*",
       },
     },

@@ -1,3 +1,4 @@
+import type { KeyObject } from "node:crypto";
 import {
   humanThread,
   id,
@@ -6,15 +7,19 @@ import {
   sha256Hex,
   type McpTokenRow,
   type OpenbotDb,
+  type OrgInboxRow,
   type TurnRow,
 } from "@openbot/db";
 import {
   McpError,
+  inboxInput,
   sendMessageInput,
   sendToAgentInput,
+  sendToOrgInput,
   sendToThreadInput,
   type SendMessageInput,
 } from "@openbot/api-types";
+import { signFedJws } from "@openbot/federation";
 import { insertMessage } from "@openbot/live-work";
 
 export class McpInflight {
@@ -409,6 +414,162 @@ export function sendToAgent(
   }
 }
 
+export type InboxItem = {
+  id: string;
+  fromSlug: string;
+  fromOrg: string;
+  preview: string;
+  urgency: string;
+};
+
+export function inbox(
+  db: OpenbotDb,
+  inflight: McpInflight,
+  bearer: string | undefined,
+  rawInput: unknown,
+): { ok: true; pending: InboxItem[]; acked?: string } {
+  const input = parseOrThrow(inboxInput, coerceToolArgs(rawInput));
+  const claims = verifyMcpToken(db, bearer);
+  inflight.add(claims.harnessSessionId);
+  try {
+    return db.immediate(() => {
+      const turn = lockRunningTurn(db, claims);
+      if (!turn) throw new McpError("no_active_turn", "no running turn", 409);
+      requireGateway(db, claims, "Inbox");
+      let acked: string | undefined;
+      if (input.ack) {
+        const row = db.get<OrgInboxRow>("SELECT * FROM org_inbox WHERE id = ?", [input.ack]);
+        if (!row || row.status !== "pending") {
+          throw new McpError("not_found", "inbox item not found", 404);
+        }
+        const t = now();
+        db.run(
+          "UPDATE org_inbox SET status = 'acked', acked_at = ?, acked_turn_id = ? WHERE id = ? AND status = 'pending'",
+          [t, turn.id, row.id],
+        );
+        acked = row.id;
+      }
+      const pending = listPendingInbox(db, input.limit ?? 20);
+      return acked ? { ok: true as const, pending, acked } : { ok: true as const, pending };
+    });
+  } finally {
+    inflight.remove(claims.harnessSessionId);
+  }
+}
+
+export async function sendToOrg(
+  db: OpenbotDb,
+  inflight: McpInflight,
+  bearer: string | undefined,
+  rawInput: unknown,
+  hooks?: McpHooks,
+): Promise<{ ok: true; id: string; hop: 1 }> {
+  const input = parseOrThrow(sendToOrgInput, normalizeSendArgs(rawInput));
+  const claims = verifyMcpToken(db, bearer);
+  inflight.add(claims.harnessSessionId);
+  try {
+    const prepared = db.immediate(() => {
+      const turn = lockRunningTurn(db, claims);
+      if (!turn) throw new McpError("no_active_turn", "no running turn", 409);
+      const bot = requireGateway(db, claims, "SendToOrg");
+      if (!federationIsOn(db, hooks)) {
+        throw new McpError("federation_off", "federation is off", 409);
+      }
+      const org = currentOrg(db);
+      if (!org) throw new McpError("federation_off", "federation is off", 409);
+      const peer = lookupAllowedPeer(db, input.org);
+      if (!peer) throw new McpError("not_found", "peer not found", 404);
+      const dests = replyDestinations(db, turn.id);
+      if (dests && !dests.has(peer.peer_org_id.toLowerCase())) {
+        const human = humanThread(db, claims.botId);
+        if (human) {
+          insertMessage(db, {
+            threadId: human.id,
+            turnId: turn.id,
+            role: "assistant",
+            origin: "send_message",
+            body: "cannot forward to a third org",
+            fromBotId: claims.botId,
+          });
+          db.run("UPDATE turns SET sent_message_count = sent_message_count + 1 WHERE id = ?", [turn.id]);
+        }
+        writeFedAudit(db, claims.accountId, "fed.drop", {
+          reason: "no_forward",
+          toOrg: peer.peer_org_id,
+        });
+        return { kind: "no_forward" as const };
+      }
+      // threadId is accepted for later thread_bridges (PR-39a); never hop++ or map here.
+      const envelope = {
+        id: id(),
+        fromOrg: org.org_id,
+        fromSlug: org.slug,
+        fromActor: { type: "gateway" as const, name: bot.name, botId: claims.botId },
+        toOrg: peer.peer_org_id,
+        urgency: input.urgency ?? "normal",
+        hop: 1 as const,
+        createdAt: now(),
+        body: input.body,
+      };
+      return { kind: "send" as const, envelope, peer, org };
+    });
+    if (prepared.kind === "no_forward") {
+      throw new McpError("no_forward", "cannot forward inbound mail to a third org", 409);
+    }
+
+    let privateKey: KeyObject;
+    try {
+      const loaded = hooks?.orgPrivateKey?.();
+      if (!loaded) throw new Error("missing org key");
+      privateKey = loaded;
+    } catch {
+      throw new McpError("no_org_key", "org key unavailable", 500);
+    }
+
+    const rawBody = JSON.stringify(prepared.envelope);
+    const token = signFedJws({
+      privateKey,
+      fromOrgId: prepared.org.org_id,
+      toOrgId: prepared.peer.peer_org_id,
+      messageId: prepared.envelope.id,
+      rawBody,
+    });
+    const url = `${prepared.peer.base_url}/fed/v1/messages`;
+    let status = 0;
+    try {
+      const res = await (hooks?.fetchFed ?? fetch)(url, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+          "idempotency-key": prepared.envelope.id,
+        },
+        body: rawBody,
+        signal: AbortSignal.timeout(FED_POST_TIMEOUT_MS),
+      });
+      status = res.status;
+    } catch (err) {
+      const name = err instanceof Error ? err.name : "";
+      if (name === "TimeoutError" || name === "AbortError") {
+        throw new McpError("timeout", "peer timed out", 504);
+      }
+      throw new McpError("outbound_failed", err instanceof Error ? err.message : "outbound failed", 502);
+    }
+    writeFedAudit(db, claims.accountId, "fed.outbound", {
+      toOrg: prepared.peer.peer_org_id,
+      jti: prepared.envelope.id,
+      hop: 1,
+      status,
+    });
+    if (status < 200 || status >= 300) {
+      throw new McpError("peer_error", `peer HTTP ${status}`, 502);
+    }
+    return { ok: true, id: prepared.envelope.id, hop: 1 };
+  } finally {
+    inflight.remove(claims.harnessSessionId);
+  }
+}
+
 export function approveMessage(db: OpenbotDb, accountId: string, messageId: string): boolean {
   return db.immediate(() => {
     const msg = db.get<{ id: string; origin: string; turn_id: string | null; thread_id: string }>(
@@ -472,6 +633,35 @@ export const SEND_TO_AGENT_TOOL = {
   },
 };
 
+export const SEND_TO_ORG_TOOL = {
+  name: "SendToOrg",
+  description:
+    "Send a one-hop message to another org. Gateway only. hop is always 1. Do not forward inbound mail to a third org. Fails if federation is off.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      org: { type: "string", description: "Peer unique slug or org uuid" },
+      body: { type: "string" },
+      urgency: { type: "string", enum: ["normal", "needs_user"] },
+      threadId: { type: "string" },
+    },
+    required: ["org", "body"],
+  },
+};
+
+export const INBOX_TOOL = {
+  name: "Inbox",
+  description:
+    "List or ack pending inbound org mail. Gateway only. Ack binds to this running turn and does not enqueue another turn.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      limit: { type: "number" },
+      ack: { type: "string", description: "org_inbox id to ack" },
+    },
+  },
+};
+
 export const SEND_TO_THREAD_TOOL = {
   name: "SendToThread",
   description:
@@ -488,7 +678,139 @@ export const SEND_TO_THREAD_TOOL = {
   },
 };
 
-export type McpHooks = { onKick?: () => void };
+export function mcpToolsForRole(role: string | null | undefined): unknown[] {
+  const tools: unknown[] = [SEND_MESSAGE_TOOL, SEND_TO_AGENT_TOOL, SEND_TO_THREAD_TOOL];
+  if (role === "gateway") tools.push(SEND_TO_ORG_TOOL, INBOX_TOOL);
+  return tools;
+}
+
+function toolsForCaller(db: OpenbotDb, bearer: string | undefined): unknown[] {
+  try {
+    const claims = verifyMcpToken(db, bearer);
+    return mcpToolsForRole(botRole(db, claims.botId)?.role);
+  } catch {
+    // Missing/invalid token: desk subset so SendToOrg is never advertised by default.
+    return mcpToolsForRole("desk");
+  }
+}
+
+export type McpHooks = {
+  onKick?: () => void;
+  federationEffective?: () => boolean;
+  orgPrivateKey?: () => KeyObject;
+  fetchFed?: typeof fetch;
+};
+
+const INBOX_PREVIEW = 240;
+const FED_POST_TIMEOUT_MS = 10_000;
+
+type OrgPeerRow = {
+  peer_org_id: string;
+  slug: string;
+  name: string;
+  base_url: string;
+  pubkey: string;
+  status: string;
+};
+
+function parseOrThrow<T>(
+  schema: { safeParse: (v: unknown) => { success: true; data: T } | { success: false } },
+  raw: unknown,
+): T {
+  const parsed = schema.safeParse(raw);
+  if (!parsed.success) throw new McpError("bad_request", "invalid input", 400);
+  return parsed.data;
+}
+
+function botRole(db: OpenbotDb, botId: string): { role: string; name: string } | undefined {
+  return db.get<{ role: string; name: string }>(
+    "SELECT IFNULL(role, 'desk') AS role, name FROM bots WHERE id = ?",
+    [botId],
+  );
+}
+
+function requireGateway(db: OpenbotDb, claims: McpClaims, tool: string): { role: string; name: string } {
+  const bot = botRole(db, claims.botId);
+  if (!bot || bot.role !== "gateway") {
+    throw new McpError("forbidden", `${tool} is Gateway only`, 403);
+  }
+  return bot;
+}
+
+function federationIsOn(db: OpenbotDb, hooks?: McpHooks): boolean {
+  if (hooks?.federationEffective) return hooks.federationEffective();
+  const row = db.get<{ federation_enabled: number }>(
+    "SELECT federation_enabled FROM org_meta WHERE id = 'current'",
+  );
+  if (!row || row.federation_enabled !== 1) return false;
+  return process.env.OPENBOT_FEDERATION !== "0";
+}
+
+function currentOrg(db: OpenbotDb): { org_id: string; slug: string; name: string } | undefined {
+  return db.get<{ org_id: string; slug: string; name: string }>(
+    "SELECT org_id, slug, name FROM org_meta WHERE id = 'current'",
+  );
+}
+
+function lookupAllowedPeer(db: OpenbotDb, org: string): OrgPeerRow | undefined {
+  const raw = org.trim();
+  if (!raw) return undefined;
+  const byId = db.get<OrgPeerRow>(
+    "SELECT * FROM org_peers WHERE peer_org_id = ? AND status = 'allowed'",
+    [raw.toLowerCase()],
+  );
+  if (byId) return byId;
+  return db.get<OrgPeerRow>(
+    "SELECT * FROM org_peers WHERE lower(slug) = lower(?) AND status = 'allowed'",
+    [raw],
+  );
+}
+
+function writeFedAudit(
+  db: OpenbotDb,
+  accountId: string,
+  type: string,
+  payload: Record<string, unknown>,
+): void {
+  db.run(
+    `INSERT INTO audit_events (id, account_id, actor, type, payload, created_at)
+     VALUES (?, ?, 'federation', ?, ?, ?)`,
+    [id(), accountId, type, JSON.stringify(payload), now()],
+  );
+}
+
+function replyDestinations(db: OpenbotDb, turnId: string): Set<string> | null {
+  const userRow = db.get<{ origin: string; remote_org_id: string | null }>(
+    "SELECT origin, remote_org_id FROM messages WHERE turn_id = ? AND role = 'user' ORDER BY created_at DESC LIMIT 1",
+    [turnId],
+  );
+  if (!userRow) return null;
+  if (userRow.origin !== "federation" && userRow.origin !== "prompt") return null;
+  const allowed = new Set<string>();
+  if (userRow.origin === "federation" && userRow.remote_org_id) {
+    allowed.add(userRow.remote_org_id.toLowerCase());
+  }
+  const acked = db.all<{ from_org_id: string }>(
+    "SELECT from_org_id FROM org_inbox WHERE acked_turn_id = ?",
+    [turnId],
+  );
+  for (const row of acked) allowed.add(row.from_org_id.toLowerCase());
+  return allowed;
+}
+
+function listPendingInbox(db: OpenbotDb, limit: number) {
+  const rows = db.all<OrgInboxRow>(
+    "SELECT * FROM org_inbox WHERE status = 'pending' ORDER BY created_at ASC, id ASC LIMIT ?",
+    [limit],
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    fromSlug: r.from_slug,
+    fromOrg: r.from_org_id,
+    preview: r.body.length > INBOX_PREVIEW ? `${r.body.slice(0, INBOX_PREVIEW)}…` : r.body,
+    urgency: r.urgency,
+  }));
+}
 
 function coerceToolArgs(raw: unknown): Record<string, unknown> {
   if (typeof raw === "string") {
@@ -514,13 +836,13 @@ function normalizeSendArgs(raw: unknown): unknown {
   return args;
 }
 
-export function handleMcpJsonRpc(
+export async function handleMcpJsonRpc(
   db: OpenbotDb,
   inflight: McpInflight,
   bearer: string | undefined,
   body: unknown,
   hooks?: McpHooks,
-): { status: number; json: unknown } {
+): Promise<{ status: number; json: unknown }> {
   const msg = body as { jsonrpc?: string; id?: unknown; method?: string; params?: Record<string, unknown> };
   const idVal = msg?.id ?? null;
   const method = msg?.method ?? "";
@@ -551,11 +873,7 @@ export function handleMcpJsonRpc(
     if (method === "tools/list") {
       return {
         status: 200,
-        json: {
-          jsonrpc: "2.0",
-          id: idVal,
-          result: { tools: [SEND_MESSAGE_TOOL, SEND_TO_AGENT_TOOL, SEND_TO_THREAD_TOOL] },
-        },
+        json: { jsonrpc: "2.0", id: idVal, result: { tools: toolsForCaller(db, bearer) } },
       };
     }
     if (method === "tools/call") {
@@ -570,6 +888,10 @@ export function handleMcpJsonRpc(
       } else if (name === "SendToThread") {
         result = sendToThread(db, inflight, bearer, args);
         hooks?.onKick?.();
+      } else if (name === "SendToOrg") {
+        result = await sendToOrg(db, inflight, bearer, args, hooks);
+      } else if (name === "Inbox") {
+        result = inbox(db, inflight, bearer, args);
       } else {
         throw new McpError("unknown_tool", `unknown tool ${name}`, 400);
       }

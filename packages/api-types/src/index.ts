@@ -24,6 +24,22 @@ export type SendToThreadInput = z.infer<typeof sendToThreadInput>;
 
 export type SendMessageInput = z.infer<typeof sendMessageInput>;
 
+export const sendToOrgInput = z.object({
+  org: z.string().min(1).max(80),
+  body: z.string().min(1).max(32_000),
+  urgency: z.enum(["normal", "needs_user"]).optional(),
+  threadId: z.string().min(1).max(64).optional(),
+});
+
+export type SendToOrgInput = z.infer<typeof sendToOrgInput>;
+
+export const inboxInput = z.object({
+  limit: z.number().int().min(1).max(100).optional(),
+  ack: z.string().min(1).max(64).optional(),
+});
+
+export type InboxInput = z.infer<typeof inboxInput>;
+
 export const createBotInput = z.object({
   name: z.string().min(1).max(80),
   description: z.string().max(4000).default(""),

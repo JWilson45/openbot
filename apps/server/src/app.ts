@@ -55,6 +55,7 @@ import {
   fetchPeerFedInfo,
   insertOrgPeer,
   listOrgPeers,
+  loadOrgKeypair,
   OrgPeerError,
   orgMemberSnapshot,
   orgPeerPublic,
@@ -1323,7 +1324,11 @@ export function createApp(cfg: HomeConfig): {
       body = {};
     }
     try {
-      const result = handleMcpJsonRpc(db, inflight, bearer, body, { onKick: () => ctx.engine.kick() });
+      const result = await handleMcpJsonRpc(db, inflight, bearer, body, {
+        onKick: () => ctx.engine.kick(),
+        federationEffective: () => federationEffective(currentOrgMeta(db)),
+        orgPrivateKey: () => loadOrgKeypair(ctx.home, ctx.master).privateKey,
+      });
       const json = result.json as { result?: { content?: unknown[] } };
       if (result.status === 200 && json?.result?.content) {
         const parsed = JSON.parse(String((json.result.content as { text?: string }[])[0]?.text ?? "{}")) as {
