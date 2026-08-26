@@ -12,6 +12,7 @@ import {
   McpError,
   sendMessageInput,
   sendToAgentInput,
+  sendToThreadInput,
   type SendMessageInput,
 } from "@openbot/api-types";
 import { insertMessage } from "@openbot/live-work";
@@ -96,13 +97,7 @@ export function sendMessage(
   const claims = verifyMcpToken(db, bearer);
   inflight.add(claims.harnessSessionId);
   try {
-    const hourly = db.get<{ n: number }>(
-      `SELECT COUNT(*) as n FROM messages
-       WHERE origin = 'send_message' AND created_at > ? AND thread_id IN
-         (SELECT id FROM threads WHERE account_id = ?)`,
-      [now() - 60 * 60 * 1000, claims.accountId],
-    );
-    if ((hourly?.n ?? 0) >= 100) {
+    if (countHourlySends(db, claims.accountId) >= 100) {
       throw new McpError("rate_limited", "hourly send limit", 429);
     }
 
@@ -153,6 +148,176 @@ function lockRunningTurn(db: OpenbotDb, claims: McpClaims): TurnRow | undefined 
      ORDER BY created_at DESC LIMIT 1`,
     [claims.harnessSessionId],
   );
+}
+
+function countHourlySends(db: OpenbotDb, accountId: string): number {
+  return (
+    db.get<{ n: number }>(
+      `SELECT COUNT(*) as n FROM messages
+       WHERE origin IN ('send_message', 'thread') AND created_at > ? AND thread_id IN
+         (SELECT id FROM threads WHERE account_id = ?)`,
+      [now() - 60 * 60 * 1000, accountId],
+    )?.n ?? 0
+  );
+}
+
+const GROUP_MENTION_CAP = 3;
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function parseGroupMentions<T extends { name: string }>(
+  body: string,
+  members: T[],
+): { mentioned: T[]; truncated: boolean } {
+  const hits: { member: T; index: number }[] = [];
+  for (const member of members) {
+    if (!member.name || /\s/.test(member.name)) continue;
+    const match = new RegExp(`(?:^|\\s)@${escapeRegExp(member.name)}\\b`, "i").exec(body);
+    if (match) hits.push({ member, index: match.index });
+  }
+  hits.sort((a, b) => a.index - b.index);
+  return {
+    mentioned: hits.slice(0, GROUP_MENTION_CAP).map((h) => h.member),
+    truncated: hits.length > GROUP_MENTION_CAP,
+  };
+}
+
+export function queueGroupMentions(
+  db: OpenbotDb,
+  opts: { threadId: string; title: string; body: string; skipBotId?: string },
+): { turnIds: string[]; mentioned: string[]; mentionedTruncated: boolean } {
+  const members = db.all<{ id: string; name: string }>(
+    `SELECT b.id, b.name FROM thread_participants tp
+     JOIN bots b ON b.id = tp.bot_id
+     WHERE tp.thread_id = ? AND tp.bot_id IS NOT NULL AND b.status = 'active'`,
+    [opts.threadId],
+  );
+  const eligible = opts.skipBotId ? members.filter((m) => m.id !== opts.skipBotId) : members;
+  const { mentioned, truncated } = parseGroupMentions(opts.body, eligible);
+  const turnIds: string[] = [];
+  for (const bot of mentioned) {
+    const queued = db.get<{ n: number }>(
+      "SELECT COUNT(*) as n FROM turns WHERE bot_id = ? AND status = 'queued'",
+      [bot.id],
+    );
+    if ((queued?.n ?? 0) >= 5) continue;
+    const turnId = id();
+    const t = now();
+    db.run(
+      `INSERT INTO turns (id, thread_id, bot_id, status, sent_message_count, assistant_text, deadline_at, created_at)
+       VALUES (?, ?, ?, 'queued', 0, '', ?, ?)`,
+      [turnId, opts.threadId, bot.id, t + 2 * 60 * 60 * 1000, t],
+    );
+    insertMessage(db, {
+      threadId: opts.threadId,
+      turnId,
+      role: "user",
+      origin: "prompt",
+      body: `You were @mentioned in ${opts.title}.\n${opts.body}`,
+    });
+    turnIds.push(turnId);
+  }
+  return {
+    turnIds,
+    mentioned: mentioned.map((m) => m.name),
+    mentionedTruncated: truncated,
+  };
+}
+
+type GroupThreadRow = { id: string; title: string; kind: string; account_id: string };
+
+function resolveGroupThread(
+  db: OpenbotDb,
+  claims: McpClaims,
+  turn: TurnRow,
+  input: { threadId?: string; name?: string },
+): GroupThreadRow {
+  let thread: GroupThreadRow | undefined;
+  if (input.threadId) {
+    thread = db.get<GroupThreadRow>(
+      "SELECT id, title, kind, account_id FROM threads WHERE id = ? AND account_id = ?",
+      [input.threadId, claims.accountId],
+    );
+  } else if (input.name) {
+    thread = db.get<GroupThreadRow>(
+      `SELECT id, title, kind, account_id FROM threads
+       WHERE account_id = ? AND kind = 'group' AND lower(title) = lower(?)
+       ORDER BY created_at DESC LIMIT 1`,
+      [claims.accountId, input.name],
+    );
+  } else {
+    // Warm sessions keep the cold-start DM in claims; group speech follows this turn.
+    thread = db.get<GroupThreadRow>("SELECT id, title, kind, account_id FROM threads WHERE id = ?", [
+      turn.thread_id,
+    ]);
+  }
+  if (!thread || thread.account_id !== claims.accountId) {
+    throw new McpError("not_found", "group thread not found", 404);
+  }
+  if (thread.kind !== "group") {
+    throw new McpError("bad_request", "SendToThread target must be a group thread", 400);
+  }
+  const member = db.get(
+    "SELECT id FROM thread_participants WHERE thread_id = ? AND bot_id = ?",
+    [thread.id, claims.botId],
+  );
+  if (!member) throw new McpError("forbidden", "not a participant of this group", 403);
+  return thread;
+}
+
+export function sendToThread(
+  db: OpenbotDb,
+  inflight: McpInflight,
+  bearer: string | undefined,
+  rawInput: unknown,
+): { ok: true; messageId: string; threadId: string; turnIds: string[] } {
+  const input = sendToThreadInput.parse(normalizeSendArgs(rawInput));
+  const claims = verifyMcpToken(db, bearer);
+  inflight.add(claims.harnessSessionId);
+  try {
+    if (countHourlySends(db, claims.accountId) >= 100) {
+      throw new McpError("rate_limited", "hourly send limit", 429);
+    }
+    return db.immediate(() => {
+      const turn = lockRunningTurn(db, claims);
+      if (!turn) throw new McpError("no_active_turn", "no running turn for this harness session", 409);
+      if (turn.sent_message_count >= 20) {
+        throw new McpError("rate_limited", "per-turn send limit", 429);
+      }
+      const thread = resolveGroupThread(db, claims, turn, input);
+      const row = insertMessage(db, {
+        threadId: thread.id,
+        turnId: turn.id,
+        role: "assistant",
+        origin: "thread",
+        body: input.body,
+        urgency: input.urgency,
+        fromBotId: claims.botId,
+      });
+      db.run("UPDATE turns SET sent_message_count = sent_message_count + 1 WHERE id = ?", [turn.id]);
+      db.run(
+        `INSERT INTO audit_events (id, account_id, actor, type, payload, created_at)
+         VALUES (?, ?, 'harness', 'send_to_thread', ?, ?)`,
+        [
+          id(),
+          claims.accountId,
+          JSON.stringify({ messageId: row.id, turnId: turn.id, threadId: thread.id }),
+          now(),
+        ],
+      );
+      const fanout = queueGroupMentions(db, {
+        threadId: thread.id,
+        title: thread.title,
+        body: input.body,
+        skipBotId: claims.botId,
+      });
+      return { ok: true as const, messageId: row.id, threadId: thread.id, turnIds: fanout.turnIds };
+    });
+  } finally {
+    inflight.remove(claims.harnessSessionId);
+  }
 }
 
 export function sendToAgent(
@@ -307,6 +472,22 @@ export const SEND_TO_AGENT_TOOL = {
   },
 };
 
+export const SEND_TO_THREAD_TOOL = {
+  name: "SendToThread",
+  description:
+    "Speak in a group thread. Default thread is the one this turn is on. SendMessage still DMs the human privately. SendToAgent is 1:1, not this group.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      body: { type: "string", description: "Message shown in the group thread" },
+      threadId: { type: "string", description: "Group thread id; defaults to this turn's thread" },
+      name: { type: "string", description: "Group thread title" },
+      urgency: { type: "string", enum: ["normal", "needs_user"] },
+    },
+    required: ["body"],
+  },
+};
+
 export type McpHooks = { onKick?: () => void };
 
 function coerceToolArgs(raw: unknown): Record<string, unknown> {
@@ -356,7 +537,7 @@ export function handleMcpJsonRpc(
           result: {
             protocolVersion: requested,
             capabilities: { tools: { listChanged: false } },
-            serverInfo: { name: "openbot", version: "0.1.0" },
+            serverInfo: { name: "openbot", version: "0.2.0" },
           },
         },
       };
@@ -370,7 +551,11 @@ export function handleMcpJsonRpc(
     if (method === "tools/list") {
       return {
         status: 200,
-        json: { jsonrpc: "2.0", id: idVal, result: { tools: [SEND_MESSAGE_TOOL, SEND_TO_AGENT_TOOL] } },
+        json: {
+          jsonrpc: "2.0",
+          id: idVal,
+          result: { tools: [SEND_MESSAGE_TOOL, SEND_TO_AGENT_TOOL, SEND_TO_THREAD_TOOL] },
+        },
       };
     }
     if (method === "tools/call") {
@@ -381,6 +566,9 @@ export function handleMcpJsonRpc(
         result = sendMessage(db, inflight, bearer, args);
       } else if (name === "SendToAgent") {
         result = sendToAgent(db, inflight, bearer, args);
+        hooks?.onKick?.();
+      } else if (name === "SendToThread") {
+        result = sendToThread(db, inflight, bearer, args);
         hooks?.onKick?.();
       } else {
         throw new McpError("unknown_tool", `unknown tool ${name}`, 400);

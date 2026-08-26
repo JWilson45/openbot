@@ -143,10 +143,12 @@ export class TurnEngine {
       ]);
       if (bot) {
         this.opts.onPush(bot.account_id, { type: "turn.updated", turnId: turn.id, status: "failed" });
-        const msgs = this.opts.db.all("SELECT * FROM messages WHERE turn_id = ? ORDER BY created_at", [
-          turn.id,
-        ]);
+        const msgs = this.opts.db.all<{ origin: string }>(
+          "SELECT * FROM messages WHERE turn_id = ? ORDER BY created_at",
+          [turn.id],
+        );
         for (const m of msgs) {
+          if (m.origin === "prompt") continue; // per-turn clones, not transcript bubbles
           this.opts.onPush(bot.account_id, { type: "message.created", message: m });
         }
       }
@@ -210,7 +212,7 @@ export class TurnEngine {
     }>("SELECT * FROM bots WHERE id = ?", [turn.bot_id]);
     if (!bot) return;
 
-    const thread = this.opts.db.get<{ id: string; account_id: string }>(
+    const thread = this.opts.db.get<{ id: string; account_id: string; kind: string; title: string }>(
       "SELECT * FROM threads WHERE id = ?",
       [turn.thread_id],
     );
@@ -373,6 +375,9 @@ export class TurnEngine {
         [turn.id],
       );
       let prompt = userMsg?.body ?? "";
+      if (thread.kind === "group") {
+        prompt = `Group thread "${thread.title}". To speak here call SendToThread. SendMessage still DMs the human privately. SendToAgent is 1:1, not this group.\n\n${prompt}`;
+      }
       if (!warm) {
         const digest = buildThreadDigest(this.opts.db, {
           threadId: turn.thread_id,
@@ -404,8 +409,12 @@ export class TurnEngine {
       turnId: turn.id,
       status: updated?.status,
     });
-    const msgs = this.opts.db.all("SELECT * FROM messages WHERE turn_id = ? ORDER BY created_at", [turn.id]);
+    const msgs = this.opts.db.all<{ origin: string }>(
+      "SELECT * FROM messages WHERE turn_id = ? ORDER BY created_at",
+      [turn.id],
+    );
     for (const m of msgs) {
+      if (m.origin === "prompt") continue; // per-turn clones, not transcript bubbles
       this.opts.onPush(bot.account_id, { type: "message.created", message: m });
     }
   }

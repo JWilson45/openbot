@@ -68,7 +68,7 @@ export function insertTurn(
   db: OpenbotDb,
   w: World,
   status: string,
-  extra?: { sent?: number; assistant?: string },
+  extra?: { sent?: number; assistant?: string; threadId?: string; botId?: string },
 ): string {
   const turnId = id();
   db.run(
@@ -76,8 +76,8 @@ export function insertTurn(
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       turnId,
-      w.threadId,
-      w.botId,
+      extra?.threadId ?? w.threadId,
+      extra?.botId ?? w.botId,
       w.harnessSessionId,
       status,
       extra?.sent ?? 0,

@@ -134,7 +134,7 @@ export function buildThreadDigest(
   }>(
     `SELECT origin, body, from_bot_id FROM messages
      WHERE thread_id = ?
-       AND origin IN ('user', 'send_message', 'fallback', 'agent', 'system')
+       AND origin IN ('user', 'send_message', 'fallback', 'agent', 'system', 'thread', 'federation')
        AND (turn_id IS NULL OR turn_id != ?)
      ORDER BY created_at DESC
      LIMIT ?`,
@@ -173,10 +173,9 @@ function digestSpeaker(
   names: Map<string, string>,
 ): string {
   if (m.origin === "user") return "Human";
-  if (m.origin === "send_message" || m.origin === "fallback") return "You";
   if (m.origin === "system") return "System";
-  if (m.origin === "agent") {
-    if (!m.from_bot_id || m.from_bot_id === opts.botId) return "You";
+  if (m.origin === "federation") return "Org";
+  if (m.from_bot_id && m.from_bot_id !== opts.botId) {
     const cached = names.get(m.from_bot_id);
     if (cached) return cached;
     const row = db.get<{ name: string }>("SELECT name FROM bots WHERE id = ?", [m.from_bot_id]);

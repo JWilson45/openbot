@@ -5,6 +5,9 @@
  * Directives in the user prompt:
  *   [[send:body]]     POST SendMessage via MCP HTTP
  *   [[echo-prompt]]   SendMessage "got-digest" or "no-digest" based on ACP reset block
+ *   [[echo-prefix]]   SendMessage "got-group-prefix" if the group runTurn prefix is present
+ *   [[thread:Title:body]]  SendToThread by group title (empty Title omits name/threadId)
+ *   [[threadid:uuid:body]] SendToThread by group thread id
  *   [[write:name]]    write name into cwd
  *   [[ramble]]        emit assistant text, do not SendMessage
  *   [[sleep:ms]]      wait
@@ -59,6 +62,13 @@ function extractText(prompt: unknown): string {
       .join("\n");
   }
   return "";
+}
+
+function currentMessage(text: string): string {
+  // Digest is prior thread; re-running [[thread:]] from history would fan-out again.
+  const marker = "\nCurrent message:\n";
+  const idx = text.lastIndexOf(marker);
+  return idx >= 0 ? text.slice(idx + marker.length) : text;
 }
 
 async function callTool(url: string, token: string, name: string, args: Record<string, unknown>): Promise<void> {
@@ -130,6 +140,7 @@ async function handle(msg: {
     const sessionId = String(params.sessionId ?? "");
     const sess = sessions.get(sessionId);
     const text = extractText(params.prompt);
+    const current = currentMessage(text);
     notify("session/update", {
       sessionId,
       update: {
@@ -138,21 +149,21 @@ async function handle(msg: {
       },
     });
 
-    const sleep = /\[\[sleep:(\d+)\]\]/.exec(text);
+    const sleep = /\[\[sleep:(\d+)\]\]/.exec(current);
     if (sleep) await Bun.sleep(Number(sleep[1]));
 
-    const writeMatch = /\[\[write:([^\]]+)\]\]/.exec(text);
+    const writeMatch = /\[\[write:([^\]]+)\]\]/.exec(current);
     if (writeMatch && sess) {
       writeFileSync(join(sess.cwd, writeMatch[1]), `written-by-fake-agent\ncwd=${sess.cwd}\n`);
     }
 
-    const shell = /\[\[shell:([^\]]+)\]\]/.exec(text);
+    const shell = /\[\[shell:([^\]]+)\]\]/.exec(current);
     if (shell && sess) {
       const proc = Bun.spawn(["bash", "-lc", shell[1]], { cwd: sess.cwd, stdout: "pipe", stderr: "pipe" });
       await proc.exited;
     }
 
-    if (text.includes("[[permission]]")) {
+    if (current.includes("[[permission]]")) {
       const rpcId = permRpc++;
       write({
         jsonrpc: "2.0",
@@ -176,32 +187,57 @@ async function handle(msg: {
     const mcpToken = sess?.mcpToken || process.env.OPENBOT_MCP_TOKEN;
 
     try {
-      const sendto = /\[\[sendto:([^:\]]+):([\s\S]*?)\]\]/.exec(text);
+      const sendto = /\[\[sendto:([^:\]]+):([\s\S]*?)\]\]/.exec(current);
       if (sendto && mcpUrl && mcpToken) {
         await callTool(mcpUrl, mcpToken, "SendToAgent", { name: sendto[1].trim(), body: sendto[2].trim() });
       }
 
-      if (text.includes("[[echo-prompt]]") && mcpUrl && mcpToken) {
+      const threadById = /\[\[threadid:([^:\]]+):([\s\S]*?)\]\]/.exec(current);
+      if (threadById && mcpUrl && mcpToken) {
+        await callTool(mcpUrl, mcpToken, "SendToThread", {
+          threadId: threadById[1].trim(),
+          body: threadById[2].trim(),
+        });
+      }
+
+      const threadByName = /\[\[thread:(?!id)([^:\]]*):([\s\S]*?)\]\]/.exec(current);
+      if (threadByName && mcpUrl && mcpToken) {
+        const title = threadByName[1].trim();
+        const body = threadByName[2].trim();
+        await callTool(mcpUrl, mcpToken, "SendToThread", title ? { name: title, body } : { body });
+      }
+
+      if (current.includes("[[echo-prompt]]") && mcpUrl && mcpToken) {
         await callSend(mcpUrl, mcpToken, /ACP session reset/.test(text) ? "got-digest" : "no-digest");
       }
 
-      const send = /\[\[send:([\s\S]*?)\]\]/.exec(text);
-      const sendCwd = text.includes("[[cwd]]");
+      if (current.includes("[[echo-prefix]]") && mcpUrl && mcpToken) {
+        await callSend(
+          mcpUrl,
+          mcpToken,
+          /To speak here call SendToThread/.test(text) ? "got-group-prefix" : "no-group-prefix",
+        );
+      }
+
+      const send = /\[\[send:([\s\S]*?)\]\]/.exec(current);
+      const sendCwd = current.includes("[[cwd]]");
       if ((send || sendCwd) && mcpUrl && mcpToken) {
         const body = sendCwd ? `cwd=${sess?.cwd}` : send![1].trim();
         await callSend(mcpUrl, mcpToken, body);
       } else if (
         mcpUrl &&
         mcpToken &&
-        !text.includes("[[ramble]]") &&
-        !text.includes("[[permission]]") &&
-        !text.includes("[[echo-prompt]]") &&
-        !text.includes("[[sendto:") &&
+        !current.includes("[[ramble]]") &&
+        !current.includes("[[permission]]") &&
+        !current.includes("[[echo-prompt]]") &&
+        !current.includes("[[echo-prefix]]") &&
+        !current.includes("[[sendto:") &&
+        !current.includes("[[thread") &&
         !writeMatch &&
         !shell &&
-        text.trim()
+        current.trim()
       ) {
-        await callSend(mcpUrl, mcpToken, text.trim());
+        await callSend(mcpUrl, mcpToken, current.trim());
       }
     } catch (err) {
       notify("session/update", {

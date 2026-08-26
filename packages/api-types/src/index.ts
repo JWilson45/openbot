@@ -13,6 +13,15 @@ export const sendToAgentInput = z.object({
 
 export type SendToAgentInput = z.infer<typeof sendToAgentInput>;
 
+export const sendToThreadInput = z.object({
+  body: z.string().min(1).max(32_000),
+  threadId: z.string().uuid().optional(),
+  name: z.string().min(1).max(80).optional(),
+  urgency: z.enum(["normal", "needs_user"]).optional(),
+});
+
+export type SendToThreadInput = z.infer<typeof sendToThreadInput>;
+
 export type SendMessageInput = z.infer<typeof sendMessageInput>;
 
 export const createBotInput = z.object({

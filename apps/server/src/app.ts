@@ -25,7 +25,13 @@ import {
   type SessionInfo,
 } from "@openbot/auth";
 import { loadOrCreateMasterKey, open, seal, RedactingLogger } from "@openbot/vault";
-import { approveMessage, handleMcpJsonRpc, McpInflight, rejectMessage } from "@openbot/mcp-send-message";
+import {
+  approveMessage,
+  handleMcpJsonRpc,
+  McpInflight,
+  queueGroupMentions,
+  rejectMessage,
+} from "@openbot/mcp-send-message";
 import { McpError, addThreadParticipantInput, createGroupThreadInput, postMessageInput } from "@openbot/api-types";
 import { insertMessage, parseLivePayload, promote, summarizeLiveEvent } from "@openbot/live-work";
 import { sha256Hex } from "@openbot/db";
@@ -89,30 +95,8 @@ function cookies(c: { req: { header: (n: string) => string | undefined } }): str
   return parseCookie(c.req.header("cookie"));
 }
 
-const GROUP_MENTION_CAP = 3;
 const VISIBLE_MESSAGES_SQL =
   "SELECT * FROM messages WHERE thread_id = ? AND origin != 'prompt' ORDER BY created_at";
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function parseGroupMentions<T extends { name: string }>(
-  body: string,
-  members: T[],
-): { mentioned: T[]; truncated: boolean } {
-  const hits: { member: T; index: number }[] = [];
-  for (const member of members) {
-    if (!member.name || /\s/.test(member.name)) continue;
-    const match = new RegExp(`(?:^|\\s)@${escapeRegExp(member.name)}\\b`, "i").exec(body);
-    if (match) hits.push({ member, index: match.index });
-  }
-  hits.sort((a, b) => a.index - b.index);
-  return {
-    mentioned: hits.slice(0, GROUP_MENTION_CAP).map((h) => h.member),
-    truncated: hits.length > GROUP_MENTION_CAP,
-  };
-}
 
 function groupMeetsMinimum(botCount: number, principalCount: number): boolean {
   return botCount >= 2 || principalCount >= 3;
@@ -972,41 +956,16 @@ export function createApp(cfg: HomeConfig): {
             origin: "user",
             body: text,
           });
-          const members = db.all<{ id: string; name: string }>(
-            `SELECT b.id, b.name FROM thread_participants tp
-             JOIN bots b ON b.id = tp.bot_id
-             WHERE tp.thread_id = ? AND tp.bot_id IS NOT NULL AND b.status = 'active'`,
-            [thread.id],
-          );
-          const { mentioned, truncated } = parseGroupMentions(text, members);
-          const turnIds: string[] = [];
-          for (const bot of mentioned) {
-            const queued = db.get<{ n: number }>(
-              "SELECT COUNT(*) as n FROM turns WHERE bot_id = ? AND status = 'queued'",
-              [bot.id],
-            );
-            if ((queued?.n ?? 0) >= 5) continue;
-            const turnId = id();
-            const t = now();
-            db.run(
-              `INSERT INTO turns (id, thread_id, bot_id, status, sent_message_count, assistant_text, deadline_at, created_at)
-               VALUES (?, ?, ?, 'queued', 0, '', ?, ?)`,
-              [turnId, thread.id, bot.id, t + 2 * 60 * 60 * 1000, t],
-            );
-            insertMessage(db, {
-              threadId: thread.id,
-              turnId,
-              role: "user",
-              origin: "prompt",
-              body: `You were @mentioned in ${thread.title}.\n${text}`,
-            });
-            turnIds.push(turnId);
-          }
+          const fanout = queueGroupMentions(db, {
+            threadId: thread.id,
+            title: thread.title,
+            body: text,
+          });
           return {
             userMessage,
-            turnIds,
-            mentioned: mentioned.map((m) => m.name),
-            mentionedTruncated: truncated,
+            turnIds: fanout.turnIds,
+            mentioned: fanout.mentioned,
+            mentionedTruncated: fanout.mentionedTruncated,
           };
         });
         onPush(s.accountId, { type: "message.created", message: posted.userMessage });
