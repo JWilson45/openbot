@@ -1,8 +1,21 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { createPublicKey, type KeyObject } from "node:crypto";
 import { id, now, type OpenbotDb } from "@openbot/db";
+import { open, seal } from "@openbot/vault";
+import {
+  generateEd25519,
+  parseRawPublicKeyB64,
+  privateKeyFromPem,
+  publicKeyFromRawB64,
+  rawPublicKeyB64,
+} from "@openbot/federation";
 
 export const FED_INFO_RATE_LIMIT = 30;
 export const FED_INFO_RATE_WINDOW_MS = 60_000;
+export const ORG_ED25519_FILE = "org.ed25519";
+export const FED_INFO_FETCH_TIMEOUT_MS = 3_000;
+export const FED_INFO_FETCH_MAX_BYTES = 64 * 1024;
 
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 
@@ -333,4 +346,348 @@ export class SlidingWindowRateLimiter {
     this.hits.set(key, recent);
     return true;
   }
+}
+
+export type LoadedOrgKey = {
+  keyId: string;
+  pubkey: string;
+  privateKey: KeyObject;
+};
+
+type OrgKeyFileV1 = {
+  v: unknown;
+  keyId: unknown;
+  pubkey: unknown;
+  ciphertext: unknown;
+  dekWrapped: unknown;
+};
+
+export function orgEd25519Path(home: string): string {
+  return join(home, ORG_ED25519_FILE);
+}
+
+export function loadOrgKeypair(home: string, master: Buffer): LoadedOrgKey {
+  const path = orgEd25519Path(home);
+  if (!existsSync(path)) throw new Error(`missing ${ORG_ED25519_FILE}`);
+  const parsed = JSON.parse(readFileSync(path, "utf8")) as OrgKeyFileV1;
+  if (parsed.v !== 1) throw new Error(`unsupported ${ORG_ED25519_FILE} version`);
+  if (typeof parsed.keyId !== "string" || !parsed.keyId) throw new Error(`invalid ${ORG_ED25519_FILE} keyId`);
+  if (typeof parsed.pubkey !== "string" || !parsed.pubkey) throw new Error(`invalid ${ORG_ED25519_FILE} pubkey`);
+  if (typeof parsed.ciphertext !== "string" || typeof parsed.dekWrapped !== "string") {
+    throw new Error(`invalid ${ORG_ED25519_FILE} envelope`);
+  }
+  const pem = open(master, {
+    ciphertext: Buffer.from(parsed.ciphertext, "base64"),
+    dekWrapped: Buffer.from(parsed.dekWrapped, "base64"),
+    keyId: parsed.keyId,
+    lastFour: "",
+  });
+  const privateKey = privateKeyFromPem(pem);
+  const derived = rawPublicKeyB64(createPublicKey(privateKey));
+  if (derived !== parsed.pubkey) throw new Error(`${ORG_ED25519_FILE} pubkey does not match private key`);
+  publicKeyFromRawB64(parsed.pubkey);
+  return { keyId: parsed.keyId, pubkey: parsed.pubkey, privateKey };
+}
+
+export function ensureOrgKeypair(home: string, master: Buffer, db: OpenbotDb): LoadedOrgKey {
+  const path = orgEd25519Path(home);
+  if (!existsSync(path)) {
+    const kp = generateEd25519();
+    const sealed = seal(master, kp.privateKeyPem);
+    writeFileSync(
+      path,
+      `${JSON.stringify(
+        {
+          v: 1,
+          keyId: sealed.keyId,
+          pubkey: kp.publicKeyRawB64,
+          ciphertext: sealed.ciphertext.toString("base64"),
+          dekWrapped: sealed.dekWrapped.toString("base64"),
+        },
+        null,
+        2,
+      )}\n`,
+      { mode: 0o600 },
+    );
+    try {
+      chmodSync(path, 0o600);
+    } catch {
+      /* ignore */
+    }
+  }
+  const loaded = loadOrgKeypair(home, master);
+  const row = currentOrgMeta(db);
+  if (!row) throw new Error("org_meta missing; call ensureOrgMeta first");
+  if (row.pubkey !== loaded.pubkey) {
+    db.run("UPDATE org_meta SET pubkey = ? WHERE id = 'current'", [loaded.pubkey]);
+  }
+  return loaded;
+}
+
+export class OrgPeerError extends Error {
+  constructor(
+    readonly code: string,
+    message?: string,
+  ) {
+    super(message ?? code);
+    this.name = "OrgPeerError";
+  }
+}
+
+export type OrgPeerRow = {
+  id: string;
+  peer_org_id: string;
+  slug: string;
+  name: string;
+  base_url: string;
+  pubkey: string;
+  status: string;
+  created_at: number;
+};
+
+export type OrgPeerPublic = {
+  orgId: string;
+  slug: string;
+  name: string;
+  baseUrl: string;
+  pubkey: string;
+  status: string;
+  createdAt: number;
+};
+
+const PEER_ORG_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function orgPeerPublic(row: OrgPeerRow): OrgPeerPublic {
+  return {
+    orgId: row.peer_org_id,
+    slug: row.slug,
+    name: row.name,
+    baseUrl: row.base_url,
+    pubkey: row.pubkey,
+    status: row.status,
+    createdAt: row.created_at,
+  };
+}
+
+export function parsePeerPubkey(raw: string): string {
+  try {
+    return parseRawPublicKeyB64(raw).toString("base64");
+  } catch {
+    throw new OrgPeerError("invalid_pubkey", "invalid_pubkey");
+  }
+}
+
+export function parsePeerBaseUrl(raw: string, env?: Record<string, string | undefined>): string {
+  const t = raw.trim();
+  if (!t) throw new OrgPeerError("invalid_peer_url", "invalid_peer_url");
+  let url: URL;
+  try {
+    url = new URL(t);
+  } catch {
+    throw new OrgPeerError("invalid_peer_url", "invalid_peer_url");
+  }
+  if (url.username || url.password) throw new OrgPeerError("invalid_peer_url", "invalid_peer_url");
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new OrgPeerError("invalid_peer_url", "invalid_peer_url");
+  }
+  const host = url.hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (!host) throw new OrgPeerError("invalid_peer_url", "invalid_peer_url");
+  if (isBlockedPeerHost(host)) throw new OrgPeerError("invalid_peer_url", "invalid_peer_url");
+
+  const loopbackHttp = host === "localhost" || host === "127.0.0.1" || host === "::1";
+  if (url.protocol === "http:") {
+    if (!loopbackHttp) {
+      const allowLan = (env ?? process.env).OPENBOT_FED_ALLOW_HTTP === "1";
+      if (!allowLan || !isRfc1918Host(host)) {
+        throw new OrgPeerError("invalid_peer_url", "invalid_peer_url");
+      }
+    }
+  }
+  return url.origin;
+}
+
+export function listOrgPeers(db: OpenbotDb): OrgPeerRow[] {
+  return db.all<OrgPeerRow>("SELECT * FROM org_peers ORDER BY created_at, slug");
+}
+
+export function insertOrgPeer(
+  db: OpenbotDb,
+  input: { slug: string; orgId: string; baseUrl: string; pubkey: string; name?: string },
+  env?: Record<string, string | undefined>,
+): OrgPeerRow {
+  let slug: string;
+  try {
+    slug = normalizeOrgSlug(input.slug);
+  } catch {
+    throw new OrgPeerError("invalid_slug", "invalid_slug");
+  }
+  const orgId = input.orgId.trim().toLowerCase();
+  if (!PEER_ORG_ID_RE.test(orgId)) throw new OrgPeerError("invalid_org_id", "invalid_org_id");
+  const baseUrl = parsePeerBaseUrl(input.baseUrl, env);
+  const pubkey = parsePeerPubkey(input.pubkey);
+  const name = (input.name ?? "").trim();
+  return db.immediate(() => {
+    if (db.get("SELECT id FROM org_peers WHERE slug = ?", [slug])) {
+      throw new OrgPeerError("duplicate_slug", "duplicate_slug");
+    }
+    if (db.get("SELECT id FROM org_peers WHERE peer_org_id = ?", [orgId])) {
+      throw new OrgPeerError("duplicate_org", "duplicate_org");
+    }
+    const row: OrgPeerRow = {
+      id: id(),
+      peer_org_id: orgId,
+      slug,
+      name,
+      base_url: baseUrl,
+      pubkey,
+      status: "allowed",
+      created_at: now(),
+    };
+    db.run(
+      `INSERT INTO org_peers (id, peer_org_id, slug, name, base_url, pubkey, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [row.id, row.peer_org_id, row.slug, row.name, row.base_url, row.pubkey, row.status, row.created_at],
+    );
+    return row;
+  });
+}
+
+export function getOrgPeer(db: OpenbotDb, peerOrgId: string): OrgPeerRow | undefined {
+  return db.get<OrgPeerRow>("SELECT * FROM org_peers WHERE peer_org_id = ?", [peerOrgId.trim().toLowerCase()]);
+}
+
+export function deleteOrgPeer(db: OpenbotDb, peerOrgId: string): boolean {
+  const row = getOrgPeer(db, peerOrgId);
+  if (!row) return false;
+  db.run("DELETE FROM org_peers WHERE peer_org_id = ?", [peerOrgId]);
+  return true;
+}
+
+export function disableOrgPeer(db: OpenbotDb, peerOrgId: string): OrgPeerRow | undefined {
+  const row = getOrgPeer(db, peerOrgId);
+  if (!row) return undefined;
+  db.run("UPDATE org_peers SET status = 'disabled' WHERE peer_org_id = ?", [peerOrgId]);
+  return getOrgPeer(db, peerOrgId);
+}
+
+export async function fetchPeerFedInfo(origin: string): Promise<unknown> {
+  const res = await fetch(`${origin}/fed/v1/info`, {
+    method: "GET",
+    redirect: "error",
+    signal: AbortSignal.timeout(FED_INFO_FETCH_TIMEOUT_MS),
+    headers: { accept: "application/json" },
+  });
+  if (!res.ok) throw new OrgPeerError("info_failed", "info_failed");
+  const cl = res.headers.get("content-length");
+  if (cl && Number(cl) > FED_INFO_FETCH_MAX_BYTES) throw new OrgPeerError("info_too_large", "info_too_large");
+  const reader = res.body?.getReader();
+  if (!reader) throw new OrgPeerError("info_failed", "info_failed");
+  const chunks: Uint8Array[] = [];
+  let n = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    n += value.byteLength;
+    if (n > FED_INFO_FETCH_MAX_BYTES) {
+      try {
+        await reader.cancel();
+      } catch {
+        /* ignore */
+      }
+      throw new OrgPeerError("info_too_large", "info_too_large");
+    }
+    chunks.push(value);
+  }
+  const buf = Buffer.concat(chunks.map((c) => Buffer.from(c)));
+  try {
+    return JSON.parse(buf.toString("utf8"));
+  } catch {
+    throw new OrgPeerError("info_failed", "info_failed");
+  }
+}
+
+function parseIpv4(host: string): [number, number, number, number] | null {
+  const parts = host.split(".");
+  if (parts.length !== 4) return null;
+  const nums: number[] = [];
+  for (const p of parts) {
+    if (!/^\d{1,3}$/.test(p)) return null;
+    if (p.length > 1 && p.startsWith("0")) return null;
+    const n = Number(p);
+    if (n > 255) return null;
+    nums.push(n);
+  }
+  return nums as [number, number, number, number];
+}
+
+function expandIpv6(host: string): number[] | null {
+  let s = host.toLowerCase();
+  if (s.startsWith("::ffff:")) {
+    const v4 = parseIpv4(s.slice(7));
+    if (v4) return [0, 0, 0, 0, 0, 0xffff, (v4[0] << 8) | v4[1], (v4[2] << 8) | v4[3]];
+  }
+  if (s.includes(".")) return null;
+  const halves = s.split("::");
+  if (halves.length > 2) return null;
+  const parseHalf = (h: string): number[] | null => {
+    if (!h) return [];
+    const out: number[] = [];
+    for (const p of h.split(":")) {
+      if (!/^[0-9a-f]{1,4}$/.test(p)) return null;
+      out.push(parseInt(p, 16));
+    }
+    return out;
+  };
+  if (halves.length === 1) {
+    const parts = parseHalf(halves[0]!);
+    if (!parts || parts.length !== 8) return null;
+    return parts;
+  }
+  const left = parseHalf(halves[0]!);
+  const right = parseHalf(halves[1]!);
+  if (!left || !right || left.length + right.length > 8) return null;
+  return [...left, ...Array(8 - left.length - right.length).fill(0), ...right];
+}
+
+function isRfc1918Host(host: string): boolean {
+  const v4 = parseIpv4(host);
+  if (!v4) return false;
+  if (v4[0] === 10) return true;
+  if (v4[0] === 192 && v4[1] === 168) return true;
+  if (v4[0] === 172 && v4[1] >= 16 && v4[1] <= 31) return true;
+  return false;
+}
+
+function isBlockedPeerHost(host: string): boolean {
+  if (host === "0.0.0.0") return true;
+  const v4 = parseIpv4(host);
+  if (v4) {
+    if (v4[0] === 0 && v4[1] === 0 && v4[2] === 0 && v4[3] === 0) return true;
+    if (v4[0] === 169 && v4[1] === 254) return true;
+    return false;
+  }
+  const v6 = expandIpv6(host);
+  if (!v6) return false;
+  if (v6.every((g) => g === 0)) return true;
+  if ((v6[0]! & 0xffc0) === 0xfe80) return true;
+  if (
+    v6[0] === 0xfd00 &&
+    v6[1] === 0x0ec2 &&
+    v6[2] === 0 &&
+    v6[3] === 0 &&
+    v6[4] === 0 &&
+    v6[5] === 0 &&
+    v6[6] === 0 &&
+    v6[7] === 0x0254
+  ) {
+    return true;
+  }
+  if (v6[0] === 0 && v6[1] === 0 && v6[2] === 0 && v6[3] === 0 && v6[4] === 0 && v6[5] === 0xffff) {
+    const hi = v6[6]!;
+    const lo = v6[7]!;
+    const mapped: [number, number, number, number] = [(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff];
+    if (mapped[0] === 0 && mapped[1] === 0 && mapped[2] === 0 && mapped[3] === 0) return true;
+    if (mapped[0] === 169 && mapped[1] === 254) return true;
+  }
+  return false;
 }

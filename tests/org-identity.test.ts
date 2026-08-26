@@ -1,15 +1,20 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { OpenbotDb, id } from "@openbot/db";
+import { loadOrCreateMasterKey } from "@openbot/vault";
+import { verifyFedJws } from "@openbot/federation";
 import { createApp } from "../apps/server/src/app.ts";
 import {
   clientRateKey,
   currentOrgMeta,
   deriveOrgSlug,
+  ensureOrgKeypair,
   ensureOrgMeta,
   FED_INFO_RATE_LIMIT,
   FED_INFO_RATE_WINDOW_MS,
+  loadOrgKeypair,
+  orgEd25519Path,
   SlidingWindowRateLimiter,
 } from "../apps/server/src/org.ts";
 import { loginCookie, startTestServer } from "../apps/server/src/test-helpers.ts";
@@ -163,7 +168,7 @@ describe("ensureOrgMeta", () => {
 });
 
 describe("org HTTP", () => {
-  test("GET /fed/v1/info is public, gateway null, federation off, empty pubkey", async () => {
+  test("GET /fed/v1/info is public, gateway null, federation off, 32-byte pubkey", async () => {
     const { server, origin, ctx } = startTestServer({
       home: tempHome(),
       publicOrigin: "http://127.0.0.1:8787",
@@ -185,7 +190,8 @@ describe("org HTTP", () => {
     expect(json.caps.protocol).toBe("openbot-fed/1");
     expect(json.caps.hopLimit).toBe(1);
     expect(json.caps.attachments).toBe(false);
-    expect(json.pubkey === "" || json.pubkey == null).toBe(true);
+    expect(json.pubkey).toBe(row.pubkey);
+    expect(Buffer.from(json.pubkey, "base64").length).toBe(32);
     server.stop(true);
   });
 
@@ -237,11 +243,13 @@ describe("openbot org CLI", () => {
       slug: string;
       federationEnabled: boolean;
       gateway: unknown;
+      pubkey: string;
     };
     expect(json.orgId).toMatch(/^[0-9a-f-]{36}$/i);
     expect(json.slug).toBe("local");
     expect(json.federationEnabled).toBe(false);
     expect(json.gateway).toBeNull();
+    expect(Buffer.from(json.pubkey, "base64").length).toBe(32);
     const db = OpenbotDb.open(join(home, "openbot.sqlite"));
     expect(db.all("SELECT id FROM users").length).toBe(0);
     db.close();
@@ -340,6 +348,102 @@ async function readUntil(stream: ReadableStream<Uint8Array>, needle: string): Pr
   }
   return text;
 }
+
+describe("org.ed25519 keypair", () => {
+  test("createApp writes sealed file, no lastFour, no credentials row", () => {
+    const home = tempHome();
+    const created = createApp({ home, port: 0, env: {} });
+    try {
+      const path = orgEd25519Path(home);
+      expect(existsSync(path)).toBe(true);
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+      const file = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+      expect(file.v).toBe(1);
+      expect(file).not.toHaveProperty("lastFour");
+      expect(Object.keys(file).sort()).toEqual(["ciphertext", "dekWrapped", "keyId", "pubkey", "v"]);
+      expect(readFileSync(path, "utf8")).not.toContain("BEGIN PRIVATE KEY");
+      expect(created.ctx.db.all("SELECT id FROM credentials")).toHaveLength(0);
+      expect(created.ctx.db.all("SELECT id FROM users")).toHaveLength(0);
+      expect(Buffer.from(String(file.pubkey), "base64").length).toBe(32);
+    } finally {
+      created.stop();
+    }
+  });
+
+  test("round-trip: generate, reopen home, new process signs fixture JWS", async () => {
+    const home = tempHome();
+    const first = createApp({ home, port: 0, env: {} });
+    const orgId = currentOrgMeta(first.ctx.db)!.org_id;
+    const pubkey = currentOrgMeta(first.ctx.db)!.pubkey;
+    first.stop();
+
+    const second = createApp({ home, port: 0, env: {} });
+    expect(currentOrgMeta(second.ctx.db)!.pubkey).toBe(pubkey);
+    second.stop();
+
+    const msgId = "11111111-1111-1111-1111-111111111111";
+    const aud = "22222222-2222-2222-2222-222222222222";
+    const body = JSON.stringify({ id: msgId });
+    const repo = join(import.meta.dir, "..");
+    const proc = Bun.spawn({
+      cmd: [
+        process.execPath,
+        "-e",
+        `import { join } from "node:path";
+import { OpenbotDb } from "./packages/db/src/index.ts";
+import { loadOrCreateMasterKey } from "./packages/vault/src/index.ts";
+import { signFedJws } from "./packages/federation/src/index.ts";
+import { currentOrgMeta, loadOrgKeypair } from "./apps/server/src/org.ts";
+const home = process.env.OPENBOT_ROUNDTRIP_HOME;
+if (!home) throw new Error("missing home");
+const master = loadOrCreateMasterKey(home);
+const key = loadOrgKeypair(home, master);
+const db = OpenbotDb.open(join(home, "openbot.sqlite"));
+const org = currentOrgMeta(db);
+if (!org) throw new Error("missing org");
+const jws = signFedJws({
+  privateKey: key.privateKey,
+  fromOrgId: org.org_id,
+  toOrgId: process.env.OPENBOT_ROUNDTRIP_AUD,
+  messageId: process.env.OPENBOT_ROUNDTRIP_JTI,
+  rawBody: process.env.OPENBOT_ROUNDTRIP_BODY,
+});
+console.log(jws);
+db.close();
+`,
+      ],
+      cwd: repo,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        OPENBOT_ROUNDTRIP_HOME: home,
+        OPENBOT_ROUNDTRIP_AUD: aud,
+        OPENBOT_ROUNDTRIP_JTI: msgId,
+        OPENBOT_ROUNDTRIP_BODY: body,
+      },
+    });
+    const stdout = await new Response(proc.stdout).text();
+    const stderr = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    expect(stderr).toBe("");
+    expect(code).toBe(0);
+    verifyFedJws(stdout.trim(), {
+      publicKey: pubkey,
+      expectedAud: aud,
+      expectedJti: msgId,
+      rawBody: body,
+    });
+
+    const master = loadOrCreateMasterKey(home);
+    const loaded = loadOrgKeypair(home, master);
+    expect(loaded.pubkey).toBe(pubkey);
+    const db = OpenbotDb.open(join(home, "openbot.sqlite"));
+    ensureOrgKeypair(home, master, db);
+    expect(currentOrgMeta(db)!.org_id).toBe(orgId);
+    db.close();
+  });
+});
 
 describe("fed info rate limit helper", () => {
   test("31st request in a minute is denied; X-Forwarded-For only from loopback", () => {

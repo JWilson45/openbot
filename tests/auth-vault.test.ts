@@ -15,6 +15,17 @@ import { RedactingLogger, loadOrCreateMasterKey, open, seal } from "@openbot/vau
 import { fakeAgentCommand, tempHome } from "./helpers.ts";
 import { loginCookie, startTestServer } from "../apps/server/src/test-helpers.ts";
 
+describe("RedactingLogger", () => {
+  test("redacts sk-ob_ keys", () => {
+    const logger = new RedactingLogger(() => undefined);
+    logger.info("mint", { token: "sk-ob_deadbeefcafebabe" });
+    const line = logger.lines.join("\n");
+    expect(line).toContain("sk-ob_[redacted]");
+    expect(line).not.toContain("deadbeef");
+    expect(logger.containsSecretLeak()).toBe(false);
+  });
+});
+
 describe("allowlist + bot-create + key inject", () => {
   test("listed GitHub login can become a session; unlisted is denied", () => {
     const home = tempHome();

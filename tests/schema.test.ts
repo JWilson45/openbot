@@ -23,6 +23,7 @@ test("schema applies on a fresh sqlite file", () => {
     "org_meta",
     "thread_participants",
     "org_members",
+    "org_peers",
   ]) {
     expect(names).toContain(required);
   }
@@ -69,4 +70,8 @@ test("schema applies on a fresh sqlite file", () => {
   }
   const indexes = db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index'").map((i) => i.name);
   expect(indexes).toContain("org_members_user");
+  const peerCols = db.all<{ name: string }>("PRAGMA table_info(org_peers)").map((c) => c.name);
+  for (const col of ["id", "peer_org_id", "slug", "name", "base_url", "pubkey", "status", "created_at"]) {
+    expect(peerCols).toContain(col);
+  }
 });

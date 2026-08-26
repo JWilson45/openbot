@@ -5,8 +5,20 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { addAllowlist, loadAllowlist } from "@openbot/auth";
 import { detectGrokCliVersion, grokCliPinStatus, PINNED_GROK_CLI } from "@openbot/acp-grok";
 import { OpenbotDb } from "@openbot/db";
+import { loadOrCreateMasterKey } from "@openbot/vault";
 import { createApp } from "./app.ts";
-import { ensureOrgMeta, orgCliSnapshot, writeOrgJson } from "./org.ts";
+import {
+  currentOrgMeta,
+  deleteOrgPeer,
+  ensureOrgKeypair,
+  ensureOrgMeta,
+  insertOrgPeer,
+  listOrgPeers,
+  orgCliSnapshot,
+  OrgPeerError,
+  orgPeerPublic,
+  writeOrgJson,
+} from "./org.ts";
 
 function defaultHome(): string {
   return process.env.OPENBOT_HOME || join(homedir(), ".openbot");
@@ -82,6 +94,9 @@ Usage:
   openbot install [--user] [--home ~/.openbot] [--port 8787] [--start]
   openbot org [--home ~/.openbot]
   openbot org init [--home ~/.openbot] [--slug acme] [--name "Acme"]
+  openbot peers [--home ~/.openbot]
+  openbot peers add --slug beta --url https://beta.example.com --pubkey <b64> --org-id <uuid>
+  openbot peers remove --id <orgId>
   openbot version | -v | --version
   openbot allowlist add <github-login>
   openbot allowlist
@@ -89,8 +104,9 @@ Usage:
   demo     local sign-in as "demo" (loopback). --fake uses the scripted ACP agent.
   server   bind the desk (default 127.0.0.1). --origin overrides OPENBOT_PUBLIC_ORIGIN.
   install  write a launchd LaunchAgent or systemd --user unit. Never requires root.
-  org      print instance identity JSON. Works with zero users.
+  org      print instance identity JSON including pubkey. Works with zero users.
   org init write org.json and upsert org_meta (org_id is never rotated).
+  peers    list, add, or remove federation peers.
   version  print {"openbot","grokPin","grok"} JSON.
 
 Closing a browser tab does not stop the teammate.
@@ -160,7 +176,7 @@ function orgCommand(): void {
   mkdirSync(home, { recursive: true });
   const db = OpenbotDb.open(join(home, "openbot.sqlite"));
   try {
-    const row = ensureOrgMeta(db, {
+    ensureOrgMeta(db, {
       env: process.env,
       file: join(home, "org.json"),
       publicOrigin: process.env.OPENBOT_PUBLIC_ORIGIN,
@@ -168,9 +184,68 @@ function orgCommand(): void {
       slug: init ? arg("--slug") : undefined,
       name: init ? arg("--name") : undefined,
     });
+    const master = loadOrCreateMasterKey(home, process.env.OPENBOT_MASTER_KEY);
+    ensureOrgKeypair(home, master, db);
+    const row = currentOrgMeta(db);
+    if (!row) throw new Error("org_meta write failed");
     if (init) writeOrgJson(join(home, "org.json"), row);
     console.log(JSON.stringify(orgCliSnapshot(row)));
   } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  } finally {
+    db.close();
+  }
+}
+
+function peersCommand(): void {
+  const home = arg("--home", defaultHome())!;
+  const sub = process.argv[3];
+  if (sub && sub !== "add" && sub !== "remove" && !sub.startsWith("-")) {
+    console.error("usage: openbot peers [add --slug <slug> --url <url> --pubkey <b64>] [remove --id <orgId>] [--home <dir>]");
+    process.exit(1);
+  }
+  mkdirSync(home, { recursive: true });
+  const db = OpenbotDb.open(join(home, "openbot.sqlite"));
+  try {
+    ensureOrgMeta(db, {
+      env: process.env,
+      file: join(home, "org.json"),
+      publicOrigin: process.env.OPENBOT_PUBLIC_ORIGIN,
+      advertisedOrigin: `http://127.0.0.1:${arg("--port", process.env.PORT ?? "8787")}`,
+    });
+    if (sub === "add") {
+      const slug = arg("--slug");
+      const url = arg("--url");
+      const pubkey = arg("--pubkey");
+      const orgId = arg("--org-id") ?? arg("--id");
+      if (!slug || !url || !pubkey || !orgId) {
+        console.error(
+          "usage: openbot peers add --slug <slug> --url <url> --pubkey <b64> --org-id <uuid> [--name <name>] [--home <dir>]",
+        );
+        process.exit(1);
+      }
+      const row = insertOrgPeer(db, { slug, orgId, baseUrl: url, pubkey, name: arg("--name") ?? "" });
+      console.log(JSON.stringify(orgPeerPublic(row)));
+    } else if (sub === "remove") {
+      const peerId = arg("--id");
+      if (!peerId) {
+        console.error("usage: openbot peers remove --id <orgId> [--home <dir>]");
+        process.exit(1);
+      }
+      if (!deleteOrgPeer(db, peerId)) {
+        console.error("not_found");
+        process.exit(1);
+      }
+      console.log(JSON.stringify({ ok: true }));
+    } else {
+      console.log(JSON.stringify({ peers: listOrgPeers(db).map(orgPeerPublic) }));
+    }
+  } catch (err) {
+    if (err instanceof OrgPeerError) {
+      console.error(err.code);
+      process.exit(1);
+    }
     console.error(err instanceof Error ? err.message : String(err));
     process.exit(1);
   } finally {
@@ -326,6 +401,8 @@ if (cmd === "version" || cmd === "-v" || cmd === "--version") {
   }
 } else if (cmd === "org") {
   orgCommand();
+} else if (cmd === "peers") {
+  peersCommand();
 } else if (cmd === "install") {
   install();
 } else {

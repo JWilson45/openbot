@@ -202,6 +202,17 @@ CREATE TABLE IF NOT EXISTS org_members (
   created_at integer NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS org_members_user ON org_members(user_id);
+
+CREATE TABLE IF NOT EXISTS org_peers (
+  id text PRIMARY KEY,
+  peer_org_id text NOT NULL UNIQUE,
+  slug text NOT NULL UNIQUE,
+  name text NOT NULL DEFAULT '',
+  base_url text NOT NULL,
+  pubkey text NOT NULL,
+  status text NOT NULL DEFAULT 'allowed',
+  created_at integer NOT NULL
+);
 `;
 
 export type SqlValue = string | number | bigint | boolean | null | Uint8Array;

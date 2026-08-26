@@ -192,8 +192,9 @@ Default `$OPENBOT_HOME` = `~/.openbot`.
 
 | Path | Role |
 | --- | --- |
-| `openbot.sqlite` | Bots, threads, turns, messages, live-work, sessions, `org_meta` |
+| `openbot.sqlite` | Bots, threads, turns, messages, live-work, sessions, `org_meta`, `org_peers` |
 | `org.json` | Optional org slug/name/origin. DB wins once written; `org init` rewrites this file. |
+| `org.ed25519` | Sealed Ed25519 org key (mode 0600). Not under `desk/`. Not a `credentials` row. |
 | `master.key` | Vault master (mode 0600). Not under `desk/` |
 | `allowlist` | GitHub logins, one per line |
 | `desk/` | Shared computer. Chromium profile under `desk/.openbot/chromium`. |

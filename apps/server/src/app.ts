@@ -35,12 +35,21 @@ import { mountOpenAiCompat } from "./openai.ts";
 import {
   clientRateKey,
   currentOrgMeta,
+  deleteOrgPeer,
+  disableOrgPeer,
   ensureOrgAccount,
+  ensureOrgKeypair,
   ensureOrgMeta,
   fedInfoPayload,
   FED_INFO_RATE_LIMIT,
   FED_INFO_RATE_WINDOW_MS,
+  fetchPeerFedInfo,
+  insertOrgPeer,
+  listOrgPeers,
+  OrgPeerError,
   orgMemberSnapshot,
+  orgPeerPublic,
+  parsePeerBaseUrl,
   SlidingWindowRateLimiter,
 } from "./org.ts";
 
@@ -122,6 +131,7 @@ export function createApp(cfg: HomeConfig): {
     advertisedOrigin,
   });
   const master = loadOrCreateMasterKey(cfg.home, process.env.OPENBOT_MASTER_KEY);
+  ensureOrgKeypair(cfg.home, master, db);
   const allowlist = loadAllowlist(cfg.home, process.env.OPENBOT_GITHUB_ALLOWLIST);
   const log = cfg.logger ?? new RedactingLogger();
   ensureOrgAccount(db, log);
@@ -329,6 +339,92 @@ export function createApp(cfg: HomeConfig): {
     } catch {
       return c.json({ error: "unauthorized" }, 401);
     }
+  });
+
+  const peerEnv = cfg.env ?? process.env;
+
+  function peerError(err: unknown) {
+    if (err instanceof OrgPeerError) {
+      const status = err.code.startsWith("duplicate") ? 409 : 400;
+      return { error: err.code, status: status as 400 | 409 };
+    }
+    return null;
+  }
+
+  async function readObjectJson(c: { req: { json: () => Promise<unknown> } }) {
+    try {
+      const parsed = await c.req.json();
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+      return parsed as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+
+  app.get("/v1/org/peers", (c) => {
+    requireSession(c);
+    return c.json({ peers: listOrgPeers(db).map(orgPeerPublic) });
+  });
+
+  app.post("/v1/org/peers/from-info", async (c) => {
+    requireSession(c);
+    const body = await readObjectJson(c);
+    if (!body) return c.json({ error: "invalid_json" }, 400);
+    const baseUrl = typeof body.baseUrl === "string" ? body.baseUrl : "";
+    let origin: string;
+    try {
+      origin = parsePeerBaseUrl(baseUrl, peerEnv);
+    } catch (err) {
+      const mapped = peerError(err);
+      if (mapped) return c.json({ error: mapped.error }, mapped.status);
+      throw err;
+    }
+    try {
+      const info = await fetchPeerFedInfo(origin);
+      return c.json(info);
+    } catch (err) {
+      const mapped = peerError(err);
+      if (mapped) return c.json({ error: mapped.error }, mapped.status);
+      return c.json({ error: "info_failed" }, 400);
+    }
+  });
+
+  app.post("/v1/org/peers", async (c) => {
+    requireSession(c);
+    const body = await readObjectJson(c);
+    if (!body) return c.json({ error: "invalid_json" }, 400);
+    try {
+      const row = insertOrgPeer(
+        db,
+        {
+          slug: typeof body.slug === "string" ? body.slug : "",
+          orgId: typeof body.orgId === "string" ? body.orgId : "",
+          baseUrl: typeof body.baseUrl === "string" ? body.baseUrl : "",
+          pubkey: typeof body.pubkey === "string" ? body.pubkey : "",
+          name: typeof body.name === "string" ? body.name : "",
+        },
+        peerEnv,
+      );
+      return c.json(orgPeerPublic(row));
+    } catch (err) {
+      const mapped = peerError(err);
+      if (mapped) return c.json({ error: mapped.error }, mapped.status);
+      throw err;
+    }
+  });
+
+  app.delete("/v1/org/peers/:orgId", (c) => {
+    requireSession(c);
+    const ok = deleteOrgPeer(db, c.req.param("orgId"));
+    if (!ok) return c.json({ error: "not_found" }, 404);
+    return c.json({ ok: true });
+  });
+
+  app.post("/v1/org/peers/:orgId/disable", (c) => {
+    requireSession(c);
+    const row = disableOrgPeer(db, c.req.param("orgId"));
+    if (!row) return c.json({ error: "not_found" }, 404);
+    return c.json(orgPeerPublic(row));
   });
 
   app.post("/v1/bots", async (c) => {
