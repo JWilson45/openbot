@@ -856,8 +856,8 @@ export const SPA_HTML = `<!DOCTYPE html>
     const last = state.messages[state.messages.length - 1];
     if (!last || last.role !== 'user' || last.origin === 'agent') return '';
     if (last._failed) return '';
-    // Group hello stores a user bubble and queues nobody.
-    if (state.view === 'group' && !last._pending && !last.turn_id) return '';
+    // Group user rows stay turn_id null; hello is this POST's empty turnIds, not a missing turn_id.
+    if (state.view === 'group' && !last._pending && !(Array.isArray(last._turnIds) && last._turnIds.length > 0)) return '';
     const harness = state.compute && state.compute.harness;
     if (last._pending || harness === 'starting') return 'starting';
     if (harness === 'in_turn') return 'working';
@@ -871,6 +871,8 @@ export const SPA_HTML = `<!DOCTYPE html>
     if (m.origin === 'system') return 'System';
     if (m.origin === 'federation') return m.remote_actor_name || 'Org';
     if (m.from_bot_id) return botName(m.from_bot_id);
+    // Group fallback has no from_bot_id; do not pin it to the last selected DM.
+    if (m.origin === 'fallback' && state.view === 'group') return 'Teammate';
     return state.bot?.name || 'Teammate';
   }
 
@@ -1016,22 +1018,26 @@ export const SPA_HTML = `<!DOCTYPE html>
     announce('Sending message');
     try {
       const res = await api('/v1/threads/' + state.thread.id + '/messages', { method:'POST', body: JSON.stringify({ body }) });
-      if (res.userMessageId) tmp.id = res.userMessageId;
-      // Group 202 is { turnIds }; empty array is a successful hello, not a missing turnId.
+      // WS may already have replaced tmp; stamp the in-array row, not the detached object.
+      const live = state.messages.find(x =>
+        (res.userMessageId && x.id === res.userMessageId) || x.id === tmp.id || x === tmp
+      ) || tmp;
+      if (res.userMessageId) live.id = res.userMessageId;
       if (Array.isArray(res.turnIds)) {
-        tmp.turn_id = res.turnIds[0] || null;
+        live._turnIds = res.turnIds;
         if (res.turnIds[0]) state.turn = res.turnIds[0];
       } else if (res.turnId) {
-        tmp.turn_id = res.turnId;
+        live.turn_id = res.turnId;
         state.turn = res.turnId;
       }
-      tmp._pending = false;
+      live._pending = false;
       paintMessages();
       announce('Message sent');
     } catch (e) {
-      tmp._pending = false;
-      tmp._failed = true;
-      tmp.error = e.message;
+      const live = state.messages.find(x => x.id === tmp.id || x === tmp) || tmp;
+      live._pending = false;
+      live._failed = true;
+      live.error = e.message;
       paintMessages();
       announce('Send failed');
     } finally {
@@ -1382,13 +1388,24 @@ export const SPA_HTML = `<!DOCTYPE html>
     // Per-turn @mention clones are not transcript bubbles.
     if (m.origin === 'prompt') return;
     const tid = m.thread_id || m.threadId;
-    const sameThread = state.thread && tid === state.thread.id;
-    const botReply = state.view === 'human' && m.origin && m.origin !== 'user' && m.origin !== 'agent';
-    if (!sameThread && !botReply) return;
+    const sameThread = Boolean(state.thread && tid === state.thread.id);
+    // Other threads' system/fallback must not land in this transcript.
+    if (!sameThread) return;
     const idx = state.messages.findIndex(x => x.id === m.id || (x.id && String(x.id).startsWith('tmp-') && x.body === m.body && x.role === m.role));
     const wasNew = idx < 0;
-    if (idx >= 0) state.messages[idx] = { ...state.messages[idx], ...m, _pending:false, _failed:false };
-    else state.messages.push(m);
+    if (idx >= 0) {
+      const prev = state.messages[idx];
+      state.messages[idx] = {
+        ...prev,
+        ...m,
+        // Keep tmp pending until sendMsg stamps _turnIds; WS can replace the object first.
+        _pending: Boolean(prev._pending && m.origin === 'user'),
+        _failed: false,
+        _turnIds: Array.isArray(prev._turnIds) ? prev._turnIds : m._turnIds,
+      };
+    } else {
+      state.messages.push(m);
+    }
     paintMessages();
     if (wasNew && m.role !== 'user') announce(senderLabel(m) + ' replied');
   }
@@ -1406,8 +1423,13 @@ export const SPA_HTML = `<!DOCTYPE html>
         return;
       }
       if (t.thread) state.thread = t.thread;
+      const prevById = new Map(state.messages.filter(m => m.id).map(m => [m.id, m]));
       const keepFailed = state.messages.filter(m => m._failed);
-      state.messages = visibleMessages(t.messages);
+      state.messages = visibleMessages(t.messages).map(m => {
+        const prev = prevById.get(m.id);
+        if (prev && Array.isArray(prev._turnIds)) return { ...m, _turnIds: prev._turnIds };
+        return m;
+      });
       for (const f of keepFailed) {
         if (!state.messages.some(m => m.body === f.body && m.role === 'user')) state.messages.push(f);
       }
