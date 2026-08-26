@@ -852,11 +852,25 @@ export const SPA_HTML = `<!DOCTYPE html>
     if (jump) jump.hidden = stickBottom;
   }
 
+  function dropFinishedTurn(turnId, status) {
+    if (!turnId) return;
+    if (status !== 'completed' && status !== 'failed' && status !== 'cancelled') return;
+    for (const m of state.messages) {
+      if (!Array.isArray(m._turnIds) || !m._turnIds.length) continue;
+      m._turnIds = m._turnIds.filter(id => id !== turnId);
+    }
+    if (state.turn === turnId) {
+      const still = [...state.messages].reverse().find(m => Array.isArray(m._turnIds) && m._turnIds.length);
+      state.turn = still ? still._turnIds[0] : null;
+    }
+  }
+
   function waitingKind() {
     const last = state.messages[state.messages.length - 1];
     if (!last || last.role !== 'user' || last.origin === 'agent') return '';
     if (last._failed) return '';
     // Group user rows stay turn_id null; hello is this POST's empty turnIds, not a missing turn_id.
+    // Finished mention turns are dropped from _turnIds so SendMessage-to-DM does not stick on waiting.
     if (state.view === 'group' && !last._pending && !(Array.isArray(last._turnIds) && last._turnIds.length > 0)) return '';
     const harness = state.compute && state.compute.harness;
     if (last._pending || harness === 'starting') return 'starting';
@@ -1466,7 +1480,10 @@ export const SPA_HTML = `<!DOCTYPE html>
     ws.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
       if (msg.type === 'message.created' && msg.message && msg.message.origin !== 'prompt') upsertMessage(msg.message);
-      if (msg.type === 'turn.updated') void reloadThread();
+      if (msg.type === 'turn.updated') {
+        dropFinishedTurn(msg.turnId, msg.status);
+        void reloadThread();
+      }
       if (msg.type === 'live_work') {
         if (msg.turnId) state.turn = msg.turnId;
         state.live.push(msg.event);

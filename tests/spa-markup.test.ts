@@ -44,6 +44,7 @@ describe("desk SPA markup", () => {
     expect(html).toContain("origin === 'prompt'");
     expect(html).toContain("turnIds");
     expect(html).toContain("_turnIds");
+    expect(html).toContain("dropFinishedTurn");
     expect(html).toContain("sameThread");
     expect(html).toContain("Groups");
     server.stop(true);
