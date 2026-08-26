@@ -7,11 +7,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=__ROOT__
-ExecStart="__BUN__" "__CLI__" server --home "__HOME__" --port __PORT__ --host 127.0.0.1
+WorkingDirectory=__WORKDIR__
+ExecStart=__EXECSTART__
 Restart=always
 RestartSec=3
 Environment="OPENBOT_HOME=__HOME__"
+Environment="HOME=__USER_HOME__"
 Environment="PATH=__PATH__"
 
 [Install]

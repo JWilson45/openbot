@@ -1,0 +1,57 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            artifact: openbot-darwin-arm64
+          - os: macos-13
+            artifact: openbot-darwin-x64
+          - os: ubuntu-latest
+            artifact: openbot-linux-x64
+          - os: ubuntu-24.04-arm
+            artifact: openbot-linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run scripts/build-binary.ts --current
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: flatten binaries
+        run: |
+          mkdir -p dist
+          find artifacts -type f -name 'openbot-*' -exec cp {} dist/ \;
+          chmod +x dist/openbot-*
+          ls -la dist
+          cp contrib/install.sh dist/install.sh
+      - name: create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/openbot-darwin-arm64 \
+            dist/openbot-darwin-x64 \
+            dist/openbot-linux-x64 \
+            dist/openbot-linux-arm64 \
+            dist/install.sh \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes

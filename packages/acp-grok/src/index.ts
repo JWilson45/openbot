@@ -1,5 +1,8 @@
+import { basename } from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawn, type Subprocess } from "bun";
 import type { EnsureHarnessRequest, LiveWorkEvent, PromptResult } from "@openbot/compute-protocol";
+import { runMcpBridge } from "./mcp-bridge.ts";
 
 type Rpc = {
   jsonrpc: "2.0";
@@ -363,10 +366,11 @@ export class AcpClient {
         headers: [{ name: "Authorization", value: `Bearer ${req.mcpToken}` }],
       });
     } else {
+      const bridge = mcpBridgeSpawn(req.mcpUrl, req.mcpToken);
       mcpServers.push({
         name: "openbot",
-        command: process.execPath,
-        args: [new URL("../mcp-bridge.ts", import.meta.url).pathname, req.mcpUrl, req.mcpToken],
+        command: bridge.command,
+        args: bridge.args,
         env: [],
       });
     }
@@ -436,7 +440,22 @@ function contentText(content: unknown): string {
   return "";
 }
 
-export { defaultCommand };
+function mcpBridgeSpawn(mcpUrl: string, mcpToken: string): { command: string; args: string[] } {
+  const exec = process.execPath;
+  const base = basename(exec).toLowerCase().replace(/\.exe$/, "");
+  const compiled = base !== "bun" && !base.startsWith("bun-");
+  if (compiled) return { command: exec, args: ["mcp-bridge", mcpUrl, mcpToken] };
+  const entry = process.argv[1];
+  if (entry && /cli\.ts$/.test(entry)) {
+    return { command: exec, args: [entry, "mcp-bridge", mcpUrl, mcpToken] };
+  }
+  return {
+    command: exec,
+    args: [fileURLToPath(new URL("./mcp-bridge.ts", import.meta.url)), mcpUrl, mcpToken],
+  };
+}
+
+export { defaultCommand, runMcpBridge };
 export { detectCliLogins, grokCliSignedIn, type CliLoginStatus } from "./cli-auth.ts";
 export { prepareIsolatedGrokHome, ISOLATED_GROK_CONFIG } from "./grok-home.ts";
 export {

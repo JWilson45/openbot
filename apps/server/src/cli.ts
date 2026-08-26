@@ -1,9 +1,12 @@
 #!/usr/bin/env bun
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { addAllowlist, loadAllowlist } from "@openbot/auth";
-import { detectGrokCliVersion, grokCliPinStatus, PINNED_GROK_CLI } from "@openbot/acp-grok";
+import { detectGrokCliVersion, grokCliPinStatus, PINNED_GROK_CLI, runMcpBridge } from "@openbot/acp-grok";
+import pkg from "../../../package.json" with { type: "json" };
+import launchdTemplate from "../../../contrib/launchd/ai.openbot.plist" with { type: "text" };
+import systemdTemplate from "../../../contrib/systemd/openbot.service" with { type: "text" };
 import { OpenbotDb } from "@openbot/db";
 import { loadOrCreateMasterKey } from "@openbot/vault";
 import { createApp } from "./app.ts";
@@ -122,10 +125,12 @@ function flag(name: string): boolean {
 }
 
 function openbotVersion(): string {
-  const pkg = JSON.parse(readFileSync(join(import.meta.dir, "../../../package.json"), "utf8")) as {
-    version: string;
-  };
   return pkg.version;
+}
+
+function isStandaloneBinary(): boolean {
+  const base = basename(process.execPath).toLowerCase().replace(/\.exe$/, "");
+  return base !== "bun" && !base.startsWith("bun-");
 }
 
 function printVersion(): void {
@@ -210,6 +215,8 @@ Named orgs live in ~/.openbot/orgs/<slug>/ (registry: ~/.openbot/profiles.json).
 --home / OPENBOT_HOME pin a path (units snapshot this) and skip the current org.
 A running demo/server stays on the org it started with until you restart it.
 Grok login stays in ~/.grok (not the org home).
+Install a binary: curl https://github.com/JWilson45/openbot/releases/latest/download/install.sh | bash
+  or: brew tap JWilson45/openbot https://github.com/JWilson45/openbot && brew install openbot
 
 Closing a browser tab does not stop the teammate.
 Stopping openbot server does.
@@ -238,6 +245,21 @@ function cliPath(): string {
   return resolve(import.meta.dir, "cli.ts");
 }
 
+function serverArgv(home: string, port: string): string[] {
+  if (isStandaloneBinary()) {
+    return [process.execPath, "server", "--home", home, "--port", port, "--host", "127.0.0.1"];
+  }
+  return [resolveBun(), cliPath(), "server", "--home", home, "--port", port, "--host", "127.0.0.1"];
+}
+
+function quoteUnitArg(s: string): string {
+  return `"${s.replace(/"/g, '\\"')}"`;
+}
+
+function launchdArgsXml(args: string[]): string {
+  return args.map((a) => `\t\t<string>${xmlEscape(a)}</string>`).join("\n");
+}
+
 function xmlEscape(s: string): string {
   return s
     .replace(/&/g, "&amp;")
@@ -247,24 +269,26 @@ function xmlEscape(s: string): string {
 }
 
 function unitVars(home: string, port: string): Record<string, string> {
+  const args = serverArgv(home, port);
   return {
-    __BUN__: resolveBun(),
-    __CLI__: cliPath(),
     __HOME__: home,
     __PORT__: port,
-    __ROOT__: repoRoot(),
+    __WORKDIR__: isStandaloneBinary() ? home : repoRoot(),
+    __EXECSTART__: args.map(quoteUnitArg).join(" "),
+    __PROGRAM_ARGUMENTS__: launchdArgsXml(args),
     __PATH__: process.env.PATH ?? "/usr/bin:/bin",
     __USER_HOME__: userHome(),
   };
 }
 
-function renderTemplate(path: string, vars: Record<string, string>, xml: boolean): string {
-  let text = readFileSync(path, "utf8");
+function renderTemplate(text: string, vars: Record<string, string>, xml: boolean): string {
   const keys = Object.keys(vars).sort((a, b) => b.length - a.length);
+  let out = text;
   for (const k of keys) {
-    text = text.replaceAll(k, xml ? xmlEscape(vars[k]!) : vars[k]!);
+    const value = vars[k]!;
+    out = out.replaceAll(k, xml && k !== "__PROGRAM_ARGUMENTS__" ? xmlEscape(value) : value);
   }
-  return text;
+  return out;
 }
 
 function orgCommand(): void {
@@ -425,9 +449,8 @@ function install(): void {
   const port = arg("--port", process.env.PORT ?? "8787")!;
   const start = flag("--start");
   const vars = unitVars(home, port);
-  const contrib = join(repoRoot(), "contrib");
-  const darwinRendered = renderTemplate(join(contrib, "launchd/ai.openbot.plist"), vars, true);
-  const linuxRendered = renderTemplate(join(contrib, "systemd/openbot.service"), vars, false);
+  const darwinRendered = renderTemplate(launchdTemplate, vars, true);
+  const linuxRendered = renderTemplate(systemdTemplate, vars, false);
 
   if (process.platform === "darwin") {
     const dest = join(userHome(), "Library/LaunchAgents/ai.openbot.plist");
@@ -489,6 +512,10 @@ if (cmd === "version" || cmd === "-v" || cmd === "--version") {
   const port = Number(arg("--port", process.env.PORT ?? "8787"));
   const host = resolveHost();
   const fake = process.argv.includes("--fake");
+  if (fake && isStandaloneBinary()) {
+    console.error("compiled openbot does not include --fake; clone the repo for scripted demos");
+    process.exit(1);
+  }
   addAllowlist(home, "demo");
   process.env.OPENBOT_DEV_LOGIN = "1";
   process.env.OPENBOT_GITHUB_ALLOWLIST = [process.env.OPENBOT_GITHUB_ALLOWLIST, "demo"].filter(Boolean).join(",");
@@ -642,6 +669,14 @@ if (cmd === "version" || cmd === "-v" || cmd === "--version") {
       process.exit(1);
     }
   }
+} else if (cmd === "mcp-bridge") {
+  const url = process.argv[3];
+  const token = process.argv[4];
+  if (!url || !token) {
+    console.error("usage: openbot mcp-bridge <url> <token>");
+    process.exit(1);
+  }
+  await runMcpBridge(url, token);
 } else if (cmd === "install") {
   install();
 } else {

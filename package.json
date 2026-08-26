@@ -13,7 +13,9 @@
   "scripts": {
     "test": "bun test",
     "start": "bun run apps/server/src/cli.ts server",
-    "openbot": "bun run apps/server/src/cli.ts"
+    "openbot": "bun run apps/server/src/cli.ts",
+    "build:binary": "bun run scripts/build-binary.ts --current",
+    "build:release": "bun run scripts/build-binary.ts"
   },
   "engines": {
     "bun": ">=1.1.0"

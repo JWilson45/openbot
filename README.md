@@ -57,6 +57,27 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 
 ## Install
 
+Binary (no Bun at runtime). Still needs **Grok CLI** on PATH (`grok login` as this user). Do not run as root.
+
+```bash
+# curl (Linux / macOS)
+curl -fsSL https://github.com/JWilson45/openbot/releases/latest/download/install.sh | bash
+# installs to ~/.local/bin/openbot  (override: OPENBOT_BIN=/usr/local/bin/openbot)
+
+# Homebrew
+brew tap JWilson45/openbot https://github.com/JWilson45/openbot
+brew install openbot
+```
+
+Then:
+
+```bash
+openbot org init acme --name "Acme"
+openbot install --user --org acme --port 8787 --start
+```
+
+From source (contributors):
+
 ```bash
 git clone https://github.com/JWilson45/openbot.git
 cd openbot

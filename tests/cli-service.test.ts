@@ -44,6 +44,8 @@ describe("openbot version / help / install", () => {
     expect(stdout).toContain("openbot orgs");
     expect(stdout).toContain("openbot use");
     expect(stdout).toContain("openbot org init");
+    expect(stdout).toContain("brew tap");
+    expect(stdout).toContain("install.sh");
     expect(stdout).toContain("docs/host-service.md");
     expect(stdout).toContain("Closing a browser tab does not stop the teammate.");
   });

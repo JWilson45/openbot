@@ -7,18 +7,10 @@
 	<string>ai.openbot</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>__BUN__</string>
-		<string>__CLI__</string>
-		<string>server</string>
-		<string>--home</string>
-		<string>__HOME__</string>
-		<string>--port</string>
-		<string>__PORT__</string>
-		<string>--host</string>
-		<string>127.0.0.1</string>
+__PROGRAM_ARGUMENTS__
 	</array>
 	<key>WorkingDirectory</key>
-	<string>__ROOT__</string>
+	<string>__WORKDIR__</string>
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>OPENBOT_HOME</key>

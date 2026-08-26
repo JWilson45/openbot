@@ -23,6 +23,17 @@ Version: `openbot version` prints `{"openbot":"0.3.0","grokPin":"1.0.5","grok":"
 
 ## Install the unit
 
+Binary (GitHub Releases). `grok` must be on PATH; `grok login` as this user.
+
+```bash
+curl -fsSL https://github.com/JWilson45/openbot/releases/latest/download/install.sh | bash
+# or: brew tap JWilson45/openbot https://github.com/JWilson45/openbot && brew install openbot
+
+openbot version
+openbot org init acme --name "Acme"
+openbot install --user --org acme --port 8787
+```
+
 From a git checkout after `bun install`:
 
 ```bash
@@ -278,11 +289,12 @@ Do every step on **each** VM unless a heading says otherwise. Do not copy `$OPEN
 
 ### 1. Install the unit
 
-From a git checkout after `bun install` (same as above):
+Binary or git checkout (same as above):
 
 ```bash
-bun run openbot -- version
-bun run openbot -- install --user --org acme --port 8787   # VM B: --org beta
+# curl -fsSL https://github.com/JWilson45/openbot/releases/latest/download/install.sh | bash
+openbot version
+openbot install --user --org acme --port 8787   # VM B: --org beta
 # then load / enable --now, or pass --start
 ```
 
