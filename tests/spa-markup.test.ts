@@ -33,6 +33,17 @@ describe("desk SPA markup", () => {
     expect(html).toContain("pick-model");
     expect(html).toContain("pick-effort");
     expect(html).toContain("Reasoning");
+    expect(html).toContain("open-gateway");
+    expect(html).toContain("fed-on");
+    expect(html).toContain("fed-off");
+    expect(html).toContain("Federation");
+    expect(html).toContain("federationEnabled");
+    expect(html).toContain("/v1/threads?kind=group");
+    expect(html).toContain("new-group");
+    expect(html).toContain("data-group");
+    expect(html).toContain("origin === 'prompt'");
+    expect(html).toContain("turnIds");
+    expect(html).toContain("Groups");
     server.stop(true);
   });
 });

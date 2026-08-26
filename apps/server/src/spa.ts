@@ -98,7 +98,7 @@ export const SPA_HTML = `<!DOCTYPE html>
     .rail h2, aside.side h2 {
       font-size: .72rem; letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
     }
-    .shell.no-rail .rail h2, .shell.no-rail .desk-note, .shell.no-rail .bot-meta, .shell.no-rail #newbot { display: none; }
+    .shell.no-rail .rail h2, .shell.no-rail .desk-note, .shell.no-rail .bot-meta, .shell.no-rail #newbot, .shell.no-rail #new-group { display: none; }
     .shell.no-rail .rail { padding: 8px 6px; }
     .shell.no-side aside.side { padding: 8px 4px; }
     .shell.no-side aside.side .side-body { display: none; }
@@ -253,7 +253,7 @@ export const SPA_HTML = `<!DOCTYPE html>
   <div id="app"></div>
   <script>
   const state = {
-    me:null, bots:[], archived:[], archiveTtlMs: 30*24*60*60*1000, bot:null, thread:null, messages:[], live:[], compute:null, liveRaw: localStorage.getItem('openbot-live-raw') === '1', railCollapsed: localStorage.getItem('openbot-rail') === '1', sideCollapsed: localStorage.getItem('openbot-side') === '1',
+    me:null, bots:[], gateway:null, groups:[], org:null, archived:[], archiveTtlMs: 30*24*60*60*1000, bot:null, thread:null, messages:[], live:[], compute:null, liveRaw: localStorage.getItem('openbot-live-raw') === '1', railCollapsed: localStorage.getItem('openbot-rail') === '1', sideCollapsed: localStorage.getItem('openbot-side') === '1',
     turn:null, a2a:[], view:'human', auth:{}, harness:{}, ws:'down', sending:false, activity:[], models:[], sideW: Number(localStorage.getItem('openbot-side-w') || 320)
   };
   let hostPoll = 0;
@@ -384,15 +384,23 @@ export const SPA_HTML = `<!DOCTYPE html>
     try { state.models = (await api('/v1/inference-models')).models || []; } catch { state.models = []; }
     try {
       const bots = await api('/v1/bots');
+      // Desk roster only — Gateway is the sidecar, never a Team row.
       state.bots = bots.bots || (bots.bot ? [bots.bot] : []);
+      state.gateway = bots.gateway || null;
       state.archived = bots.archived || [];
       if (bots.archiveTtlMs) state.archiveTtlMs = bots.archiveTtlMs;
       const last = localStorage.getItem('openbot-last-bot');
-      state.bot = state.bots.find(b => b.id === last) || state.bots[0] || null;
+      state.bot = state.bots.find(b => b.id === last)
+        || (state.gateway && last === state.gateway.id ? state.gateway : null)
+        || state.bots[0]
+        || null;
     } catch {}
-    if (!state.bot && !state.archived.length) return renderOnboard();
+    // Onboard until a desk bot exists; Gateway must not skip that screen.
+    if (!state.bots.length && !state.archived.length) return renderOnboard();
+    try { state.groups = (await api('/v1/threads?kind=group')).threads || []; } catch { state.groups = []; }
+    try { state.org = await api('/v1/org'); } catch { state.org = null; }
     connectPush();
-    if (!state.bot) { state.view = 'archive'; renderApp(); return; }
+    if (!state.bots.length) { state.view = 'archive'; renderApp(); return; }
     try {
       await selectBot(state.bot.id);
     } catch (err) {
@@ -467,16 +475,30 @@ export const SPA_HTML = `<!DOCTYPE html>
     } catch (e) { if (err) err.textContent = e.message; }
   }
 
+  function isGatewayBot(b) {
+    return Boolean(b && state.gateway && b.id === state.gateway.id);
+  }
+  function visibleMessages(list) {
+    return (list || []).filter(m => m.origin !== 'prompt');
+  }
+  function principalById(botId) {
+    if (state.gateway && state.gateway.id === botId) return state.gateway;
+    return state.bots.find(b => b.id === botId) || null;
+  }
+
   async function selectBot(botId, threadId) {
     saveDraft();
-    state.bot = state.bots.find(b => b.id === botId) || state.bot;
+    const principal = principalById(botId);
+    // Gateway is not in state.bots; never keep the previous desk bot here.
+    if (!principal) return;
+    state.bot = principal;
     try { localStorage.setItem('openbot-last-bot', state.bot.id); } catch {}
     state.view = threadId ? 'a2a' : 'human';
     const t = threadId
       ? await api('/v1/threads/' + threadId)
       : await api('/v1/threads?botId=' + encodeURIComponent(botId));
     state.thread = t.thread;
-    state.messages = t.messages || [];
+    state.messages = visibleMessages(t.messages);
     try {
       const a2a = await api('/v1/threads?kind=a2a&botId=' + encodeURIComponent(botId));
       state.a2a = a2a.threads || [];
@@ -491,6 +513,71 @@ export const SPA_HTML = `<!DOCTYPE html>
     if (draft) draft.focus();
   }
 
+  async function refreshGroups() {
+    try {
+      const res = await api('/v1/threads?kind=group');
+      state.groups = res.threads || [];
+    } catch { state.groups = state.groups || []; }
+  }
+
+  async function selectGroup(threadId) {
+    if (!threadId) return;
+    saveDraft();
+    state.view = 'group';
+    const t = await api('/v1/threads/' + threadId);
+    state.thread = t.thread;
+    state.messages = visibleMessages(t.messages);
+    stickBottom = true;
+    renderApp();
+    const latestTurnId = t.latestTurnId || [...(state.messages || [])].reverse().find(m => m.turn_id)?.turn_id;
+    state.turn = latestTurnId;
+    await catchUpLive(latestTurnId);
+    loadDraft();
+    const draft = document.getElementById('draft');
+    if (draft) draft.focus();
+  }
+
+  function openNewGroup() {
+    const botChecks = state.bots.map(b =>
+      '<label><input type="checkbox" data-bot="' + b.id + '" /> ' + escapeHtml(b.name) + '</label>'
+    ).join('');
+    const gwCheck = state.gateway
+      ? '<label><input type="checkbox" data-bot="' + state.gateway.id + '" /> ' + escapeHtml(state.gateway.name) + '</label>'
+      : '';
+    const overlay = h(\`<div class="overlay"><div class="modal">
+      <h2 id="grp-title">New group</h2>
+      <label for="grp-name">Title</label>
+      <input id="grp-name" name="title" value="New thread" />
+      <p class="muted">Pick at least two teammates. You are included.</p>
+      <div id="grp-bots" style="display:flex;flex-direction:column;gap:6px">\${botChecks}\${gwCheck}</div>
+      <p class="err" id="grp-err" hidden></p>
+      <div class="modal-actions">
+        <button class="primary" type="button" id="grp-go">Create</button>
+        <button type="button" id="grp-no">Cancel</button>
+      </div>
+    </div></div>\`);
+    overlay.querySelector('.modal').setAttribute('aria-labelledby', 'grp-title');
+    const close = openOverlay(overlay);
+    overlay.querySelector('#grp-no').onclick = close;
+    overlay.querySelector('#grp-go').onclick = async () => {
+      const err = overlay.querySelector('#grp-err');
+      const botIds = [...overlay.querySelectorAll('#grp-bots input[data-bot]:checked')].map(i => i.getAttribute('data-bot'));
+      try {
+        const res = await api('/v1/threads', { method:'POST', body: JSON.stringify({
+          kind:'group',
+          title: overlay.querySelector('#grp-name').value,
+          botIds,
+        }) });
+        await refreshGroups();
+        close();
+        await selectGroup(res.thread.id);
+      } catch (e) {
+        err.hidden = false;
+        err.textContent = e.message || 'Could not create group';
+      }
+    };
+  }
+
   function statusPill() {
     const harness = state.compute && state.compute.harness;
     const ws = state.ws;
@@ -503,6 +590,7 @@ export const SPA_HTML = `<!DOCTYPE html>
   }
 
   function botName(id) {
+    if (state.gateway && state.gateway.id === id) return state.gateway.name;
     const b = state.bots.find(x => x.id === id) || state.archived.find(x => x.id === id);
     return b ? b.name : (id || 'bot').slice(0, 8);
   }
@@ -547,10 +635,13 @@ export const SPA_HTML = `<!DOCTYPE html>
         method:'PATCH',
         body: JSON.stringify({ model, reasoningEffort: effort })
       });
-      const bot = state.bots.find(b => b.id === state.bot.id) || state.bot;
+      const bot = state.bots.find(b => b.id === state.bot.id)
+        || (isGatewayBot(state.bot) ? state.gateway : null)
+        || state.bot;
       bot.model = res.model;
       bot.reasoning_effort = res.reasoningEffort;
       state.bot = bot;
+      if (isGatewayBot(bot)) state.gateway = bot;
       announce('Next turn uses ' + res.model + ' · ' + res.reasoningEffort);
     } catch (e) { announce(e.message); }
   }
@@ -576,14 +667,29 @@ export const SPA_HTML = `<!DOCTYPE html>
   function renderApp() {
     const inArchive = state.view === 'archive';
     const inActivity = state.view === 'activity';
-    document.title = (inArchive ? 'Archive' : inActivity ? 'Activity' : (state.bot?.name || 'OpenBot')) + ' · OpenBot';
+    const inGroup = state.view === 'group';
+    const gwSelected = isGatewayBot(state.bot) && state.view === 'human';
+    const heading = inArchive ? 'Archive' : inActivity ? 'Activity' : inGroup ? (state.thread?.title || 'Group') : (state.bot?.name || 'OpenBot');
+    document.title = heading + ' · OpenBot';
     const railBots = state.bots.map(b => {
-      const active = state.bot && b.id === state.bot.id && state.view === 'human';
+      const active = state.bot && b.id === state.bot.id && state.view === 'human' && !gwSelected;
       const pres = presenceOf(b);
       return '<button type="button" class="bot' + (active ? ' active' : '') + '" data-id="' + b.id + '" aria-current="' + (active ? 'page' : 'false') + '">' +
         '<span class="st ' + escapeHtml(pres.key) + '" title="' + escapeHtml(pres.label) + '"></span>' +
         '<span class="avatar" aria-hidden="true">' + escapeHtml(initials(b.name)) + '</span>' +
         '<span class="bot-meta"><strong>' + escapeHtml(b.name) + '</strong><span class="muted presence">' + escapeHtml(pres.label) + '</span></span></button>';
+    }).join('');
+    const gwEnabled = Boolean(state.gateway && state.gateway.enabled);
+    const gatewayPin = state.gateway
+      ? '<button type="button" class="bot folder' + (gwSelected ? ' active' : '') + '" id="open-gateway" data-id="' + state.gateway.id + '" aria-current="' + (gwSelected ? 'page' : 'false') + '">' +
+        '<span class="avatar" aria-hidden="true">' + escapeHtml(initials(state.gateway.name)) + '</span>' +
+        '<span class="bot-meta"><strong>' + escapeHtml(state.gateway.name) + '</strong><span class="muted presence">' + (gwEnabled ? 'Federation on' : 'Federation off') + '</span></span></button>'
+      : '';
+    const railGroups = (state.groups || []).map(t => {
+      const active = inGroup && state.thread && t.id === state.thread.id;
+      return '<button type="button" class="bot folder' + (active ? ' active' : '') + '" data-group="' + t.id + '" aria-current="' + (active ? 'page' : 'false') + '">' +
+        '<span class="avatar" aria-hidden="true">#</span>' +
+        '<span class="bot-meta"><strong>' + escapeHtml(t.title || 'Group') + '</strong></span></button>';
     }).join('');
     const handoffs = (state.a2a || []).map(t =>
       '<div><button type="button" data-a2a="' + t.id + '">' + escapeHtml(handoffLabel(t)) + '</button></div>'
@@ -593,6 +699,14 @@ export const SPA_HTML = `<!DOCTYPE html>
       ? ''
       : readonly
       ? '<p class="muted" id="draft-help">This handoff log is read-only. Message the bot from their human thread.</p>'
+      : inGroup
+      ? \`
+        <div class="composer">
+          <label class="sr-only" for="draft">Message group</label>
+          <textarea id="draft" name="draft" rows="2" maxlength="32000" aria-describedby="draft-help" placeholder="Message the group… @name to mention"></textarea>
+          <button class="primary" id="send" type="button" disabled>Send</button>
+        </div>
+        <div class="hint" id="draft-help"><span><kbd>Enter</kbd> send · <kbd>Shift</kbd>+<kbd>Enter</kbd> newline · @mention up to 3 teammates</span><span id="count"></span></div>\`
       : \`\${inferenceFields('pick-model', 'pick-effort')}
         <div class="composer">
           <label class="sr-only" for="draft">Message \${escapeHtml(state.bot?.name || '')}</label>
@@ -608,11 +722,11 @@ export const SPA_HTML = `<!DOCTYPE html>
 
     el.innerHTML = '';
     el.append(h(\`<header class="app-header">
-      <h1>\${inArchive ? 'Archive' : inActivity ? 'Activity' : escapeHtml(state.bot?.name || 'OpenBot')}</h1>
+      <h1>\${escapeHtml(heading)}</h1>
       <div class="header-actions">
         \${statusPill()}
         <button type="button" class="side-toggle" id="live-toggle" aria-expanded="false">Live work</button>
-        \${!inArchive && !inActivity && state.bot ? '<button type="button" id="archive-bot">Archive</button>' : ''}
+        \${!inArchive && !inActivity && !inGroup && state.bot && !gwSelected ? '<button type="button" id="archive-bot">Archive</button>' : ''}
         <button type="button" id="help" aria-haspopup="dialog">Help</button>
         <button type="button" id="takeover">Takeover</button>
         <button type="button" id="settings">Settings</button>
@@ -635,9 +749,13 @@ export const SPA_HTML = `<!DOCTYPE html>
           <span class="avatar" aria-hidden="true">📦</span>
           <span class="bot-meta"><strong>Archive</strong><span class="muted"> \${state.archived.length} teammate\${state.archived.length === 1 ? '' : 's'}</span></span>
         </button>
+        \${gatewayPin}
+        <h2>Groups</h2>
+        \${railGroups}
+        <button type="button" id="new-group">New group</button>
         <p class="muted desk-note">Shared desk · one browser · SendToAgent is how bots talk.</p>
       </nav>
-      <main class="thread" aria-label="\${inArchive ? 'Archive' : inActivity ? 'Activity' : 'Conversation'}">
+      <main class="thread" aria-label="\${inArchive ? 'Archive' : inActivity ? 'Activity' : inGroup ? 'Group' : 'Conversation'}">
         \${mainInner}
       </main>
       <div class="resize-side" id="resize-side" role="separator" aria-orientation="vertical" aria-label="Resize live work" tabindex="0"></div>
@@ -674,6 +792,7 @@ export const SPA_HTML = `<!DOCTYPE html>
     bind('#settings', openSettings);
     bind('#takeover', startTakeover);
     bind('#newbot', renderOnboard);
+    bind('#new-group', openNewGroup);
     bind('#help', openHelp);
     bind('#open-archive', openArchiveFolder);
     bind('#open-activity', openActivity);
@@ -690,6 +809,9 @@ export const SPA_HTML = `<!DOCTYPE html>
     });
     el.querySelectorAll('button.bot[data-id]').forEach(btn => {
       btn.onclick = () => selectBot(btn.getAttribute('data-id'));
+    });
+    el.querySelectorAll('[data-group]').forEach(btn => {
+      btn.onclick = () => selectGroup(btn.getAttribute('data-group'));
     });
     el.querySelectorAll('[data-a2a]').forEach(btn => {
       btn.onclick = () => selectBot(state.bot.id, btn.getAttribute('data-a2a'));
@@ -734,6 +856,8 @@ export const SPA_HTML = `<!DOCTYPE html>
     const last = state.messages[state.messages.length - 1];
     if (!last || last.role !== 'user' || last.origin === 'agent') return '';
     if (last._failed) return '';
+    // Group hello stores a user bubble and queues nobody.
+    if (state.view === 'group' && !last._pending && !last.turn_id) return '';
     const harness = state.compute && state.compute.harness;
     if (last._pending || harness === 'starting') return 'starting';
     if (harness === 'in_turn') return 'working';
@@ -742,9 +866,11 @@ export const SPA_HTML = `<!DOCTYPE html>
   }
 
   function senderLabel(m) {
-    if (m.role === 'user' && m.origin === 'user') return 'You';
+    if (m.role === 'user' && (m.origin === 'user' || !m.origin)) return 'You';
     if (m.origin === 'agent') return botName(m.from_bot_id) || 'Bot';
     if (m.origin === 'system') return 'System';
+    if (m.origin === 'federation') return m.remote_actor_name || 'Org';
+    if (m.from_bot_id) return botName(m.from_bot_id);
     return state.bot?.name || 'Teammate';
   }
 
@@ -758,12 +884,16 @@ export const SPA_HTML = `<!DOCTYPE html>
       empty.className = 'empty';
       empty.textContent = state.view === 'a2a'
         ? 'No handoff messages yet.'
+        : state.view === 'group'
+        ? 'No messages yet. @mention a teammate to loop them in.'
         : 'No messages yet. Say hello — Enter sends, Shift+Enter makes a new line.';
       box.append(empty);
     }
     for (const m of state.messages) {
       const li = document.createElement('li');
-      const kind = m.role === 'user' && m.origin !== 'agent' ? 'user' : m.origin === 'system' || m.origin === 'agent' ? 'system' : 'assistant';
+      const kind = m.origin === 'system' || m.origin === 'agent'
+        ? 'system'
+        : m.role === 'user' && m.origin !== 'thread' ? 'user' : 'assistant';
       li.className = 'msg ' + kind;
       if (m.origin === 'fallback') li.classList.add('fallback');
       if (m._pending) li.classList.add('pending');
@@ -791,6 +921,12 @@ export const SPA_HTML = `<!DOCTYPE html>
         const badge = document.createElement('div');
         badge.className = 'badge';
         badge.textContent = 'Pending your approval';
+        li.append(badge);
+      }
+      if (m.origin === 'federation' || m.remote_org_id) {
+        const badge = document.createElement('div');
+        badge.className = 'badge';
+        badge.textContent = m.remote_actor_name ? ('From ' + m.remote_actor_name) : 'Federation';
         li.append(badge);
       }
       const body = document.createElement('div');
@@ -880,10 +1016,16 @@ export const SPA_HTML = `<!DOCTYPE html>
     announce('Sending message');
     try {
       const res = await api('/v1/threads/' + state.thread.id + '/messages', { method:'POST', body: JSON.stringify({ body }) });
-      tmp.id = res.userMessageId;
-      tmp.turn_id = res.turnId;
+      if (res.userMessageId) tmp.id = res.userMessageId;
+      // Group 202 is { turnIds }; empty array is a successful hello, not a missing turnId.
+      if (Array.isArray(res.turnIds)) {
+        tmp.turn_id = res.turnIds[0] || null;
+        if (res.turnIds[0]) state.turn = res.turnIds[0];
+      } else if (res.turnId) {
+        tmp.turn_id = res.turnId;
+        state.turn = res.turnId;
+      }
       tmp._pending = false;
-      state.turn = res.turnId;
       paintMessages();
       announce('Message sent');
     } catch (e) {
@@ -1237,6 +1379,8 @@ export const SPA_HTML = `<!DOCTYPE html>
 
   function upsertMessage(m) {
     if (!m || !m.id) return;
+    // Per-turn @mention clones are not transcript bubbles.
+    if (m.origin === 'prompt') return;
     const tid = m.thread_id || m.threadId;
     const sameThread = state.thread && tid === state.thread.id;
     const botReply = state.view === 'human' && m.origin && m.origin !== 'user' && m.origin !== 'agent';
@@ -1252,14 +1396,18 @@ export const SPA_HTML = `<!DOCTYPE html>
   async function reloadThread() {
     if (state.view === 'activity') { void paintActivity(); return; }
     if (state.view === 'archive') return;
-    if (!state.bot) return;
     try {
-      const t = state.view === 'a2a' && state.thread
-        ? await api('/v1/threads/' + state.thread.id)
-        : await api('/v1/threads?botId=' + encodeURIComponent(state.bot.id));
+      let t;
+      if ((state.view === 'a2a' || state.view === 'group') && state.thread) {
+        t = await api('/v1/threads/' + state.thread.id);
+      } else if (state.bot) {
+        t = await api('/v1/threads?botId=' + encodeURIComponent(state.bot.id));
+      } else {
+        return;
+      }
       if (t.thread) state.thread = t.thread;
       const keepFailed = state.messages.filter(m => m._failed);
-      state.messages = t.messages || [];
+      state.messages = visibleMessages(t.messages);
       for (const f of keepFailed) {
         if (!state.messages.some(m => m.body === f.body && m.role === 'user')) state.messages.push(f);
       }
@@ -1295,7 +1443,7 @@ export const SPA_HTML = `<!DOCTYPE html>
     };
     ws.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
-      if (msg.type === 'message.created' && msg.message) upsertMessage(msg.message);
+      if (msg.type === 'message.created' && msg.message && msg.message.origin !== 'prompt') upsertMessage(msg.message);
       if (msg.type === 'turn.updated') void reloadThread();
       if (msg.type === 'live_work') {
         if (msg.turnId) state.turn = msg.turnId;
@@ -1411,8 +1559,13 @@ export const SPA_HTML = `<!DOCTYPE html>
   async function refreshRoster() {
     const bots = await api('/v1/bots');
     state.bots = bots.bots || [];
+    state.gateway = bots.gateway || null;
     state.archived = bots.archived || [];
     if (bots.archiveTtlMs) state.archiveTtlMs = bots.archiveTtlMs;
+    if (state.bot) {
+      state.bot = state.bots.find(b => b.id === state.bot.id)
+        || (state.gateway && state.gateway.id === state.bot.id ? state.gateway : state.bot);
+    }
   }
 
   async function openArchiveFolder() {
@@ -1422,7 +1575,7 @@ export const SPA_HTML = `<!DOCTYPE html>
   }
 
   async function archiveCurrentBot() {
-    if (!state.bot) return;
+    if (!state.bot || isGatewayBot(state.bot)) return;
     const name = state.bot.name;
     const id = state.bot.id;
     const ok = await askConfirm({
@@ -1510,12 +1663,22 @@ export const SPA_HTML = `<!DOCTYPE html>
   }
 
   async function openSettings() {
+    try { state.org = await api('/v1/org'); } catch { state.org = state.org || {}; }
+    const fedOn = Boolean(state.org && state.org.federationEnabled);
     const overlay = h(\`<div class="overlay"><div class="modal">
       <h2 id="set-title">Settings</h2>
       <p class="muted">\${harnessBlurb()}</p>
+      <h2 style="margin-top:8px;font-size:1rem">Federation</h2>
+      <p class="muted" id="fed-state">\${fedOn ? 'Federation is on. Gateway may send and receive org mail.' : 'Federation is off. Gateway will not talk to other orgs.'}</p>
+      <div class="seg" role="group" aria-label="Federation">
+        <button type="button" id="fed-on" aria-pressed="\${fedOn ? 'true' : 'false'}">On</button>
+        <button type="button" id="fed-off" aria-pressed="\${fedOn ? 'false' : 'true'}">Off</button>
+      </div>
+      <p class="err" id="fed-err" hidden></p>
       <label for="set-key">API key override (optional)</label>
       <input id="set-key" type="password" autocomplete="off" placeholder="leave blank to use grok login" />
       \${inferenceFields('set-model', 'set-effort')}
+      <div id="desk-controls">
       <label for="mode">Permission mode</label>
       <select id="mode">
         <option value="auto">Auto</option>
@@ -1523,6 +1686,7 @@ export const SPA_HTML = `<!DOCTYPE html>
         <option value="always-approve">Always-approve</option>
       </select>
       <label><input type="checkbox" id="approve" /> Require approval for SendMessage</label>
+      </div>
       <h2 style="margin-top:16px;font-size:1rem">OpenAI-compatible keys</h2>
       <p class="muted">For Open WebUI or any OpenAI client. Base URL <code>\${location.origin}/v1</code>, model <code>openbot/\${escapeHtml(state.bot?.name || 'Ada')}</code>.</p>
       <ul id="key-list" class="muted"></ul>
@@ -1547,23 +1711,64 @@ export const SPA_HTML = `<!DOCTYPE html>
     overlay.querySelector('.modal').setAttribute('aria-labelledby', 'set-title');
     const close = openOverlay(overlay);
     overlay.querySelector('#close').onclick = close;
-    if (state.bot) {
+    const gwView = isGatewayBot(state.bot);
+    if (gwView) {
+      const desk = overlay.querySelector('#desk-controls');
+      if (desk) desk.hidden = true;
+      const arch = overlay.querySelector('#archive');
+      if (arch) arch.hidden = true;
+    }
+    if (state.bot && !gwView) {
       overlay.querySelector('#mode').value = state.bot.permission_mode || 'auto';
       overlay.querySelector('#approve').checked = Boolean(Number(state.bot.require_human_approval));
     }
+    function paintFedState() {
+      const on = Boolean(state.org && state.org.federationEnabled);
+      overlay.querySelector('#fed-on').setAttribute('aria-pressed', on ? 'true' : 'false');
+      overlay.querySelector('#fed-off').setAttribute('aria-pressed', on ? 'false' : 'true');
+      overlay.querySelector('#fed-state').textContent = on
+        ? 'Federation is on. Gateway may send and receive org mail.'
+        : 'Federation is off. Gateway will not talk to other orgs.';
+      const lab = document.querySelector('#open-gateway .presence');
+      if (lab && state.gateway) lab.textContent = state.gateway.enabled ? 'Federation on' : 'Federation off';
+    }
+    async function setFederation(on) {
+      const err = overlay.querySelector('#fed-err');
+      try {
+        const res = await api('/v1/org', { method:'PATCH', body: JSON.stringify({ federationEnabled: on }) });
+        state.org = res;
+        if (state.gateway) state.gateway.enabled = Boolean(res.federationEnabled);
+        paintFedState();
+        if (on && !res.federationEnabled) {
+          err.hidden = false;
+          err.textContent = 'Federation stayed off. OPENBOT_FEDERATION=0 overrides the toggle.';
+        } else {
+          err.hidden = true;
+        }
+      } catch (e) {
+        err.hidden = false;
+        err.textContent = e.message || 'Could not update federation';
+      }
+    }
+    overlay.querySelector('#fed-on').onclick = () => setFederation(true);
+    overlay.querySelector('#fed-off').onclick = () => setFederation(false);
     bindInferenceSelects(overlay, '#set-model', '#set-effort');
     overlay.querySelector('#save').onclick = async () => {
       const key = overlay.querySelector('#set-key').value.trim();
       if (key) await api('/v1/credentials/xai', { method:'PUT', body: JSON.stringify({ key }) });
-      await api('/v1/bots/' + state.bot.id + '/settings', { method:'PATCH', body: JSON.stringify({
-        permissionMode: overlay.querySelector('#mode').value,
-        requireHumanApproval: overlay.querySelector('#approve').checked,
-        model: overlay.querySelector('#set-model')?.value,
-        reasoningEffort: overlay.querySelector('#set-effort')?.value,
-      }) });
       if (state.bot) {
-        state.bot.model = overlay.querySelector('#set-model')?.value || state.bot.model;
-        state.bot.reasoning_effort = overlay.querySelector('#set-effort')?.value || state.bot.reasoning_effort;
+        const payload = {
+          model: overlay.querySelector('#set-model')?.value,
+          reasoningEffort: overlay.querySelector('#set-effort')?.value,
+        };
+        if (!isGatewayBot(state.bot)) {
+          payload.permissionMode = overlay.querySelector('#mode').value;
+          payload.requireHumanApproval = overlay.querySelector('#approve').checked;
+        }
+        await api('/v1/bots/' + state.bot.id + '/settings', { method:'PATCH', body: JSON.stringify(payload) });
+        state.bot.model = payload.model || state.bot.model;
+        state.bot.reasoning_effort = payload.reasoningEffort || state.bot.reasoning_effort;
+        if (isGatewayBot(state.bot)) state.gateway = state.bot;
       }
       close();
     };
