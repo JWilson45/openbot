@@ -40,3 +40,18 @@ export function ensureBotProject(desk: string, botId: string, name: string): str
 export function deleteBotProject(desk: string, botId: string): void {
   rmSync(resolvedBotProject(desk, botId), { recursive: true, force: true });
 }
+
+export function gatewayWorkspaceDir(desk: string): string {
+  return join(desk, ".openbot", "gateway");
+}
+
+/** Diplomat cwd. Not a project folder and not isolation. */
+export function ensureGatewayWorkspace(desk: string): string {
+  const dir = resolve(gatewayWorkspaceDir(desk));
+  const expected = resolve(desk, ".openbot", "gateway");
+  if (dir !== expected || !isInsideDesk(desk, dir)) {
+    throw new Error("gateway workspace path must be desk/.openbot/gateway");
+  }
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}

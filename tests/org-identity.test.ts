@@ -27,7 +27,13 @@ async function runOpenbot(
   env?: Record<string, string | undefined>,
 ): Promise<{ stdout: string; stderr: string; code: number }> {
   const spawned: Record<string, string | undefined> = { ...process.env, ...env };
-  for (const key of ["OPENBOT_ORG_ID", "OPENBOT_ORG_SLUG", "OPENBOT_ORG_NAME", "OPENBOT_PUBLIC_ORIGIN"] as const) {
+  for (const key of [
+    "OPENBOT_ORG_ID",
+    "OPENBOT_ORG_SLUG",
+    "OPENBOT_ORG_NAME",
+    "OPENBOT_PUBLIC_ORIGIN",
+    "OPENBOT_FEDERATION",
+  ] as const) {
     if (env && Object.prototype.hasOwnProperty.call(env, key)) continue;
     delete spawned[key];
   }
@@ -230,6 +236,45 @@ describe("org HTTP", () => {
     expect(json).not.toHaveProperty("gateway");
     server.stop(true);
   });
+
+  test("PATCH /v1/org toggles federationEnabled; env 0 still wins", async () => {
+    const { server, origin, ctx } = startTestServer({ home: tempHome() });
+    const { cookie } = loginCookie({ ctx }, "alice");
+    const headers = { cookie, "content-type": "application/json" };
+    const anon = await fetch(`${origin}/v1/org`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ federationEnabled: true }),
+    });
+    expect(anon.status).toBe(401);
+    const on = await fetch(`${origin}/v1/org`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ federationEnabled: true }),
+    });
+    expect(on.status).toBe(200);
+    const stored = (await on.json()) as { federationEnabled: boolean };
+    expect(stored.federationEnabled).toBe(true);
+    expect(currentOrgMeta(ctx.db)?.federation_enabled).toBe(1);
+    const prev = process.env.OPENBOT_FEDERATION;
+    process.env.OPENBOT_FEDERATION = "0";
+    try {
+      const info = await fetch(`${origin}/fed/v1/info`).then((r) => r.json()) as {
+        caps: { federation: string };
+      };
+      expect(info.caps.federation).toBe("off");
+    } finally {
+      if (prev === undefined) delete process.env.OPENBOT_FEDERATION;
+      else process.env.OPENBOT_FEDERATION = prev;
+    }
+    const off = await fetch(`${origin}/v1/org`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ federationEnabled: false }),
+    });
+    expect(((await off.json()) as { federationEnabled: boolean }).federationEnabled).toBe(false);
+    server.stop(true);
+  });
 });
 
 describe("openbot org CLI", () => {
@@ -304,6 +349,45 @@ describe("openbot org CLI", () => {
     expect(bad.stderr).toContain("invalid org slug");
     const fqdn = await runOpenbot(["org", "init", "--home", home, "--slug", "acme.example.com"]);
     expect(fqdn.code).not.toBe(0);
+  });
+
+  test("openbot gateway on|off writes DB and does not delete Gateway", async () => {
+    const home = tempHome();
+    const created = startTestServer({ home });
+    loginCookie({ ctx: created.ctx }, "alice");
+    const gw = created.ctx.db.get<{ id: string; name: string }>(
+      "SELECT id, name FROM bots WHERE IFNULL(role, 'desk') = 'gateway'",
+    );
+    expect(gw).toBeTruthy();
+    created.server.stop(true);
+
+    const on = await runOpenbot(["gateway", "on", "--home", home]);
+    expect(on.code).toBe(0);
+    const onJson = JSON.parse(on.stdout.trim()) as {
+      federationEnabled: boolean;
+      gateway: { id: string; name: string } | null;
+    };
+    expect(onJson.federationEnabled).toBe(true);
+    expect(onJson.gateway?.id).toBe(gw!.id);
+
+    const prev = process.env.OPENBOT_FEDERATION;
+    const envOff = await runOpenbot(["gateway", "on", "--home", home], { OPENBOT_FEDERATION: "0" });
+    expect(envOff.code).toBe(0);
+    expect((JSON.parse(envOff.stdout.trim()) as { federationEnabled: boolean }).federationEnabled).toBe(
+      false,
+    );
+    if (prev === undefined) delete process.env.OPENBOT_FEDERATION;
+    else process.env.OPENBOT_FEDERATION = prev;
+
+    const off = await runOpenbot(["gateway", "off", "--home", home]);
+    expect(off.code).toBe(0);
+    expect((JSON.parse(off.stdout.trim()) as { federationEnabled: boolean }).federationEnabled).toBe(false);
+    const db = OpenbotDb.open(join(home, "openbot.sqlite"));
+    expect(db.get<{ n: number }>("SELECT COUNT(*) as n FROM bots WHERE id = ?", [gw!.id])?.n).toBe(1);
+    expect(db.get<{ federation_enabled: number }>("SELECT federation_enabled FROM org_meta")?.federation_enabled).toBe(
+      0,
+    );
+    db.close();
   });
 
   test("openbot demo does not persist listen origin over org.json", async () => {

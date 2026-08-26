@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS bots (
   require_human_approval integer NOT NULL DEFAULT 0,
   model text NOT NULL DEFAULT 'grok-4.6',
   reasoning_effort text NOT NULL DEFAULT 'high',
+  role text NOT NULL DEFAULT 'desk',
   created_at integer NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS bots_active_name ON bots(account_id, name) WHERE status = 'active';
@@ -251,6 +252,8 @@ export class OpenbotDb {
     this.ensureColumn("bots", "archived_at", "integer");
     this.ensureColumn("bots", "model", "text NOT NULL DEFAULT 'grok-4.6'");
     this.ensureColumn("bots", "reasoning_effort", "text NOT NULL DEFAULT 'high'");
+    this.ensureColumn("bots", "role", "text NOT NULL DEFAULT 'desk'");
+    this.ensureColumn("org_meta", "federation_enabled", "integer NOT NULL DEFAULT 0");
     this.raw.exec(
       "UPDATE bots SET archived_at = created_at WHERE status = 'archived' AND archived_at IS NULL",
     );
@@ -352,7 +355,13 @@ export const MAX_ACTIVE_BOTS = 6;
 /** Archived bots are purged this long after archive unless restored. */
 export const ARCHIVE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
+export function isGatewayRole(role: string | null | undefined): boolean {
+  return role === "gateway";
+}
+
 export function deleteBotPermanently(db: OpenbotDb, botId: string): void {
+  const row = db.get<{ role: string | null }>("SELECT role FROM bots WHERE id = ?", [botId]);
+  if (isGatewayRole(row?.role)) return;
   db.immediate(() => {
     // Membership rows FK to bots; drop this bot before the bots DELETE.
     db.run(`DELETE FROM thread_participants WHERE bot_id = ?`, [botId]);

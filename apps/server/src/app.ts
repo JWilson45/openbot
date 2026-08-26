@@ -9,6 +9,7 @@ import {
   OpenbotDb,
   deleteBotPermanently,
   id,
+  isGatewayRole,
   now,
   type TurnRow,
 } from "@openbot/db";
@@ -40,6 +41,7 @@ import {
   ensureOrgAccount,
   ensureOrgKeypair,
   ensureOrgMeta,
+  federationEffective,
   fedInfoPayload,
   FED_INFO_RATE_LIMIT,
   FED_INFO_RATE_WINDOW_MS,
@@ -50,8 +52,10 @@ import {
   orgMemberSnapshot,
   orgPeerPublic,
   parsePeerBaseUrl,
+  setFederationEnabled,
   SlidingWindowRateLimiter,
 } from "./org.ts";
+import { findActiveGateway, provisionOrgGateway } from "./gateway.ts";
 
 export type HomeConfig = {
   home: string;
@@ -130,6 +134,7 @@ export function createApp(cfg: HomeConfig): {
     publicOrigin: cfg.publicOrigin,
     advertisedOrigin,
   });
+  provisionOrgGateway(db, cfg.home);
   const master = loadOrCreateMasterKey(cfg.home, process.env.OPENBOT_MASTER_KEY);
   ensureOrgKeypair(cfg.home, master, db);
   const allowlist = loadAllowlist(cfg.home, process.env.OPENBOT_GITHUB_ALLOWLIST);
@@ -228,7 +233,8 @@ export function createApp(cfg: HomeConfig): {
     if (!fedInfoLimiter.take(key)) return c.json({ error: "rate_limited" }, 429);
     const row = currentOrgMeta(db);
     if (!row) return c.json({ error: "no_org" }, 500);
-    return c.json(fedInfoPayload(row));
+    const gw = row.account_id ? findActiveGateway(db, row.account_id) : undefined;
+    return c.json(fedInfoPayload(row, gw ? { name: gw.name } : null));
   });
 
   app.get("/", (c) => c.html(SPA_HTML));
@@ -278,6 +284,7 @@ export function createApp(cfg: HomeConfig): {
         name: user.name,
         email: user.email,
       });
+      provisionOrgGateway(db, cfg.home);
       c.header("Set-Cookie", cookieHeader(session.token, ctx.publicOrigin.startsWith("https")));
       return c.redirect("/");
     } catch (err) {
@@ -302,6 +309,7 @@ export function createApp(cfg: HomeConfig): {
     const login = String(c.req.query("login") ?? "demo").trim().toLowerCase();
     try {
       const session = completeGithubLogin(db, allowlist, { login });
+      provisionOrgGateway(db, cfg.home);
       c.header("Set-Cookie", cookieHeader(session.token, false));
       return c.redirect("/");
     } catch (err) {
@@ -339,6 +347,21 @@ export function createApp(cfg: HomeConfig): {
     } catch {
       return c.json({ error: "unauthorized" }, 401);
     }
+  });
+
+  app.patch("/v1/org", async (c) => {
+    requireSession(c);
+    const body = (await c.req.json()) as { federationEnabled?: unknown };
+    if ("federationEnabled" in body) {
+      if (typeof body.federationEnabled !== "boolean") {
+        return c.json({ error: "invalid_federation" }, 400);
+      }
+      setFederationEnabled(db, body.federationEnabled);
+      if (!federationEffective(currentOrgMeta(db))) ctx.engine.stopGatewayAcps();
+    }
+    const row = currentOrgMeta(db);
+    if (!row) return c.json({ error: "no_org" }, 500);
+    return c.json(orgMemberSnapshot(row));
   });
 
   const peerEnv = cfg.env ?? process.env;
@@ -429,13 +452,15 @@ export function createApp(cfg: HomeConfig): {
 
   app.post("/v1/bots", async (c) => {
     const s = requireSession(c);
+    provisionOrgGateway(db, cfg.home);
     const body = await c.req.json();
+    if (body.role != null) return c.json({ error: "invalid_role" }, 400);
     const name = String(body.name ?? "").trim();
     const description = String(body.description ?? "");
     if (!name) return c.json({ error: "name required" }, 400);
     const normalized = name.trim();
     const active = db.get<{ n: number }>(
-      "SELECT COUNT(*) as n FROM bots WHERE account_id = ? AND status = 'active'",
+      "SELECT COUNT(*) AS n FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'desk'",
       [s.accountId],
     );
     if ((active?.n ?? 0) >= MAX_ACTIVE_BOTS) return c.json({ error: "cap" }, 409);
@@ -489,16 +514,30 @@ export function createApp(cfg: HomeConfig): {
 
   app.get("/v1/bots", (c) => {
     const s = requireSession(c);
+    provisionOrgGateway(db, cfg.home);
     ctx.engine.purgeExpiredArchives(s.accountId);
-    const bots = db.all("SELECT * FROM bots WHERE account_id = ? AND status = 'active' ORDER BY created_at", [
-      s.accountId,
-    ]);
-    const archived = db.all(
-      "SELECT * FROM bots WHERE account_id = ? AND status = 'archived' ORDER BY archived_at DESC",
+    const bots = db.all(
+      "SELECT * FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'desk' ORDER BY created_at",
       [s.accountId],
     );
+    const archived = db.all(
+      "SELECT * FROM bots WHERE account_id = ? AND status = 'archived' AND IFNULL(role, 'desk') = 'desk' ORDER BY archived_at DESC",
+      [s.accountId],
+    );
+    const gatewayRow = db.get(
+      "SELECT * FROM bots WHERE account_id = ? AND IFNULL(role, 'desk') = 'gateway' AND status = 'active'",
+      [s.accountId],
+    ) as { id: string } | undefined;
+    const org = currentOrgMeta(db);
     return c.json({
       bots: bots.map((b) => ({ ...(b as object), presence: botPresence(ctx, (b as { id: string }).id) })),
+      gateway: gatewayRow
+        ? {
+            ...(gatewayRow as object),
+            presence: botPresence(ctx, gatewayRow.id),
+            enabled: federationEffective(org),
+          }
+        : null,
       archived,
       bot: bots[0] ?? null,
       archiveTtlMs: ARCHIVE_TTL_MS,
@@ -507,11 +546,12 @@ export function createApp(cfg: HomeConfig): {
 
   app.post("/v1/bots/:id/archive", (c) => {
     const s = requireSession(c);
-    const bot = db.get<{ id: string; name: string; status: string }>(
-      "SELECT id, name, status FROM bots WHERE id = ? AND account_id = ?",
+    const bot = db.get<{ id: string; name: string; status: string; role: string | null }>(
+      "SELECT id, name, status, role FROM bots WHERE id = ? AND account_id = ?",
       [c.req.param("id"), s.accountId],
     );
     if (!bot) return c.json({ error: "not_found" }, 404);
+    if (isGatewayRole(bot.role)) return c.json({ error: "gateway_protected" }, 409);
     if (bot.status !== "active") return c.json({ error: "not_active" }, 409);
     const t = now();
     db.run("UPDATE bots SET status = 'archived', archived_at = ? WHERE id = ?", [t, bot.id]);
@@ -527,14 +567,15 @@ export function createApp(cfg: HomeConfig): {
   app.post("/v1/bots/:id/restore", (c) => {
     const s = requireSession(c);
     ctx.engine.purgeExpiredArchives(s.accountId);
-    const bot = db.get<{ id: string; name: string; status: string }>(
-      "SELECT id, name, status FROM bots WHERE id = ? AND account_id = ?",
+    const bot = db.get<{ id: string; name: string; status: string; role: string | null }>(
+      "SELECT id, name, status, role FROM bots WHERE id = ? AND account_id = ?",
       [c.req.param("id"), s.accountId],
     );
     if (!bot) return c.json({ error: "not_found" }, 404);
+    if (isGatewayRole(bot.role)) return c.json({ error: "gateway_protected" }, 409);
     if (bot.status !== "archived") return c.json({ error: "not_archived" }, 409);
     const active = db.get<{ n: number }>(
-      "SELECT COUNT(*) as n FROM bots WHERE account_id = ? AND status = 'active'",
+      "SELECT COUNT(*) AS n FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'desk'",
       [s.accountId],
     );
     if ((active?.n ?? 0) >= MAX_ACTIVE_BOTS) return c.json({ error: "cap" }, 409);
@@ -557,11 +598,12 @@ export function createApp(cfg: HomeConfig): {
     if (String(body.confirm ?? "").trim().toUpperCase() !== "DELETE") {
       return { status: 400 as const, json: { error: "confirm", message: "Type DELETE to permanently delete" } };
     }
-    const bot = db.get<{ id: string; status: string }>(
-      "SELECT id, status FROM bots WHERE id = ? AND account_id = ?",
+    const bot = db.get<{ id: string; status: string; role: string | null }>(
+      "SELECT id, status, role FROM bots WHERE id = ? AND account_id = ?",
       [c.req.param("id"), accountId],
     );
     if (!bot) return { status: 404 as const, json: { error: "not_found" } };
+    if (isGatewayRole(bot.role)) return { status: 409 as const, json: { error: "gateway_protected" } };
     if (bot.status !== "archived") return { status: 409 as const, json: { error: "archive_first" } };
     void ctx.engine.runnerFor(accountId).acpFor(bot.id)?.kill();
     deleteBotPermanently(db, bot.id);
@@ -595,11 +637,12 @@ export function createApp(cfg: HomeConfig): {
   app.patch("/v1/bots/:id", async (c) => {
     const s = requireSession(c);
     const body = await c.req.json();
-    const bot = db.get<{ id: string }>("SELECT id FROM bots WHERE id = ? AND account_id = ?", [
-      c.req.param("id"),
-      s.accountId,
-    ]);
+    const bot = db.get<{ id: string; role: string | null }>(
+      "SELECT id, role FROM bots WHERE id = ? AND account_id = ?",
+      [c.req.param("id"), s.accountId],
+    );
     if (!bot) return c.json({ error: "not_found" }, 404);
+    if (isGatewayRole(bot.role) && body.name) return c.json({ error: "gateway_protected" }, 409);
     if (body.name) db.run("UPDATE bots SET name = ? WHERE id = ?", [String(body.name), bot.id]);
     if (body.description != null) db.run("UPDATE bots SET description = ? WHERE id = ?", [String(body.description), bot.id]);
     return c.json({ ok: true });
@@ -612,11 +655,18 @@ export function createApp(cfg: HomeConfig): {
       id: string;
       model: string | null;
       reasoning_effort: string | null;
-    }>("SELECT id, model, reasoning_effort FROM bots WHERE id = ? AND account_id = ?", [
+      role: string | null;
+    }>("SELECT id, model, reasoning_effort, role FROM bots WHERE id = ? AND account_id = ?", [
       c.req.param("id"),
       s.accountId,
     ]);
     if (!bot) return c.json({ error: "not_found" }, 404);
+    if (
+      isGatewayRole(bot.role) &&
+      (body.permissionMode != null || body.harness != null || body.requireHumanApproval != null)
+    ) {
+      return c.json({ error: "gateway_protected" }, 409);
+    }
     const catalog = listGrokModels(cfg.home);
     let model = bot.model || "";
     let reasoningEffort = bot.reasoning_effort || "";
@@ -748,7 +798,11 @@ export function createApp(cfg: HomeConfig): {
           [s.accountId, botId],
         )
       : db.get(
-          "SELECT * FROM threads WHERE account_id = ? AND IFNULL(kind,'human') = 'human' ORDER BY created_at LIMIT 1",
+          `SELECT t.* FROM threads t
+           JOIN bots b ON b.id = t.bot_id
+           WHERE t.account_id = ? AND IFNULL(t.kind,'human') = 'human'
+             AND IFNULL(b.role, 'desk') = 'desk'
+           ORDER BY t.created_at LIMIT 1`,
           [s.accountId],
         );
     const messages = thread ? db.all(VISIBLE_MESSAGES_SQL, [(thread as { id: string }).id]) : [];

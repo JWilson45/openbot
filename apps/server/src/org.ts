@@ -180,6 +180,27 @@ export function ensureOrgAccount(
   });
 }
 
+/** DB flag AND env panic. Env `0` wins; env cannot force on. */
+export function federationEffective(
+  row?: OrgMetaRow | null,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  if (!row || row.federation_enabled !== 1) return false;
+  return env.OPENBOT_FEDERATION !== "0";
+}
+
+export const FEDERATION_OFF_NOTICE =
+  "Federation is off. Turn it on in Settings to send or receive org mail.";
+
+export function setFederationEnabled(db: OpenbotDb, enabled: boolean): OrgMetaRow {
+  const stored = currentOrgMeta(db);
+  if (!stored) throw new Error("org_meta missing");
+  db.run("UPDATE org_meta SET federation_enabled = ? WHERE id = 'current'", [enabled ? 1 : 0]);
+  const row = currentOrgMeta(db);
+  if (!row) throw new Error("org_meta write failed");
+  return row;
+}
+
 export function ensureOrgMeta(db: OpenbotDb, opts: EnsureOrgMetaOpts = {}): OrgMetaRow {
   const env = opts.env ?? process.env;
   const file = opts.file ? readOrgFile(opts.file) : {};
@@ -252,29 +273,36 @@ export function orgMemberSnapshot(row: OrgMetaRow): {
   };
 }
 
-export function orgCliSnapshot(row: OrgMetaRow): {
+export function orgCliSnapshot(
+  row: OrgMetaRow,
+  gateway: { id: string; name: string } | null = null,
+): {
   orgId: string;
   slug: string;
   name: string;
   publicOrigin: string | null;
   pubkey: string;
   federationEnabled: boolean;
-  gateway: null;
+  gateway: { id: string; name: string } | null;
 } {
   return {
     ...orgMemberSnapshot(row),
+    federationEnabled: federationEffective(row),
     pubkey: row.pubkey || "",
-    gateway: null,
+    gateway,
   };
 }
 
-export function fedInfoPayload(row: OrgMetaRow): {
+export function fedInfoPayload(
+  row: OrgMetaRow,
+  gateway: { name: string } | null = null,
+): {
   orgId: string;
   slug: string;
   name: string;
   publicOrigin: string | null;
   pubkey: string;
-  gateway: null;
+  gateway: { name: string } | null;
   caps: {
     protocol: string;
     federation: "off" | "on";
@@ -291,10 +319,10 @@ export function fedInfoPayload(row: OrgMetaRow): {
     name: row.name,
     publicOrigin: row.public_origin,
     pubkey: row.pubkey || "",
-    gateway: null,
+    gateway,
     caps: {
       protocol: "openbot-fed/1",
-      federation: "off",
+      federation: federationEffective(row) ? "on" : "off",
       maxBodyBytes: 32_000,
       maxRequestBytes: 65_536,
       attachments: false,

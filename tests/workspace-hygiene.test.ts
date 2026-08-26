@@ -6,6 +6,8 @@ import {
   botProjectDir,
   deleteBotProject,
   ensureBotProject,
+  ensureGatewayWorkspace,
+  gatewayWorkspaceDir,
   isInsideDesk,
   LocalHostRunner,
 } from "@openbot/runner";
@@ -58,6 +60,18 @@ describe("bot project workspace", () => {
     expect(existsSync(desk)).toBe(true);
     expect(existsSync(join(desk, "keep.txt"))).toBe(true);
     expect(existsSync(join(victim, "x.txt"))).toBe(true);
+  });
+
+  test("ensureGatewayWorkspace is desk/.openbot/gateway not a project dir", () => {
+    const home = tempHome();
+    const desk = join(home, "desk");
+    const dir = ensureGatewayWorkspace(desk);
+    expect(dir).toBe(gatewayWorkspaceDir(desk));
+    expect(dir).toBe(join(desk, ".openbot", "gateway"));
+    expect(existsSync(dir)).toBe(true);
+    expect(dir.includes("projects")).toBe(false);
+    const runner = new LocalHostRunner(home, "acct");
+    expect(runner.ensureGatewayWorkspace()).toBe(dir);
   });
 
   test("isInsideDesk", () => {

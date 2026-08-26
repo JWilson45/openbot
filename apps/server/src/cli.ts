@@ -17,8 +17,10 @@ import {
   orgCliSnapshot,
   OrgPeerError,
   orgPeerPublic,
+  setFederationEnabled,
   writeOrgJson,
 } from "./org.ts";
+import { findActiveGateway } from "./gateway.ts";
 
 function defaultHome(): string {
   return process.env.OPENBOT_HOME || join(homedir(), ".openbot");
@@ -94,6 +96,7 @@ Usage:
   openbot install [--user] [--home ~/.openbot] [--port 8787] [--start]
   openbot org [--home ~/.openbot]
   openbot org init [--home ~/.openbot] [--slug acme] [--name "Acme"]
+  openbot gateway on | off [--home ~/.openbot]
   openbot peers [--home ~/.openbot]
   openbot peers add --slug beta --url https://beta.example.com --pubkey <b64> --org-id <uuid>
   openbot peers remove --id <orgId>
@@ -106,6 +109,7 @@ Usage:
   install  write a launchd LaunchAgent or systemd --user unit. Never requires root.
   org      print instance identity JSON including pubkey. Works with zero users.
   org init write org.json and upsert org_meta (org_id is never rotated).
+  gateway  write org_meta.federation_enabled. Env OPENBOT_FEDERATION=0 still wins. Does not delete Gateway.
   peers    list, add, or remove federation peers.
   version  print {"openbot","grokPin","grok"} JSON.
 
@@ -189,7 +193,35 @@ function orgCommand(): void {
     const row = currentOrgMeta(db);
     if (!row) throw new Error("org_meta write failed");
     if (init) writeOrgJson(join(home, "org.json"), row);
-    console.log(JSON.stringify(orgCliSnapshot(row)));
+    const gw = row.account_id ? findActiveGateway(db, row.account_id) : undefined;
+    console.log(JSON.stringify(orgCliSnapshot(row, gw ? { id: gw.id, name: gw.name } : null)));
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  } finally {
+    db.close();
+  }
+}
+
+function gatewayCommand(): void {
+  const home = arg("--home", defaultHome())!;
+  const sub = process.argv[3];
+  if (sub !== "on" && sub !== "off") {
+    console.error("usage: openbot gateway on|off [--home <dir>]");
+    process.exit(1);
+  }
+  mkdirSync(home, { recursive: true });
+  const db = OpenbotDb.open(join(home, "openbot.sqlite"));
+  try {
+    ensureOrgMeta(db, {
+      env: process.env,
+      file: join(home, "org.json"),
+      publicOrigin: process.env.OPENBOT_PUBLIC_ORIGIN,
+      advertisedOrigin: `http://127.0.0.1:${arg("--port", process.env.PORT ?? "8787")}`,
+    });
+    const row = setFederationEnabled(db, sub === "on");
+    const gw = row.account_id ? findActiveGateway(db, row.account_id) : undefined;
+    console.log(JSON.stringify(orgCliSnapshot(row, gw ? { id: gw.id, name: gw.name } : null)));
   } catch (err) {
     console.error(err instanceof Error ? err.message : String(err));
     process.exit(1);
@@ -401,8 +433,11 @@ if (cmd === "version" || cmd === "-v" || cmd === "--version") {
   }
 } else if (cmd === "org") {
   orgCommand();
+} else if (cmd === "gateway") {
+  gatewayCommand();
 } else if (cmd === "peers") {
   peersCommand();
+
 } else if (cmd === "install") {
   install();
 } else {

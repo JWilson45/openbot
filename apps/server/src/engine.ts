@@ -3,8 +3,14 @@ import { id, now, purgeExpiredArchivedBots, type OpenbotDb, type TurnRow } from 
 import { appendLiveWork, buildThreadDigest, insertMessage, promote, wrapPromptWithDigest } from "@openbot/live-work";
 import { mintMcpToken, persistMcpToken, type McpInflight } from "@openbot/mcp-send-message";
 import { open, type Envelope } from "@openbot/vault";
-import { deleteBotProject, LocalHostRunner } from "@openbot/runner";
+import {
+  acpIdleTtlMs,
+  deleteBotProject,
+  gatewayAcpIdleTtlMs,
+  LocalHostRunner,
+} from "@openbot/runner";
 import { DEFAULT_GROK_MODEL, DEFAULT_REASONING_EFFORT, grokCliSignedIn } from "@openbot/acp-grok";
+import { currentOrgMeta, FEDERATION_OFF_NOTICE, federationEffective } from "./org.ts";
 
 export type EngineOpts = {
   db: OpenbotDb;
@@ -40,7 +46,17 @@ export class TurnEngine {
         this.opts.onPush(accountId, { type: "live_work", turnId: turn.id, event: ev });
         if (ev.kind === "permission_request") {
           const reqId = String((ev.payload as { reqId?: string }).reqId ?? "");
-          if (r.permissionMode === "ask") {
+          const client = botId ? r.acpFor(botId) : r.acp;
+          const handler = client?.permissionHandler;
+          if (handler) {
+            void Promise.resolve(handler(ev)).then(
+              (res) => r.respondPermission(reqId, res.allow),
+              () => r.respondPermission(reqId, false),
+            );
+            return;
+          }
+          const mode = client?.permissionMode ?? r.permissionMode;
+          if (mode === "ask") {
             this.opts.onPush(accountId, {
               type: "permission_request",
               turnId: turn.id,
@@ -84,14 +100,24 @@ export class TurnEngine {
   }
 
   reapIdleHarnesses(): void {
+    const federationOff = !federationEffective(currentOrgMeta(this.opts.db));
     for (const runner of this.runners.values()) {
-      const killed = runner.reapIdle();
+      const killed = runner.reapIdle(Date.now(), { federationOff });
       for (const botId of killed) {
         this.opts.db.run(
           "UPDATE harness_sessions SET state = 'ended', ended_at = ? WHERE bot_id = ? AND ended_at IS NULL",
           [now(), botId],
         );
       }
+    }
+  }
+
+  stopGatewayAcps(): void {
+    const rows = this.opts.db.all<{ id: string; account_id: string }>(
+      `SELECT id, account_id FROM bots WHERE IFNULL(role, 'desk') = 'gateway' AND status = 'active'`,
+    );
+    for (const row of rows) {
+      this.runners.get(row.account_id)?.invalidateAcp(row.id);
     }
   }
 
@@ -180,6 +206,7 @@ export class TurnEngine {
       permission_mode: string;
       model: string | null;
       reasoning_effort: string | null;
+      role: string | null;
     }>("SELECT * FROM bots WHERE id = ?", [turn.bot_id]);
     if (!bot) return;
 
@@ -193,10 +220,39 @@ export class TurnEngine {
       "SELECT * FROM compute_instances WHERE account_id = ?",
       [bot.account_id],
     );
+    const isGateway = bot.role === "gateway";
+    const org = currentOrgMeta(this.opts.db);
     const runner = this.runnerFor(bot.account_id);
     runner.permissionMode = (bot.permission_mode as typeof runner.permissionMode) || "auto";
     await runner.ensure(bot.account_id);
-    const cwd = runner.ensureProject(bot.id, bot.name);
+    const cwd = isGateway ? runner.ensureGatewayWorkspace() : runner.ensureProject(bot.id, bot.name);
+
+    if (isGateway && !federationEffective(org)) {
+      runner.invalidateAcp(bot.id);
+      this.opts.db.run("UPDATE turns SET status = 'running', started_at = ? WHERE id = ?", [
+        now(),
+        turn.id,
+      ]);
+      this.opts.onPush(bot.account_id, { type: "turn.updated", turnId: turn.id, status: "running" });
+      insertMessage(this.opts.db, {
+        threadId: turn.thread_id,
+        turnId: turn.id,
+        role: "system",
+        origin: "system",
+        body: FEDERATION_OFF_NOTICE,
+      });
+      // skip promote() empty-turn placeholder; the system line is the reply
+      this.opts.db.run("UPDATE turns SET sent_message_count = 1 WHERE id = ?", [turn.id]);
+      promote(this.opts.db, turn.id, { kind: "acp_done", stopReason: "end_turn", assistantText: "" });
+      this.opts.onPush(bot.account_id, { type: "turn.updated", turnId: turn.id, status: "completed" });
+      const msgs = this.opts.db.all("SELECT * FROM messages WHERE turn_id = ? ORDER BY created_at", [
+        turn.id,
+      ]);
+      for (const m of msgs) {
+        this.opts.onPush(bot.account_id, { type: "message.created", message: m });
+      }
+      return;
+    }
 
     const cred = this.opts.db.get<{ ciphertext: Uint8Array; dek_wrapped: Uint8Array; key_id: string }>(
       "SELECT ciphertext, dek_wrapped, key_id FROM credentials WHERE account_id = ? AND kind = 'xai_api_key'",
@@ -301,6 +357,11 @@ export class TurnEngine {
         permissionMode: bot.permission_mode as "ask" | "auto" | "always-approve",
         model,
         reasoningEffort,
+        role: isGateway ? "gateway" : "desk",
+        orgId: org?.org_id,
+        orgSlug: org?.slug,
+        idleTtlMs: isGateway ? gatewayAcpIdleTtlMs() : acpIdleTtlMs(),
+        omitCdp: isGateway,
       });
       this.opts.db.run("UPDATE harness_sessions SET acp_session_id = ? WHERE id = ?", [
         runner.acpSessionId ?? null,

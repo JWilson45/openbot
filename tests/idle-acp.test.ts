@@ -1,28 +1,46 @@
 import { describe, expect, test } from "bun:test";
-import { DEFAULT_ACP_IDLE_MS, acpIdleTtlMs } from "@openbot/runner";
+import {
+  DEFAULT_ACP_IDLE_MS,
+  DEFAULT_GATEWAY_ACP_IDLE_MS,
+  acpIdleTtlMs,
+  gatewayAcpIdleTtlMs,
+} from "@openbot/runner";
 import { fakeAgentCommand, tempHome } from "./helpers.ts";
 import { loginCookie, startTestServer } from "../apps/server/src/test-helpers.ts";
 
-function withIdleMs<T>(value: string | undefined, fn: () => T): T {
-  const prev = process.env.OPENBOT_ACP_IDLE_MS;
+function withEnv<T>(key: string, value: string | undefined, fn: () => T): T {
+  const prev = process.env[key];
   try {
-    if (value === undefined) delete process.env.OPENBOT_ACP_IDLE_MS;
-    else process.env.OPENBOT_ACP_IDLE_MS = value;
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
     return fn();
   } finally {
-    if (prev === undefined) delete process.env.OPENBOT_ACP_IDLE_MS;
-    else process.env.OPENBOT_ACP_IDLE_MS = prev;
+    if (prev === undefined) delete process.env[key];
+    else process.env[key] = prev;
   }
 }
 
 describe("acpIdleTtlMs", () => {
   test("defaults, disables at 0, and rejects invalid values", () => {
-    expect(withIdleMs(undefined, acpIdleTtlMs)).toBe(DEFAULT_ACP_IDLE_MS);
-    expect(withIdleMs("", acpIdleTtlMs)).toBe(DEFAULT_ACP_IDLE_MS);
-    expect(withIdleMs("0", acpIdleTtlMs)).toBe(0);
-    expect(withIdleMs("80", acpIdleTtlMs)).toBe(80);
-    expect(withIdleMs("-1", acpIdleTtlMs)).toBe(DEFAULT_ACP_IDLE_MS);
-    expect(withIdleMs("nope", acpIdleTtlMs)).toBe(DEFAULT_ACP_IDLE_MS);
+    expect(withEnv("OPENBOT_ACP_IDLE_MS", undefined, acpIdleTtlMs)).toBe(DEFAULT_ACP_IDLE_MS);
+    expect(withEnv("OPENBOT_ACP_IDLE_MS", "", acpIdleTtlMs)).toBe(DEFAULT_ACP_IDLE_MS);
+    expect(withEnv("OPENBOT_ACP_IDLE_MS", "0", acpIdleTtlMs)).toBe(0);
+    expect(withEnv("OPENBOT_ACP_IDLE_MS", "80", acpIdleTtlMs)).toBe(80);
+    expect(withEnv("OPENBOT_ACP_IDLE_MS", "-1", acpIdleTtlMs)).toBe(DEFAULT_ACP_IDLE_MS);
+    expect(withEnv("OPENBOT_ACP_IDLE_MS", "nope", acpIdleTtlMs)).toBe(DEFAULT_ACP_IDLE_MS);
+  });
+
+  test("gateway TTL is independent of desk TTL", () => {
+    expect(withEnv("OPENBOT_GATEWAY_ACP_IDLE_MS", undefined, gatewayAcpIdleTtlMs)).toBe(
+      DEFAULT_GATEWAY_ACP_IDLE_MS,
+    );
+    expect(withEnv("OPENBOT_GATEWAY_ACP_IDLE_MS", "0", gatewayAcpIdleTtlMs)).toBe(0);
+    expect(withEnv("OPENBOT_GATEWAY_ACP_IDLE_MS", "90", gatewayAcpIdleTtlMs)).toBe(90);
+    expect(
+      withEnv("OPENBOT_ACP_IDLE_MS", "0", () =>
+        withEnv("OPENBOT_GATEWAY_ACP_IDLE_MS", undefined, gatewayAcpIdleTtlMs),
+      ),
+    ).toBe(DEFAULT_GATEWAY_ACP_IDLE_MS);
   });
 });
 
@@ -86,6 +104,72 @@ describe("idle ACP TTL", () => {
       server.stop(true);
       if (prevIdle === undefined) delete process.env.OPENBOT_ACP_IDLE_MS;
       else process.env.OPENBOT_ACP_IDLE_MS = prevIdle;
+    }
+  });
+
+  test("desk idle 0 does not kill Gateway; Gateway uses its own TTL", async () => {
+    const prevIdle = process.env.OPENBOT_ACP_IDLE_MS;
+    const prevGw = process.env.OPENBOT_GATEWAY_ACP_IDLE_MS;
+    process.env.OPENBOT_ACP_COMMAND = fakeAgentCommand();
+    process.env.OPENBOT_ACP_IDLE_MS = "0";
+    process.env.OPENBOT_GATEWAY_ACP_IDLE_MS = "80";
+    const { ctx, server, origin } = startTestServer({ home: tempHome() });
+    try {
+      const { cookie, session } = loginCookie({ ctx }, "alice");
+      const headers = { cookie, "content-type": "application/json" };
+      await fetch(`${origin}/v1/org`, {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({ federationEnabled: true }),
+      });
+      const ada = (await fetch(`${origin}/v1/bots`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ name: "Ada" }),
+      }).then((r) => r.json())) as { bot: { id: string }; threadId: string };
+      const listed = (await fetch(`${origin}/v1/bots`, { headers }).then((r) => r.json())) as {
+        gateway: { id: string };
+      };
+      const gwId = listed.gateway.id;
+      const gwThread = (await fetch(`${origin}/v1/threads?botId=${gwId}`, { headers }).then((r) =>
+        r.json(),
+      )) as { thread: { id: string } };
+      await fetch(`${origin}/v1/threads/${ada.threadId}/messages`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ body: "[[send:desk]]" }),
+      });
+      await fetch(`${origin}/v1/threads/${gwThread.thread.id}/messages`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ body: "[[send:gw]]" }),
+      });
+      const start = Date.now();
+      while (Date.now() - start < 10_000) {
+        const deskDone = ctx.db.get<{ n: number }>(
+          "SELECT COUNT(*) as n FROM turns WHERE bot_id = ? AND status = 'completed'",
+          [ada.bot.id],
+        );
+        const gwDone = ctx.db.get<{ n: number }>(
+          "SELECT COUNT(*) as n FROM turns WHERE bot_id = ? AND status = 'completed'",
+          [gwId],
+        );
+        if ((deskDone?.n ?? 0) >= 1 && (gwDone?.n ?? 0) >= 1) break;
+        await Bun.sleep(40);
+      }
+      const runner = ctx.engine.runnerFor(session.accountId);
+      expect(runner.acpPid(ada.bot.id)).toBeTruthy();
+      expect(runner.acpPid(gwId)).toBeTruthy();
+      await Bun.sleep(150);
+      ctx.engine.maintenance();
+      expect(runner.acpPid(ada.bot.id)).toBeTruthy();
+      expect(runner.acpPid(gwId)).toBeUndefined();
+    } finally {
+      server.stop(true);
+      if (prevIdle === undefined) delete process.env.OPENBOT_ACP_IDLE_MS;
+      else process.env.OPENBOT_ACP_IDLE_MS = prevIdle;
+      if (prevGw === undefined) delete process.env.OPENBOT_GATEWAY_ACP_IDLE_MS;
+      else process.env.OPENBOT_GATEWAY_ACP_IDLE_MS = prevGw;
     }
   });
 });

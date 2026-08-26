@@ -1,5 +1,6 @@
 import { completeGithubLogin, cookieHeader, writeAllowlistFile } from "@openbot/auth";
 import { createApp, type HomeConfig } from "./app.ts";
+import { provisionOrgGateway } from "./gateway.ts";
 
 export function startTestServer(cfg: Partial<HomeConfig> & { home: string; port?: number }) {
   process.env.OPENBOT_ACP_IDLE_MS = process.env.OPENBOT_ACP_IDLE_MS ?? "0";
@@ -36,5 +37,6 @@ export function loginCookie(
   writeAllowlistFile(created.ctx.home, [login]);
   created.ctx.allowlist.add(login.toLowerCase());
   const session = completeGithubLogin(created.ctx.db, created.ctx.allowlist, { login });
+  provisionOrgGateway(created.ctx.db, created.ctx.home);
   return { cookie: `${cookieHeader(session.token).split(";")[0]}`, session };
 }
