@@ -4,7 +4,7 @@ OpenBot is a process on a machine you run. That process **is** the desk **and** 
 
 This document is how to run that process as a **user** service (systemd `--user` or a launchd LaunchAgent) and how to federate **two** such hosts. `openbot install` never requires root. Do not run Chromium as root.
 
-Version: `openbot version` prints `{"openbot":"0.2.0","grokPin":"1.0.5","grok":"…"}`. Pin lives in `packages/acp-grok/src/pin.ts`.
+Version: `openbot version` prints `{"openbot":"0.3.0","grokPin":"1.0.5","grok":"…"}`. Pin lives in `packages/acp-grok/src/pin.ts`.
 
 ---
 
@@ -27,10 +27,11 @@ From a git checkout after `bun install`:
 
 ```bash
 bun run openbot -- version
-bun run openbot -- install --user --home ~/.openbot --port 8787
+bun run openbot -- org init acme --name "Acme"
+bun run openbot -- install --user --org acme --port 8787
 ```
 
-`--user` is the only mode (user unit / LaunchAgent). There is no system service.
+`--user` is the only mode (user unit / LaunchAgent). There is no system service. `--org acme` (or `--home DIR`) is baked into the unit as `OPENBOT_HOME` so the service stays on that org. `openbot use acme` sets the current profile for interactive CLI; the unit does not read `profiles.json` at runtime.
 
 `install` writes a unit with the **absolute** Bun binary and `apps/server/src/cli.ts` from this checkout. Working directory is the repo root. If you move the clone, run `install` again.
 
@@ -98,7 +99,8 @@ loginctl enable-linger "$USER"
 
 | Variable | Purpose |
 | --- | --- |
-| `OPENBOT_HOME` | Data root (default `~/.openbot`). `--home` on the CLI. Units set this. |
+| `OPENBOT_HOME` | Pin a data root. `--home` on the CLI. Units set this so a service stays on one org. Default without a flag is the current profile (`~/.openbot/profiles.json`), else `~/.openbot`. |
+| `OPENBOT_ORG` | Select a profile by org slug (`--org` / `--profile` / positional on `demo`/`server`/`org`/`use`). Named orgs live in `~/.openbot/orgs/<slug>/`. |
 | `PORT` | Listen port (default `8787`). `--port`. |
 | `OPENBOT_HOST` | Bind address. `--host`. Default `127.0.0.1`. Allowed: `127.0.0.1`, `localhost`, `0.0.0.0`. |
 | `OPENBOT_PUBLIC_ORIGIN` | Public URL for OAuth redirects and cookies. `--origin` overrides this env var. If neither flag nor env is set, `org.json` / stored origin is kept (the listen URL is not forced). |
@@ -135,7 +137,7 @@ Then `systemctl --user daemon-reload && systemctl --user restart openbot`.
 GitHub OAuth app callback: `https://desk.example.com/auth/callback/github` (that is `$OPENBOT_PUBLIC_ORIGIN/auth/callback/github`). Allowlist the GitHub login:
 
 ```bash
-bun run openbot -- allowlist add your-github-login --home ~/.openbot
+bun run openbot -- allowlist add your-github-login
 ```
 
 ### launchd OAuth
@@ -280,7 +282,7 @@ From a git checkout after `bun install` (same as above):
 
 ```bash
 bun run openbot -- version
-bun run openbot -- install --user --home ~/.openbot --port 8787
+bun run openbot -- install --user --org acme --port 8787   # VM B: --org beta
 # then load / enable --now, or pass --start
 ```
 
@@ -289,7 +291,7 @@ bun run openbot -- install --user --home ~/.openbot --port 8787
 GitHub OAuth callback is `$OPENBOT_PUBLIC_ORIGIN/auth/callback/github` **on that VM**. Add both callbacks to the OAuth app (or use two apps). Allowlist the operator login on each home:
 
 ```bash
-bun run openbot -- allowlist add your-github-login --home ~/.openbot
+bun run openbot -- allowlist add your-github-login
 ```
 
 ### 2. Origin + TLS
@@ -353,17 +355,17 @@ Identity and the Ed25519 key exist **before the first login**. Gateway does not.
 ```bash
 # VM A
 export OPENBOT_PUBLIC_ORIGIN=https://org-a.example.com
-bun run openbot -- org init --slug acme --name "Acme" --home ~/.openbot
-bun run openbot -- org --home ~/.openbot
-# { orgId, slug, name, publicOrigin, pubkey, federationEnabled: false, gateway: null }
+bun run openbot -- org init acme --name "Acme"
+bun run openbot -- org
+# { orgId, slug, name, publicOrigin, pubkey, federationEnabled: false, gateway: null, home, profile }
 
 # VM B
 export OPENBOT_PUBLIC_ORIGIN=https://org-b.example.com
-bun run openbot -- org init --slug beta --name "Beta" --home ~/.openbot
-bun run openbot -- org --home ~/.openbot
+bun run openbot -- org init beta --name "Beta"
+bun run openbot -- org
 ```
 
-`org init` writes `$OPENBOT_HOME/org.json` and upserts `org_meta` (it never rotates `org_id`). FQDN origins such as `org-a.example.com` do **not** auto-slug — they become `local` unless you pass `--slug` / `OPENBOT_ORG_SLUG` / `org.json`.
+`org init <slug>` registers a profile (first init on a machine that already has `~/.openbot/openbot.sqlite` **adopts** that directory; otherwise `$HOME/.openbot/orgs/<slug>`). It writes `org.json` and upserts `org_meta` (it never rotates `org_id`). FQDN origins such as `org-a.example.com` do **not** auto-slug — they become `local` unless you pass the slug / `OPENBOT_ORG_SLUG` / `org.json`. `--home` still pins a path when you need it.
 
 Restart the unit again so the process is up with that origin, **then** probe (repeat on VM B with `org-b.example.com`):
 
@@ -385,7 +387,7 @@ curl -sS https://org-a.example.com/fed/v1/info
 Sign in with an allowlisted GitHub user on each origin. First login creates the org account and auto-provisions a **Gateway** bot (`role='gateway'`, not a seventh desk slot).
 
 ```bash
-bun run openbot -- org --home ~/.openbot
+bun run openbot -- org
 # gateway: { id, name: "Gateway" }, federationEnabled: still false
 ```
 
@@ -397,9 +399,9 @@ Federation **off** means: no Gateway ACP child (RAM valve), `POST /fed/v1/messag
 
 ```bash
 # VM A
-bun run openbot -- gateway on --home ~/.openbot
+bun run openbot -- gateway on
 # VM B
-bun run openbot -- gateway on --home ~/.openbot
+bun run openbot -- gateway on
 ```
 
 Writes `org_meta.federation_enabled`. Does **not** delete the Gateway row or keys. `OPENBOT_FEDERATION=0` in the unit env still wins (panic; cannot force on). Cookie API (not `sk-ob_…`): `PATCH /v1/org { "federationEnabled": true }`.
@@ -425,7 +427,7 @@ Copy identity from the **peer** with the public GET or local CLI (no cookie). Ma
 
 ```bash
 # on VM B — print what Acme will paste
-bun run openbot -- org --home ~/.openbot
+bun run openbot -- org
 # or: curl -sS https://org-b.example.com/fed/v1/info
 
 # on VM A: allow Beta (paste Beta's orgId / pubkey / publicOrigin)
@@ -433,18 +435,16 @@ bun run openbot -- peers add \
   --slug beta \
   --url https://org-b.example.com \
   --pubkey "$BETA_PUBKEY" \
-  --org-id "$BETA_ORG_ID" \
-  --home ~/.openbot
+  --org-id "$BETA_ORG_ID"
 
 # on VM B: allow Acme (paste Acme's orgId / pubkey / publicOrigin)
 bun run openbot -- peers add \
   --slug acme \
   --url https://org-a.example.com \
   --pubkey "$ACME_PUBKEY" \
-  --org-id "$ACME_ORG_ID" \
-  --home ~/.openbot
+  --org-id "$ACME_ORG_ID"
 
-bun run openbot -- peers --home ~/.openbot
+bun run openbot -- peers
 ```
 
 Optional preview (no insert): `POST /v1/org/peers/from-info` needs a cookie **session** (`openbot_session`), not `sk-ob_…`. Prefer the public GET above.

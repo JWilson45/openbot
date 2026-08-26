@@ -2,7 +2,7 @@
   "name": "openbot",
   "private": true,
   "type": "module",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "bin": {
     "openbot": "./apps/server/src/cli.ts"
   },

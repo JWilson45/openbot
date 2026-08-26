@@ -307,19 +307,19 @@ describe("thread digest", () => {
 });
 
 describe("SendToThread + group promote", () => {
-  test("tools/list includes SendToThread and server is 0.2.0", () => {
+  test("tools/list includes SendToThread and server is 0.3.0", async () => {
     const db = openDb();
     seedWorld(db);
     const inflight = new McpInflight();
-    const init = handleMcpJsonRpc(db, inflight, undefined, {
+    const init = await handleMcpJsonRpc(db, inflight, undefined, {
       jsonrpc: "2.0",
       id: 1,
       method: "initialize",
     });
     expect(
       (init.json as { result: { serverInfo: { version: string } } }).result.serverInfo.version,
-    ).toBe("0.2.0");
-    const list = handleMcpJsonRpc(db, inflight, undefined, {
+    ).toBe("0.3.0");
+    const list = await handleMcpJsonRpc(db, inflight, undefined, {
       jsonrpc: "2.0",
       id: 2,
       method: "tools/list",

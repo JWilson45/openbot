@@ -3,6 +3,7 @@ import {
   ensureThreadBridge,
   humanThread,
   id,
+  MAX_ACTIVE_BOTS,
   now,
   orderedBotPair,
   sha256Hex,
@@ -14,6 +15,7 @@ import {
 } from "@openbot/db";
 import {
   McpError,
+  createBotInput,
   inboxInput,
   sendMessageInput,
   sendToAgentInput,
@@ -368,7 +370,12 @@ export function sendToAgent(
             [claims.accountId, input.name!],
           );
       if (!target || target.status !== "active") {
-        throw new McpError("not_found", "target bot not found", 404);
+        const wanted = input.name?.trim() || input.botId || "that name";
+        throw new McpError(
+          "not_found",
+          `target bot not found. "${wanted}" is not on this desk. Call ListBots to see names. Call CreateBot to hire a new teammate. Do not curl OpenBot HTTP or /auth/local.`,
+          404,
+        );
       }
       if (target.id === claims.botId) {
         throw new McpError("bad_request", "cannot SendToAgent yourself", 400);
@@ -648,7 +655,7 @@ export const SEND_MESSAGE_TOOL = {
 export const SEND_TO_AGENT_TOOL = {
   name: "SendToAgent",
   description:
-    "Send work to another named bot on this desk. Async: returns immediately. Does not message the human. Use SendMessage to talk to the human.",
+    "Send work to another named bot already on this desk. Async: returns immediately. Does not message the human. Use ListBots to see names. If they do not exist, CreateBot then SendToAgent. Do not curl OpenBot HTTP.",
   inputSchema: {
     type: "object",
     properties: {
@@ -705,9 +712,33 @@ export const SEND_TO_THREAD_TOOL = {
   },
 };
 
+export const LIST_BOTS_TOOL = {
+  name: "ListBots",
+  description:
+    "List active desk teammates and Gateway on this org. Use this before SendToAgent. Creating a bot is CreateBot, not this tool.",
+  inputSchema: { type: "object", properties: {} },
+};
+
+export const CREATE_BOT_TOOL = {
+  name: "CreateBot",
+  description:
+    "Hire a new desk teammate on this org (unique name, cap 6 desk bots). Desk bots only — not Gateway. After it returns, SendToAgent that name. Do not curl /auth/local or POST /v1/bots. Do not mint the human's session cookie.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      name: { type: "string", description: "Unique active name on this desk" },
+      description: { type: "string", description: "Who they are / what they do" },
+      model: { type: "string" },
+      reasoningEffort: { type: "string", enum: ["low", "medium", "high", "extra high"] },
+    },
+    required: ["name"],
+  },
+};
+
 export function mcpToolsForRole(role: string | null | undefined): unknown[] {
-  const tools: unknown[] = [SEND_MESSAGE_TOOL, SEND_TO_AGENT_TOOL, SEND_TO_THREAD_TOOL];
+  const tools: unknown[] = [SEND_MESSAGE_TOOL, SEND_TO_AGENT_TOOL, SEND_TO_THREAD_TOOL, LIST_BOTS_TOOL];
   if (role === "gateway") tools.push(SEND_TO_ORG_TOOL, INBOX_TOOL);
+  else tools.push(CREATE_BOT_TOOL);
   return tools;
 }
 
@@ -726,6 +757,7 @@ export type McpHooks = {
   federationEffective?: () => boolean;
   orgPrivateKey?: () => KeyObject;
   fetchFed?: typeof fetch;
+  onCreateBot?: (bot: { accountId: string; botId: string; name: string }) => void | Promise<void>;
 };
 
 const INBOX_PREVIEW = 240;
@@ -762,6 +794,150 @@ function requireGateway(db: OpenbotDb, claims: McpClaims, tool: string): { role:
     throw new McpError("forbidden", `${tool} is Gateway only`, 403);
   }
   return bot;
+}
+
+function requireDesk(db: OpenbotDb, claims: McpClaims, tool: string): { role: string; name: string } {
+  const bot = botRole(db, claims.botId);
+  if (!bot) throw new McpError("not_found", "caller bot not found", 404);
+  if (bot.role === "gateway") {
+    throw new McpError("forbidden", `${tool} is desk only. Gateway does not hire teammates.`, 403);
+  }
+  return bot;
+}
+
+const RESERVED_GATEWAY_NAME = /^gateway(?:-\d+)?$/i;
+
+function normalizeCreateBotArgs(raw: unknown): unknown {
+  const args = coerceToolArgs(raw);
+  if (typeof args.name === "string" && args.name.trim()) return args;
+  for (const key of ["botName", "title", "agent"] as const) {
+    const v = args[key];
+    if (typeof v === "string" && v.trim()) return { ...args, name: v };
+  }
+  return args;
+}
+
+export function listBots(
+  db: OpenbotDb,
+  _inflight: McpInflight,
+  bearer: string | undefined,
+): { bots: Array<{ id: string; name: string; description: string }>; gateway: { id: string; name: string } | null } {
+  const claims = verifyMcpToken(db, bearer);
+  const rows = db.all<{ id: string; name: string; description: string; role: string }>(
+    `SELECT id, name, description, IFNULL(role, 'desk') AS role
+     FROM bots WHERE account_id = ? AND status = 'active' ORDER BY created_at`,
+    [claims.accountId],
+  );
+  const bots = rows.filter((r) => r.role !== "gateway").map(({ id, name, description }) => ({ id, name, description }));
+  const gw = rows.find((r) => r.role === "gateway");
+  return { bots, gateway: gw ? { id: gw.id, name: gw.name } : null };
+}
+
+export async function createBot(
+  db: OpenbotDb,
+  inflight: McpInflight,
+  bearer: string | undefined,
+  rawInput: unknown,
+  hooks?: McpHooks,
+): Promise<{
+  ok: true;
+  botId: string;
+  name: string;
+  threadId: string;
+  remainingDeskSlots: number;
+  messageId: string;
+}> {
+  const claims = verifyMcpToken(db, bearer);
+  const caller = requireDesk(db, claims, "CreateBot");
+  const input = parseOrThrow(createBotInput, normalizeCreateBotArgs(rawInput));
+  const name = input.name.trim();
+  inflight.add(claims.harnessSessionId);
+  try {
+    let created: { accountId: string; botId: string; name: string } | undefined;
+    const result = db.immediate(() => {
+      const turn = lockRunningTurn(db, claims);
+      if (!turn) throw new McpError("no_active_turn", "no running turn for this harness session", 409);
+      if (RESERVED_GATEWAY_NAME.test(name)) {
+        throw new McpError("reserved_name", "Gateway is auto-provisioned; pick another name", 409);
+      }
+      const activeDesk = db.get<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'desk'",
+        [claims.accountId],
+      );
+      if ((activeDesk?.n ?? 0) >= MAX_ACTIVE_BOTS) {
+        throw new McpError("cap", `desk cap ${MAX_ACTIVE_BOTS} reached`, 409);
+      }
+      const dup = db.get(
+        "SELECT id FROM bots WHERE account_id = ? AND status = 'active' AND lower(name) = lower(?)",
+        [claims.accountId, name],
+      );
+      if (dup) throw new McpError("duplicate_name", `active bot named ${JSON.stringify(name)} already exists`, 409);
+
+      const callerRow = db.get<{ model: string | null; reasoning_effort: string | null }>(
+        "SELECT model, reasoning_effort FROM bots WHERE id = ?",
+        [claims.botId],
+      );
+      const model = input.model?.trim() || callerRow?.model || "grok-4.6";
+      const reasoningEffort = input.reasoningEffort || callerRow?.reasoning_effort || "high";
+      const description = (input.description ?? "").trim() || `Teammate created by ${caller.name}.`;
+      const botId = id();
+      const threadId = id();
+      const t = now();
+      db.run(
+        `INSERT INTO bots (id, account_id, name, description, status, permission_mode, model, reasoning_effort, role, created_at)
+         VALUES (?, ?, ?, ?, 'active', 'auto', ?, ?, 'desk', ?)`,
+        [botId, claims.accountId, name, description, model, reasoningEffort, t],
+      );
+      db.run(
+        `INSERT INTO threads (id, account_id, bot_id, title, kind, created_at) VALUES (?, ?, ?, 'New thread', 'human', ?)`,
+        [threadId, claims.accountId, botId, t],
+      );
+      const human = humanThread(db, claims.botId);
+      const notice = insertMessage(db, {
+        threadId: human?.id ?? turn.thread_id,
+        turnId: turn.id,
+        role: "assistant",
+        origin: "system",
+        body: `Created teammate ${name}. Hand off with SendToAgent.`,
+        fromBotId: claims.botId,
+      });
+      insertMessage(db, {
+        threadId,
+        turnId: null,
+        role: "assistant",
+        origin: "system",
+        body: `Created by ${caller.name} via CreateBot.`,
+        fromBotId: claims.botId,
+      });
+      db.run(
+        `INSERT INTO audit_events (id, account_id, actor, type, payload, created_at)
+         VALUES (?, ?, 'harness', 'create_bot', ?, ?)`,
+        [
+          id(),
+          claims.accountId,
+          JSON.stringify({ botId, name, by: claims.botId, turnId: turn.id }),
+          t,
+        ],
+      );
+      const after = db.get<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'desk'",
+        [claims.accountId],
+      );
+      created = { accountId: claims.accountId, botId, name };
+      return {
+        ok: true as const,
+        botId,
+        name,
+        threadId,
+        remainingDeskSlots: Math.max(0, MAX_ACTIVE_BOTS - (after?.n ?? 0)),
+        messageId: notice.id,
+      };
+    });
+    if (created) await hooks?.onCreateBot?.(created);
+    return result;
+  } finally {
+    inflight.remove(claims.harnessSessionId);
+  }
 }
 
 function federationIsOn(db: OpenbotDb, hooks?: McpHooks): boolean {
@@ -886,7 +1062,7 @@ export async function handleMcpJsonRpc(
           result: {
             protocolVersion: requested,
             capabilities: { tools: { listChanged: false } },
-            serverInfo: { name: "openbot", version: "0.2.0" },
+            serverInfo: { name: "openbot", version: "0.3.0" },
           },
         },
       };
@@ -919,6 +1095,10 @@ export async function handleMcpJsonRpc(
         result = await sendToOrg(db, inflight, bearer, args, hooks);
       } else if (name === "Inbox") {
         result = inbox(db, inflight, bearer, args);
+      } else if (name === "ListBots") {
+        result = listBots(db, inflight, bearer);
+      } else if (name === "CreateBot") {
+        result = await createBot(db, inflight, bearer, args, hooks);
       } else {
         throw new McpError("unknown_tool", `unknown tool ${name}`, 400);
       }

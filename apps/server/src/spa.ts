@@ -548,7 +548,7 @@ export const SPA_HTML = `<!DOCTYPE html>
       \${inferenceFields('on-model', 'on-effort')}
       <label for="key">API key (optional)</label>
       <input id="key" name="key" type="password" autocomplete="off" placeholder="xai-… only if you are not using grok login" />
-      <p class="muted">Shared desk. One Chromium. Bots talk with SendToAgent.</p>
+      <p class="muted">Shared desk. One Chromium. Bots talk with SendToAgent. They hire with CreateBot — not by signing in as you.</p>
       <button class="primary" id="go" type="button">Create bot</button>
       <p class="err" id="err" role="alert"></p>
     </main>\`);
@@ -1597,6 +1597,9 @@ export const SPA_HTML = `<!DOCTYPE html>
         paintMessages();
       }
       if (msg.type === 'permission_request') showPerm(msg);
+      if (msg.type === 'bots.updated') {
+        void refreshRoster().then(() => renderApp());
+      }
     };
   }
 
@@ -1867,6 +1870,7 @@ export const SPA_HTML = `<!DOCTYPE html>
         <li>Focus stays in the composer after send</li>
         <li><kbd>Esc</kbd> closes dialogs</li>
         <li>Skip link (first Tab) jumps to the message box</li>
+        <li>Bots hire teammates with <code>CreateBot</code> (cap 6). They must not use <code>/auth/local</code> or <code>POST /v1/bots</code>.</li>
       </ul>
       <p class="muted">Teammates keep working if you close this tab. Stopping <code>openbot server</code> stops them.</p>
       <p class="muted">OpenAI-compatible clients (Open WebUI) can use <code>/v1</code> with an API key from Settings.</p>

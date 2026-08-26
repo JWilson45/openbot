@@ -41,7 +41,6 @@ CREATE TABLE IF NOT EXISTS bots (
   created_at integer NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS bots_active_name ON bots(account_id, name) WHERE status = 'active';
-CREATE UNIQUE INDEX IF NOT EXISTS bots_one_active_gateway ON bots(account_id) WHERE status = 'active' AND IFNULL(role, 'desk') = 'gateway';
 
 CREATE TABLE IF NOT EXISTS compute_instances (
   id text PRIMARY KEY,
@@ -62,8 +61,6 @@ CREATE TABLE IF NOT EXISTS threads (
   peer_bot_id text,
   created_at integer NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS threads_one_human_per_bot ON threads(bot_id) WHERE kind = 'human';
-CREATE UNIQUE INDEX IF NOT EXISTS threads_a2a_pair ON threads(account_id, bot_id, peer_bot_id) WHERE kind = 'a2a';
 
 CREATE TABLE IF NOT EXISTS thread_participants (
   id text PRIMARY KEY,

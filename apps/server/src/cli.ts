@@ -21,13 +21,94 @@ import {
   writeOrgJson,
 } from "./org.ts";
 import { findActiveGateway } from "./gateway.ts";
-
-function defaultHome(): string {
-  return process.env.OPENBOT_HOME || join(homedir(), ".openbot");
-}
+import {
+  listProfiles,
+  openbotStateRoot,
+  registerProfile,
+  resolveOpenbotHome,
+  setCurrentProfile,
+  useProfile,
+  type ResolveOpts,
+  type ResolveResult,
+} from "./profiles.ts";
 
 function userHome(): string {
   return process.env.HOME || homedir();
+}
+
+const VALUE_FLAGS = new Set([
+  "--home",
+  "--port",
+  "--host",
+  "--origin",
+  "--slug",
+  "--name",
+  "--org",
+  "--profile",
+  "--url",
+  "--pubkey",
+  "--org-id",
+  "--id",
+]);
+
+function firstPositional(reserved: string[] = []): string | undefined {
+  const skip = new Set(reserved);
+  for (let i = 3; i < process.argv.length; i++) {
+    const a = process.argv[i]!;
+    if (a.startsWith("-")) {
+      if (VALUE_FLAGS.has(a)) i += 1;
+      continue;
+    }
+    if (skip.has(a)) continue;
+    return a;
+  }
+  return undefined;
+}
+
+function invocation(extra: Partial<ResolveOpts> = {}): ResolveResult {
+  return resolveOpenbotHome({
+    userHome: userHome(),
+    homeFlag: arg("--home"),
+    orgFlag: arg("--org") ?? arg("--profile") ?? extra.orgFlag,
+    envHome: process.env.OPENBOT_HOME,
+    envOrg: process.env.OPENBOT_ORG,
+    createSlug: extra.createSlug,
+    requireExisting: extra.requireExisting,
+  });
+}
+
+function mustInvocation(extra: Partial<ResolveOpts> = {}): ResolveResult {
+  try {
+    const inv = invocation(extra);
+    if (inv.source === "env-home") {
+      console.error(
+        `OPENBOT_HOME=${inv.home} pins this org and ignores 'openbot use'. Unset it to switch by slug (fish: set -e OPENBOT_HOME).`,
+      );
+    }
+    return inv;
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+    throw err;
+  }
+}
+
+function orgRoster(): {
+  current: string | null;
+  orgs: Array<{ slug: string; home: string; current: boolean }>;
+} {
+  const listed = listProfiles(openbotStateRoot(userHome()));
+  return { current: listed.current, orgs: listed.profiles };
+}
+
+function rememberProfile(inv: ResolveResult, current: boolean): void {
+  if (!inv.remember || !inv.slug) return;
+  registerProfile(inv.stateRoot, inv.slug, inv.home);
+  if (current) setCurrentProfile(inv.stateRoot, inv.slug);
+}
+
+function applyOrgSlug(inv: ResolveResult): void {
+  if (inv.slug && !process.env.OPENBOT_ORG_SLUG) process.env.OPENBOT_ORG_SLUG = inv.slug;
 }
 
 function arg(name: string, fallback?: string): string | undefined {
@@ -90,28 +171,45 @@ function pinFields() {
 function printHelp(): void {
   console.log(`openbot — always-on teammate on this machine
 
+Orgs (one sqlite / desk / key per slug):
+  openbot org init acme --name "Acme"   # create + make current
+  openbot demo                          # run the current org (loopback user "demo")
+  openbot orgs                          # list
+  openbot use beta                      # switch current org
+  openbot use acme --home ~/.openbot-p3 # import an existing data dir
+  unset OPENBOT_HOME                    # required if you exported it; it pins a path
+
 Usage:
-  openbot demo [--port 8787] [--home ~/.openbot] [--host 127.0.0.1] [--fake]
-  openbot server [--port 8787] [--home ~/.openbot] [--host 127.0.0.1] [--origin http://127.0.0.1:8787]
-  openbot install [--user] [--home ~/.openbot] [--port 8787] [--start]
-  openbot org [--home ~/.openbot]
-  openbot org init [--home ~/.openbot] [--slug acme] [--name "Acme"]
-  openbot gateway on | off [--home ~/.openbot]
-  openbot peers [--home ~/.openbot]
+  openbot demo [slug] [--port 8787] [--org <slug>] [--home DIR] [--host 127.0.0.1] [--fake]
+  openbot server [slug] [--port 8787] [--org <slug>] [--home DIR] [--host 127.0.0.1] [--origin URL]
+  openbot install [--user] [--org <slug>] [--home DIR] [--port 8787] [--start]
+  openbot orgs | profiles
+  openbot use [slug] [--home DIR]
+  openbot org [slug]
+  openbot org init <slug> [--name "Acme"] [--home DIR]
+  openbot gateway on | off [slug]
+  openbot peers [--org <slug>]
   openbot peers add --slug beta --url https://beta.example.com --pubkey <b64> --org-id <uuid>
   openbot peers remove --id <orgId>
   openbot version | -v | --version
   openbot allowlist add <github-login>
   openbot allowlist
 
-  demo     local sign-in as "demo" (loopback). --fake uses the scripted ACP agent.
-  server   bind the desk (default 127.0.0.1). --origin overrides OPENBOT_PUBLIC_ORIGIN.
-  install  write a launchd LaunchAgent or systemd --user unit. Never requires root.
-  org      print instance identity JSON including pubkey. Works with zero users.
-  org init write org.json and upsert org_meta (org_id is never rotated).
-  gateway  write org_meta.federation_enabled. Env OPENBOT_FEDERATION=0 still wins. Does not delete Gateway.
-  peers    list, add, or remove federation peers.
-  version  print {"openbot","grokPin","grok"} JSON.
+  demo      same desk as server, with loopback sign-in as "demo". --fake = scripted ACP.
+  server    bind the desk (default 127.0.0.1). GitHub OAuth + allowlist. --origin overrides OPENBOT_PUBLIC_ORIGIN.
+  install   write a launchd LaunchAgent or systemd --user unit. Never requires root.
+  orgs      list orgs on this machine (slug → home). Current is used when you omit --org / --home.
+  use       switch the current org. No slug lists. --home DIR imports that data dir.
+  org       print this org's identity JSON including pubkey. Works with zero users.
+  org init  create/name an org, register the slug, make it current (org_id is never rotated).
+  gateway   write org_meta.federation_enabled. Env OPENBOT_FEDERATION=0 still wins. Does not delete Gateway.
+  peers     list, add, or remove federation peers.
+  version   print {"openbot","grokPin","grok"} JSON.
+
+Named orgs live in ~/.openbot/orgs/<slug>/ (registry: ~/.openbot/profiles.json).
+--home / OPENBOT_HOME pin a path (units snapshot this) and skip the current org.
+A running demo/server stays on the org it started with until you restart it.
+Grok login stays in ~/.grok (not the org home).
 
 Closing a browser tab does not stop the teammate.
 Stopping openbot server does.
@@ -170,13 +268,25 @@ function renderTemplate(path: string, vars: Record<string, string>, xml: boolean
 }
 
 function orgCommand(): void {
-  const home = arg("--home", defaultHome())!;
   const sub = process.argv[3];
-  if (sub && sub !== "init" && !sub.startsWith("-")) {
-    console.error("usage: openbot org [init [--slug <slug>] [--name <name>]] [--home <dir>]");
+  const init = sub === "init";
+  const positionalSlug = init
+    ? firstPositional(["init"])
+    : sub && sub !== "init" && !sub.startsWith("-")
+      ? sub
+      : firstPositional(["init"]);
+  const slug = init ? (arg("--slug") ?? positionalSlug) : (arg("--org") ?? arg("--profile") ?? positionalSlug);
+  if (init && arg("--slug") && positionalSlug && arg("--slug") !== positionalSlug) {
+    console.error("org init: positional slug and --slug must match");
     process.exit(1);
   }
-  const init = sub === "init";
+  const inv = mustInvocation({
+    orgFlag: init ? undefined : slug,
+    createSlug: init ? slug : undefined,
+    requireExisting: !init && Boolean(slug),
+  });
+  const home = inv.home;
+  applyOrgSlug(inv);
   mkdirSync(home, { recursive: true });
   const db = OpenbotDb.open(join(home, "openbot.sqlite"));
   try {
@@ -185,7 +295,7 @@ function orgCommand(): void {
       file: join(home, "org.json"),
       publicOrigin: process.env.OPENBOT_PUBLIC_ORIGIN,
       advertisedOrigin: `http://127.0.0.1:${arg("--port", process.env.PORT ?? "8787")}`,
-      slug: init ? arg("--slug") : undefined,
+      slug: init ? slug : undefined,
       name: init ? arg("--name") : undefined,
     });
     const master = loadOrCreateMasterKey(home, process.env.OPENBOT_MASTER_KEY);
@@ -193,8 +303,17 @@ function orgCommand(): void {
     const row = currentOrgMeta(db);
     if (!row) throw new Error("org_meta write failed");
     if (init) writeOrgJson(join(home, "org.json"), row);
+    rememberProfile(init ? { ...inv, slug: row.slug, remember: inv.source !== "home-flag" && inv.source !== "env-home" } : inv, init);
     const gw = row.account_id ? findActiveGateway(db, row.account_id) : undefined;
-    console.log(JSON.stringify(orgCliSnapshot(row, gw ? { id: gw.id, name: gw.name } : null)));
+    const snapshot = {
+      ...orgCliSnapshot(row, gw ? { id: gw.id, name: gw.name } : null),
+      home,
+      profile: inv.slug ?? row.slug,
+    };
+    console.log(JSON.stringify(snapshot));
+    if (init && (inv.source === "home-flag" || inv.source === "env-home")) {
+      console.error(`not registered as a profile (because --home / OPENBOT_HOME). to switch later: openbot use ${row.slug} --home ${home}`);
+    }
   } catch (err) {
     console.error(err instanceof Error ? err.message : String(err));
     process.exit(1);
@@ -204,12 +323,17 @@ function orgCommand(): void {
 }
 
 function gatewayCommand(): void {
-  const home = arg("--home", defaultHome())!;
   const sub = process.argv[3];
   if (sub !== "on" && sub !== "off") {
-    console.error("usage: openbot gateway on|off [--home <dir>]");
+    console.error("usage: openbot gateway on|off [slug] [--org <slug>] [--home <dir>]");
     process.exit(1);
   }
+  const inv = mustInvocation({
+    orgFlag: firstPositional(["on", "off"]),
+    requireExisting: Boolean(firstPositional(["on", "off"]) || arg("--org") || arg("--profile")),
+  });
+  const home = inv.home;
+  applyOrgSlug(inv);
   mkdirSync(home, { recursive: true });
   const db = OpenbotDb.open(join(home, "openbot.sqlite"));
   try {
@@ -221,7 +345,13 @@ function gatewayCommand(): void {
     });
     const row = setFederationEnabled(db, sub === "on");
     const gw = row.account_id ? findActiveGateway(db, row.account_id) : undefined;
-    console.log(JSON.stringify(orgCliSnapshot(row, gw ? { id: gw.id, name: gw.name } : null)));
+    console.log(
+      JSON.stringify({
+        ...orgCliSnapshot(row, gw ? { id: gw.id, name: gw.name } : null),
+        home,
+        profile: inv.slug ?? row.slug,
+      }),
+    );
   } catch (err) {
     console.error(err instanceof Error ? err.message : String(err));
     process.exit(1);
@@ -231,12 +361,14 @@ function gatewayCommand(): void {
 }
 
 function peersCommand(): void {
-  const home = arg("--home", defaultHome())!;
   const sub = process.argv[3];
   if (sub && sub !== "add" && sub !== "remove" && !sub.startsWith("-")) {
-    console.error("usage: openbot peers [add --slug <slug> --url <url> --pubkey <b64>] [remove --id <orgId>] [--home <dir>]");
+    console.error("usage: openbot peers [add --slug <slug> --url <url> --pubkey <b64>] [remove --id <orgId>] [--org <slug>] [--home <dir>]");
     process.exit(1);
   }
+  const inv = mustInvocation();
+  const home = inv.home;
+  applyOrgSlug(inv);
   mkdirSync(home, { recursive: true });
   const db = OpenbotDb.open(join(home, "openbot.sqlite"));
   try {
@@ -286,7 +418,10 @@ function peersCommand(): void {
 }
 
 function install(): void {
-  const home = resolve(arg("--home", defaultHome())!);
+  const inv = mustInvocation({ orgFlag: firstPositional([]) });
+  const home = resolve(inv.home);
+  applyOrgSlug(inv);
+  rememberProfile(inv, inv.remember);
   const port = arg("--port", process.env.PORT ?? "8787")!;
   const start = flag("--start");
   const vars = unitVars(home, port);
@@ -347,7 +482,10 @@ const cmd = process.argv[2] ?? "help";
 if (cmd === "version" || cmd === "-v" || cmd === "--version") {
   printVersion();
 } else if (cmd === "demo") {
-  const home = arg("--home", defaultHome())!;
+  const inv = mustInvocation({ orgFlag: firstPositional([]) });
+  const home = inv.home;
+  applyOrgSlug(inv);
+  rememberProfile(inv, inv.remember);
   const port = Number(arg("--port", process.env.PORT ?? "8787"));
   const host = resolveHost();
   const fake = process.argv.includes("--fake");
@@ -377,6 +515,9 @@ if (cmd === "version" || cmd === "-v" || cmd === "--version") {
       msg: "openbot demo",
       origin: reachable,
       host,
+      home,
+      profile: inv.slug,
+      org: inv.slug,
       signIn: url,
       fake,
       ...pinFields(),
@@ -385,7 +526,10 @@ if (cmd === "version" || cmd === "-v" || cmd === "--version") {
     }),
   );
 } else if (cmd === "server") {
-  const home = arg("--home", defaultHome())!;
+  const inv = mustInvocation({ orgFlag: firstPositional([]) });
+  const home = inv.home;
+  applyOrgSlug(inv);
+  rememberProfile(inv, inv.remember);
   const port = Number(arg("--port", process.env.PORT ?? "8787"));
   const host = resolveHost();
   const originFlag = process.argv.includes("--origin") ? arg("--origin")?.trim() : undefined;
@@ -410,6 +554,8 @@ if (cmd === "version" || cmd === "-v" || cmd === "--version") {
       origin: `http://${advertiseHost(host)}:${server.port}`,
       host,
       home,
+      profile: inv.slug,
+      org: inv.slug,
       desk: join(home, "desk"),
       ...pinFields(),
       note: "Closing a browser tab does not stop the teammate. Stopping this process does.",
@@ -418,7 +564,8 @@ if (cmd === "version" || cmd === "-v" || cmd === "--version") {
   );
 } else if (cmd === "allowlist") {
   const sub = process.argv[3];
-  const home = arg("--home", defaultHome())!;
+  const inv = mustInvocation();
+  const home = inv.home;
   if (sub === "add") {
     const login = process.argv[4];
     if (!login) {
@@ -437,7 +584,64 @@ if (cmd === "version" || cmd === "-v" || cmd === "--version") {
   gatewayCommand();
 } else if (cmd === "peers") {
   peersCommand();
-
+} else if (cmd === "orgs" || cmd === "profiles" || cmd === "profile") {
+  try {
+    const roster = orgRoster();
+    console.log(
+      JSON.stringify({
+        current: roster.current,
+        orgs: roster.orgs,
+        profiles: roster.orgs,
+        note: roster.current
+          ? `current org is ${roster.current}. switch: openbot use <slug>`
+          : "no current org. create: openbot org init <slug>",
+      }),
+    );
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+} else if (cmd === "use" || cmd === "switch") {
+  const slug = process.argv[3] && !process.argv[3]!.startsWith("-") ? process.argv[3] : undefined;
+  if (!slug) {
+    const roster = orgRoster();
+    console.log(
+      JSON.stringify({
+        current: roster.current,
+        orgs: roster.orgs,
+        profiles: roster.orgs,
+        note: "switch: openbot use <slug>   import: openbot use <slug> --home DIR",
+      }),
+    );
+  } else {
+    try {
+      const stateRoot = openbotStateRoot(userHome());
+      const reg = useProfile(stateRoot, slug, arg("--home"));
+      const home = reg.profiles[reg.current ?? slug]!.home;
+      const roster = orgRoster();
+      const envHome = process.env.OPENBOT_HOME?.trim();
+      if (envHome) {
+        console.error(
+          `current org is ${reg.current}, but OPENBOT_HOME=${envHome} will still win on the next command. Unset it (fish: set -e OPENBOT_HOME).`,
+        );
+      }
+      console.log(
+        JSON.stringify({
+          current: reg.current,
+          org: reg.current,
+          home,
+          orgs: roster.orgs,
+          profiles: roster.orgs,
+          note: envHome
+            ? `unset OPENBOT_HOME to actually run ${reg.current}. Restart demo/server after switching.`
+            : `current org is ${reg.current}. Restart demo/server if one is already running.`,
+        }),
+      );
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  }
 } else if (cmd === "install") {
   install();
 } else {

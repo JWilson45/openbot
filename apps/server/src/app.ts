@@ -1328,6 +1328,12 @@ export function createApp(cfg: HomeConfig): {
         onKick: () => ctx.engine.kick(),
         federationEffective: () => federationEffective(currentOrgMeta(db)),
         orgPrivateKey: () => loadOrgKeypair(ctx.home, ctx.master).privateKey,
+        onCreateBot: async ({ accountId, botId, name }) => {
+          const runner = ctx.engine.runnerFor(accountId);
+          await runner.ensure(accountId);
+          runner.ensureProject(botId, name);
+          onPush(accountId, { type: "bots.updated" });
+        },
       });
       const json = result.json as { result?: { content?: unknown[] } };
       if (result.status === 200 && json?.result?.content) {

@@ -42,8 +42,12 @@ export type InboxInput = z.infer<typeof inboxInput>;
 
 export const createBotInput = z.object({
   name: z.string().min(1).max(80),
-  description: z.string().max(4000).default(""),
+  description: z.string().max(4000).optional().default(""),
+  model: z.string().min(1).max(80).optional(),
+  reasoningEffort: z.enum(["low", "medium", "high", "extra high"]).optional(),
 });
+
+export type CreateBotInput = z.infer<typeof createBotInput>;
 
 export const patchBotInput = z.object({
   name: z.string().min(1).max(80).optional(),

@@ -219,9 +219,13 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     const desk = deskIdentityRules("Ada", "research");
     expect(desk).not.toContain("SendToOrg");
     expect(desk).toContain("SendToAgent Gateway");
+    expect(desk).toContain("CreateBot");
+    expect(desk).toContain("/auth/local");
+    expect(gw).toContain("You do not hire desk bots");
+    expect(gw).not.toMatch(/Hire a new teammate: CreateBot/);
   });
 
-  test("tools/list is role-aware; serverInfo is 0.2.0", async () => {
+  test("tools/list is role-aware; serverInfo is 0.3.0", async () => {
     const db = OpenbotDb.open(join(tempHome(), "openbot.sqlite"));
     const w = seedWorld(db);
     const inflight = new McpInflight();
@@ -233,11 +237,13 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     const deskNames = (
       (deskList.json as { result: { tools: Array<{ name: string }> } }).result.tools ?? []
     ).map((t) => t.name);
-    expect(deskNames).toEqual(["SendMessage", "SendToAgent", "SendToThread"]);
+    expect(deskNames).toEqual(["SendMessage", "SendToAgent", "SendToThread", "ListBots", "CreateBot"]);
     expect(mcpToolsForRole("desk").map((t) => (t as { name: string }).name)).toEqual([
       "SendMessage",
       "SendToAgent",
       "SendToThread",
+      "ListBots",
+      "CreateBot",
     ]);
 
     db.run("UPDATE bots SET role = 'gateway' WHERE id = ?", [w.botId]);
@@ -249,7 +255,7 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     const gwNames = (
       (gwList.json as { result: { tools: Array<{ name: string }> } }).result.tools ?? []
     ).map((t) => t.name);
-    expect(gwNames).toEqual(["SendMessage", "SendToAgent", "SendToThread", "SendToOrg", "Inbox"]);
+    expect(gwNames).toEqual(["SendMessage", "SendToAgent", "SendToThread", "ListBots", "SendToOrg", "Inbox"]);
 
     const init = await handleMcpJsonRpc(db, inflight, undefined, {
       jsonrpc: "2.0",
@@ -259,7 +265,7 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     });
     expect(
       (init.json as { result: { serverInfo: { version: string } } }).result.serverInfo.version,
-    ).toBe("0.2.0");
+    ).toBe("0.3.0");
     db.close();
   });
 

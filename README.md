@@ -33,6 +33,7 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 | Human DM | Each bot has a 1:1 thread with you. |
 | `SendMessage` | The **only** way a bot talks to you. Assistant rambling is a private work log unless it fails to call the tool (then you get a fallback). |
 | `SendToAgent` | Async mailbox to another bot. Does **not** write your DM. Handoffs in the UI show the A2A thread. |
+| `ListBots` / `CreateBot` | Roster and hire. Desk bots only (cap 6). Gateway does not hire. Bots must **not** mint `/auth/local` or `POST /v1/bots`. |
 | Parallel turns | At most one running turn **per bot**. Two bots can work at the same time on the shared desk. |
 | Warm Grok process | Each bot keeps an ACP child across turns. Model / reasoning changes respawn it on the **next** turn. |
 | Model & reasoning | Per-bot Grok model (e.g. grok-4.6) and effort (low / medium / high / extra high). Composer + Settings. |
@@ -62,16 +63,30 @@ cd openbot
 bun install
 ```
 
-The CLI is `bun run openbot -- <command>` (or `bun run apps/server/src/cli.ts`). Current version is **0.2.0**. `openbot version` prints `{ openbot, grokPin, grok }`. OpenBot pins **Grok CLI 1.0.5** (warns if missing or older; does not refuse to start).
+The CLI is `bun run openbot -- <command>` (or `bun run apps/server/src/cli.ts`). Current version is **0.3.0**. `openbot version` prints `{ openbot, grokPin, grok }`. OpenBot pins **Grok CLI 1.0.5** (warns if missing or older; does not refuse to start).
 
 ```
-openbot demo    [--port 8787] [--home ~/.openbot] [--host 127.0.0.1] [--fake]
-openbot server  [--port 8787] [--home ~/.openbot] [--host 127.0.0.1] [--origin http://127.0.0.1:8787]
-openbot install [--user] [--home ~/.openbot] [--port 8787] [--start]
-openbot org [--home ~/.openbot]
-openbot org init [--home ~/.openbot] [--slug acme] [--name "Acme"]
-openbot gateway on | off [--home ~/.openbot]
-openbot peers [--home ~/.openbot]
+openbot org init acme --name "Acme"
+openbot demo
+openbot orgs
+openbot use beta
+openbot use acme --home ~/.openbot-p3    # import an existing data dir
+```
+
+A **profile is an org**: one slug → one data dir (sqlite, desk, keys). `openbot use acme` switches which org later commands talk to. Unset `OPENBOT_HOME` first if you exported it — that env **pins a path** and ignores `use`. A running `demo`/`server` stays on the org it started with until you restart it.
+
+`--org` / `OPENBOT_ORG` select a slug for one command. `--home` / `OPENBOT_HOME` pin a directory (units snapshot this). Named orgs default to `~/.openbot/orgs/<slug>/`. An existing `~/.openbot/openbot.sqlite` is adopted by the first `org init <slug>`.
+
+```
+openbot demo    [slug] [--org <slug>] [--port 8787] [--home DIR] [--host 127.0.0.1] [--fake]
+openbot server  [slug] [--org <slug>] [--port 8787] [--home DIR] [--host 127.0.0.1] [--origin URL]
+openbot install [--user] [--org <slug>] [--home DIR] [--port 8787] [--start]
+openbot orgs | profiles
+openbot use [slug] [--home DIR]
+openbot org [slug]
+openbot org init <slug> [--name "Acme"] [--home DIR]
+openbot gateway on | off [slug]
+openbot peers [--org <slug>]
 openbot peers add --slug beta --url https://beta.example.com --pubkey <b64> --org-id <uuid>
 openbot peers remove --id <orgId>
 openbot version | -v | --version
@@ -79,14 +94,15 @@ openbot allowlist add <github-login>
 openbot allowlist
 ```
 
-Default home is `$OPENBOT_HOME` or `~/.openbot`. Bind defaults to **127.0.0.1**. OpenBot does not terminate TLS — put Caddy or nginx in front (see [docs/host-service.md](docs/host-service.md) and `contrib/caddy/Caddyfile.example`).
+Bind defaults to **127.0.0.1**. OpenBot does not terminate TLS — put Caddy or nginx in front (see [docs/host-service.md](docs/host-service.md) and `contrib/caddy/Caddyfile.example`).
 
 ### Run as a user service
 
 From a git checkout after `bun install`:
 
 ```bash
-bun run openbot -- install --user --home ~/.openbot --port 8787
+bun run openbot -- org init acme --name "Acme"
+bun run openbot -- install --user --org acme --port 8787
 ```
 
 That writes a **LaunchAgent** (`~/Library/LaunchAgents/ai.openbot.plist`) or a **systemd --user** unit (`~/.config/systemd/user/openbot.service`). Never root; Chromium must not run as root. It does not start the unit unless you pass `--start`.
@@ -111,7 +127,8 @@ On this machine:
 
 ```bash
 grok login
-bun run openbot demo --port 8787
+bun run openbot -- org init acme --name "Acme"
+bun run openbot -- demo --port 8787
 ```
 
 Open the printed `signIn` URL (loopback user `demo`). Create **Ada**. Ask her something. No API key is required if the Grok CLI session is signed in.
@@ -196,11 +213,14 @@ MCP is Streamable HTTP on loopback (`/mcp/v1`), token-bound to `{ accountId, bot
 
 ## Data on disk
 
-Default `$OPENBOT_HOME` = `~/.openbot`.
+Control dir is `~/.openbot`. Each org profile is its own data root (`$OPENBOT_HOME`).
 
 | Path | Role |
 | --- | --- |
-| `openbot.sqlite` | Bots, threads, turns, messages, live-work, sessions, `org_meta`, `org_peers`, `org_inbox` |
+| `~/.openbot/profiles.json` | Slug → data dir map and current profile |
+| `~/.openbot/orgs/<slug>/` | Default data root for a named org |
+| `~/.openbot/openbot.sqlite` | Legacy single-home layout (still valid; first `org init <slug>` adopts it) |
+| `$OPENBOT_HOME/openbot.sqlite` | Bots, threads, turns, messages, live-work, sessions, `org_meta`, `org_peers`, `org_inbox` |
 | `org.json` | Optional org slug/name/origin. DB wins once written; `org init` rewrites this file. |
 | `org.ed25519` | Sealed Ed25519 org key (mode 0600). Not under `desk/`. Not a `credentials` row. |
 | `master.key` | Vault master (mode 0600). Not under `desk/` |
@@ -209,7 +229,7 @@ Default `$OPENBOT_HOME` = `~/.openbot`.
 | `desk/projects/<botId>/` | That bot's ACP cwd. Purge deletes this folder only. Bots can still `../` into siblings. |
 | `grok-home/` | Isolated Grok config (no user MCP servers). Auth is linked from `~/.grok/auth.json` |
 
-`--home` / `OPENBOT_HOME` relocate the lot. Wiping the desk does not delete the sqlite DB or vault.
+`--home` / `OPENBOT_HOME` relocate one org's data. Wiping the desk does not delete the sqlite DB or vault. Grok CLI login stays in `~/.grok/auth.json`.
 
 ---
 
@@ -217,7 +237,8 @@ Default `$OPENBOT_HOME` = `~/.openbot`.
 
 | Variable | Purpose |
 | --- | --- |
-| `OPENBOT_HOME` | Data root (default `~/.openbot`) |
+| `OPENBOT_HOME` | Pin a data root (skips profile lookup). Default is the current profile, else `~/.openbot`. |
+| `OPENBOT_ORG` | Select a profile by slug (`--org` / `--profile`). |
 | `PORT` | Listen port (default `8787`) |
 | `OPENBOT_HOST` | Bind address (`127.0.0.1` default; `localhost`; `0.0.0.0` with a warning) |
 | `OPENBOT_PUBLIC_ORIGIN` | Public URL for OAuth redirects and cookies. `--origin` overrides this. If neither is set, `org.json` / stored `org_meta.public_origin` is kept. |

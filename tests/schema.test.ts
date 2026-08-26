@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { join } from "node:path";
 import { OpenbotDb } from "@openbot/db";
@@ -76,8 +77,8 @@ test("schema applies on a fresh sqlite file", () => {
   for (const col of ["id", "org_id", "user_id", "account_id", "role", "created_at"]) {
     expect(memberCols).toContain(col);
   }
-  const indexes = db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index'").map((i) => i.name);
-  expect(indexes).toContain("org_members_user");
+  const moreIndexes = db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index'").map((i) => i.name);
+  expect(moreIndexes).toContain("org_members_user");
   const peerCols = db.all<{ name: string }>("PRAGMA table_info(org_peers)").map((c) => c.name);
   for (const col of ["id", "peer_org_id", "slug", "name", "base_url", "pubkey", "status", "created_at"]) {
     expect(peerCols).toContain(col);
@@ -104,10 +105,10 @@ test("schema applies on a fresh sqlite file", () => {
   for (const col of ["id", "bucket", "reason", "count", "host", "last_at", "last_notice_message_id"]) {
     expect(solicitCols).toContain(col);
   }
-  expect(indexes).toContain("org_inbox_peer_msg");
-  expect(indexes).toContain("org_solicit_bucket_reason");
-  expect(indexes).toContain("thread_bridges_local");
-  expect(indexes).toContain("thread_bridges_peer_thread");
+  expect(moreIndexes).toContain("org_inbox_peer_msg");
+  expect(moreIndexes).toContain("org_solicit_bucket_reason");
+  expect(moreIndexes).toContain("thread_bridges_local");
+  expect(moreIndexes).toContain("thread_bridges_peer_thread");
   const bridgeCols = db.all<{ name: string; dflt_value: unknown; notnull: number }>(
     "PRAGMA table_info(thread_bridges)",
   );
@@ -128,4 +129,29 @@ test("schema applies on a fresh sqlite file", () => {
   const msgCols = db.all<{ name: string }>("PRAGMA table_info(messages)").map((c) => c.name);
   expect(msgCols).toContain("remote_org_id");
   expect(msgCols).toContain("remote_actor_name");
+});
+
+test("migrate adds bots.role on a pre-gateway sqlite", () => {
+  const path = join(tempHome(), "openbot.sqlite");
+  const raw = new Database(path);
+  raw.exec(`CREATE TABLE bots (
+    id text PRIMARY KEY,
+    account_id text NOT NULL,
+    name text NOT NULL,
+    description text NOT NULL DEFAULT '',
+    status text NOT NULL DEFAULT 'active',
+    permission_mode text NOT NULL DEFAULT 'auto',
+    harness text NOT NULL DEFAULT 'grok',
+    require_human_approval integer NOT NULL DEFAULT 0,
+    model text NOT NULL DEFAULT 'grok-4.6',
+    reasoning_effort text NOT NULL DEFAULT 'high',
+    created_at integer NOT NULL
+  );`);
+  raw.close();
+  const db = OpenbotDb.open(path);
+  const cols = db.all<{ name: string }>("PRAGMA table_info(bots)").map((c) => c.name);
+  expect(cols).toContain("role");
+  const indexes = db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index'").map((i) => i.name);
+  expect(indexes).toContain("bots_one_active_gateway");
+  db.close();
 });

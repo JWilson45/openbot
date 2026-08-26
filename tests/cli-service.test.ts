@@ -23,12 +23,12 @@ async function runOpenbot(
 }
 
 describe("openbot version / help / install", () => {
-  test("openbot version and --version include 0.2.0 and grokPin 1.0.5", async () => {
+  test("openbot version and --version include 0.3.0 and grokPin 1.0.5", async () => {
     for (const args of [["version"], ["--version"], ["-v"]]) {
       const { stdout, code } = await runOpenbot(args);
       expect(code).toBe(0);
       const json = JSON.parse(stdout.trim()) as { openbot: string; grokPin: string; grok: string | null };
-      expect(json.openbot).toBe("0.2.0");
+      expect(json.openbot).toBe("0.3.0");
       expect(json.grokPin).toBe("1.0.5");
       expect(json.grok === null || typeof json.grok === "string").toBe(true);
     }
@@ -40,6 +40,10 @@ describe("openbot version / help / install", () => {
     expect(stdout).toContain("install");
     expect(stdout).toContain("--host");
     expect(stdout).toContain("--origin");
+    expect(stdout).toContain("--org");
+    expect(stdout).toContain("openbot orgs");
+    expect(stdout).toContain("openbot use");
+    expect(stdout).toContain("openbot org init");
     expect(stdout).toContain("docs/host-service.md");
     expect(stdout).toContain("Closing a browser tab does not stop the teammate.");
   });
