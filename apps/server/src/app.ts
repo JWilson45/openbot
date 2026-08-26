@@ -10,7 +10,6 @@ import {
   deleteBotPermanently,
   id,
   now,
-  purgeExpiredArchivedBots,
   type TurnRow,
 } from "@openbot/db";
 import {
@@ -33,6 +32,16 @@ import { detectCliLogins, listGrokModels, resolveBotInference } from "@openbot/a
 import { SPA_HTML } from "./spa.ts";
 import { TurnEngine } from "./engine.ts";
 import { mountOpenAiCompat } from "./openai.ts";
+import {
+  clientRateKey,
+  currentOrgMeta,
+  ensureOrgMeta,
+  fedInfoPayload,
+  FED_INFO_RATE_LIMIT,
+  FED_INFO_RATE_WINDOW_MS,
+  orgMemberSnapshot,
+  SlidingWindowRateLimiter,
+} from "./org.ts";
 
 export type HomeConfig = {
   home: string;
@@ -42,6 +51,7 @@ export type HomeConfig = {
   publicOrigin?: string;
   logger?: RedactingLogger;
   devLogin?: boolean;
+  env?: Record<string, string | undefined>;
 };
 
 export type AppContext = {
@@ -58,21 +68,35 @@ export type AppContext = {
   publicOrigin: string;
   push: Map<string, Set<ServerWebSocket>>;
   devLogin: boolean;
+  maintenanceTimer?: ReturnType<typeof setInterval>;
 };
 
 function cookies(c: { req: { header: (n: string) => string | undefined } }): string | undefined {
   return parseCookie(c.req.header("cookie"));
 }
 
-export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready: () => void } {
+export function createApp(cfg: HomeConfig): {
+  app: Hono;
+  ctx: AppContext;
+  ready: () => void;
+  stop: () => void;
+} {
   mkdirSync(cfg.home, { recursive: true });
   mkdirSync(join(cfg.home, "desk"), { recursive: true });
   const db = OpenbotDb.open(join(cfg.home, "openbot.sqlite"));
+  const advertisedOrigin = cfg.publicOrigin ?? `http://127.0.0.1:${cfg.port}`;
+  const org = ensureOrgMeta(db, {
+    env: cfg.env ?? process.env,
+    file: join(cfg.home, "org.json"),
+    publicOrigin: cfg.publicOrigin,
+    advertisedOrigin,
+  });
   const master = loadOrCreateMasterKey(cfg.home, process.env.OPENBOT_MASTER_KEY);
   const allowlist = loadAllowlist(cfg.home, process.env.OPENBOT_GITHUB_ALLOWLIST);
   const log = cfg.logger ?? new RedactingLogger();
   const inflight = new McpInflight();
   const push = new Map<string, Set<ServerWebSocket>>();
+  const fedInfoLimiter = new SlidingWindowRateLimiter(FED_INFO_RATE_LIMIT, FED_INFO_RATE_WINDOW_MS);
 
   const ctx: AppContext = {
     db,
@@ -85,7 +109,7 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
     port: cfg.port,
     githubClientId: cfg.githubClientId ?? process.env.OPENBOT_GITHUB_CLIENT_ID,
     githubClientSecret: cfg.githubClientSecret ?? process.env.OPENBOT_GITHUB_CLIENT_SECRET,
-    publicOrigin: cfg.publicOrigin ?? `http://127.0.0.1:${cfg.port}`,
+    publicOrigin: org.public_origin || advertisedOrigin,
     push,
     devLogin: cfg.devLogin ?? process.env.OPENBOT_DEV_LOGIN === "1",
   };
@@ -111,6 +135,8 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
     mcpPort: () => ctx.port,
     onPush,
   });
+  ctx.maintenanceTimer = setInterval(() => ctx.engine.maintenance(), 30_000);
+  ctx.maintenanceTimer.unref();
 
   const { upgradeWebSocket, websocket } = createBunWebSocket<ServerWebSocket>();
   const app = new Hono();
@@ -148,6 +174,14 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
     } catch (err) {
       return c.json({ ok: false, error: String(err) }, 503);
     }
+  });
+
+  app.get("/fed/v1/info", (c) => {
+    const key = clientRateKey(bunRequestIp(c.env, c.req.raw), c.req.header("x-forwarded-for"));
+    if (!fedInfoLimiter.take(key)) return c.json({ error: "rate_limited" }, 429);
+    const row = currentOrgMeta(db);
+    if (!row) return c.json({ error: "no_org" }, 500);
+    return c.json(fedInfoPayload(row));
   });
 
   app.get("/", (c) => c.html(SPA_HTML));
@@ -242,6 +276,17 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
     }
   });
 
+  app.get("/v1/org", (c) => {
+    try {
+      requireSession(c);
+      const row = currentOrgMeta(db);
+      if (!row) return c.json({ error: "no_org" }, 500);
+      return c.json(orgMemberSnapshot(row));
+    } catch {
+      return c.json({ error: "unauthorized" }, 401);
+    }
+  });
+
   app.post("/v1/bots", async (c) => {
     const s = requireSession(c);
     const body = await c.req.json();
@@ -286,7 +331,9 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
         [threadId, s.accountId, botId, now()],
       );
     });
-    await ctx.engine.runnerFor(s.accountId).ensure(s.accountId);
+    const runner = ctx.engine.runnerFor(s.accountId);
+    await runner.ensure(s.accountId);
+    runner.ensureProject(botId, normalized);
     return c.json({
       bot: {
         id: botId,
@@ -302,7 +349,7 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
 
   app.get("/v1/bots", (c) => {
     const s = requireSession(c);
-    purgeExpiredArchivedBots(db, s.accountId);
+    ctx.engine.purgeExpiredArchives(s.accountId);
     const bots = db.all("SELECT * FROM bots WHERE account_id = ? AND status = 'active' ORDER BY created_at", [
       s.accountId,
     ]);
@@ -339,7 +386,7 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
 
   app.post("/v1/bots/:id/restore", (c) => {
     const s = requireSession(c);
-    purgeExpiredArchivedBots(db, s.accountId);
+    ctx.engine.purgeExpiredArchives(s.accountId);
     const bot = db.get<{ id: string; name: string; status: string }>(
       "SELECT id, name, status FROM bots WHERE id = ? AND account_id = ?",
       [c.req.param("id"), s.accountId],
@@ -378,6 +425,11 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
     if (bot.status !== "archived") return { status: 409 as const, json: { error: "archive_first" } };
     void ctx.engine.runnerFor(accountId).acpFor(bot.id)?.kill();
     deleteBotPermanently(db, bot.id);
+    try {
+      ctx.engine.runnerFor(accountId).deleteProject(bot.id);
+    } catch (err) {
+      ctx.log.error("delete bot project failed", { botId: bot.id, error: String(err) });
+    }
     return { status: 200 as const, json: { ok: true } };
   }
 
@@ -911,7 +963,33 @@ export function createApp(cfg: HomeConfig): { app: Hono; ctx: AppContext; ready:
     ctx,
     ready: () => undefined,
     websocket,
-  } as { app: Hono; ctx: AppContext; ready: () => void; websocket: typeof websocket };
+    stop: () => stopApp(ctx),
+  } as { app: Hono; ctx: AppContext; ready: () => void; stop: () => void; websocket: typeof websocket };
+}
+
+function stopApp(ctx: AppContext): void {
+  if (ctx.maintenanceTimer == null) return;
+  clearInterval(ctx.maintenanceTimer);
+  ctx.maintenanceTimer = undefined;
+}
+
+function bunRequestIp(env: unknown, req: Request): string {
+  if (!env || typeof env !== "object") return "";
+  const rec = env as {
+    requestIP?: (r: Request) => { address?: string } | null;
+    server?: { requestIP?: (r: Request) => { address?: string } | null };
+  };
+  try {
+    const direct = rec.requestIP?.(req)?.address;
+    if (direct) return direct;
+  } catch {
+    /* fetch adapter did not bind Bun.Server */
+  }
+  try {
+    return rec.server?.requestIP?.(req)?.address ?? "";
+  } catch {
+    return "";
+  }
 }
 
 function botPresence(ctx: AppContext, botId: string): { key: string; label: string } {

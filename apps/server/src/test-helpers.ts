@@ -2,6 +2,7 @@ import { completeGithubLogin, cookieHeader, writeAllowlistFile } from "@openbot/
 import { createApp, type HomeConfig } from "./app.ts";
 
 export function startTestServer(cfg: Partial<HomeConfig> & { home: string; port?: number }) {
+  process.env.OPENBOT_ACP_IDLE_MS = process.env.OPENBOT_ACP_IDLE_MS ?? "0";
   const port = cfg.port ?? 0;
   const created = createApp({
     home: cfg.home,
@@ -10,6 +11,7 @@ export function startTestServer(cfg: Partial<HomeConfig> & { home: string; port?
     githubClientSecret: cfg.githubClientSecret,
     publicOrigin: cfg.publicOrigin,
     logger: cfg.logger,
+    env: cfg.env,
   });
   const server = Bun.serve({
     port,
@@ -19,6 +21,11 @@ export function startTestServer(cfg: Partial<HomeConfig> & { home: string; port?
   });
   created.ctx.port = server.port;
   const origin = `http://127.0.0.1:${server.port}`;
+  const rawStop = server.stop.bind(server);
+  server.stop = ((close?: boolean) => {
+    created.stop();
+    rawStop(close);
+  }) as typeof server.stop;
   return { ...created, server, origin };
 }
 

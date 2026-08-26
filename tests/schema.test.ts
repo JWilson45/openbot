@@ -20,6 +20,7 @@ test("schema applies on a fresh sqlite file", () => {
     "credentials",
     "takeover_tickets",
     "api_keys",
+    "org_meta",
   ]) {
     expect(names).toContain(required);
   }
@@ -42,4 +43,22 @@ test("schema applies on a fresh sqlite file", () => {
   ]) {
     expect(apiKeyCols).toContain(col);
   }
+  const orgCols = db.all<{ name: string; dflt_value: unknown; notnull: number }>("PRAGMA table_info(org_meta)");
+  const orgNames = orgCols.map((c) => c.name);
+  for (const col of [
+    "id",
+    "account_id",
+    "org_id",
+    "slug",
+    "name",
+    "public_origin",
+    "pubkey",
+    "federation_enabled",
+    "created_at",
+  ]) {
+    expect(orgNames).toContain(col);
+  }
+  const fed = orgCols.find((c) => c.name === "federation_enabled");
+  expect(fed?.notnull).toBe(1);
+  expect(String(fed?.dflt_value)).toBe("0");
 });
