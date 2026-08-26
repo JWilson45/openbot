@@ -307,6 +307,24 @@ describe("org peers HTTP", () => {
       expect(Buffer.from(info.pubkey, "base64").length).toBe(32);
       expect(listOrgPeers(admin.ctx.db).length).toBe(0);
 
+      const port = new URL(peer.origin).port;
+      const viaLocalhost = await fetch(`${admin.origin}/v1/org/peers/from-info`, {
+        method: "POST",
+        headers: { cookie, "content-type": "application/json" },
+        body: JSON.stringify({ baseUrl: `http://localhost:${port}` }),
+      });
+      expect(viaLocalhost.status).toBe(200);
+      expect(((await viaLocalhost.json()) as { orgId: string }).orgId).toBe(info.orgId);
+      expect(listOrgPeers(admin.ctx.db).length).toBe(0);
+
+      const dual = await fetchPeerFedInfo(`http://localhost:${port}`, {
+        lookup: async () => [
+          { address: "::1", family: 6 },
+          { address: "127.0.0.1", family: 4 },
+        ],
+      });
+      expect((dual as { orgId: string }).orgId).toBe(info.orgId);
+
       const blocked = await fetch(`${admin.origin}/v1/org/peers/from-info`, {
         method: "POST",
         headers: { cookie, "content-type": "application/json" },

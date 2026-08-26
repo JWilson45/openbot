@@ -614,27 +614,58 @@ export async function fetchPeerFedInfo(
     throw new OrgPeerError("invalid_peer_url", "invalid_peer_url");
   }
   const host = url.hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
-  const addrs = await resolvePeerAddresses(host, opts?.lookup ?? defaultPeerLookup);
-  const pin = addrs[0]!;
+  const deadlineAt = Date.now() + FED_INFO_FETCH_TIMEOUT_MS;
+  const addrs = await raceDeadline(
+    resolvePeerAddresses(host, opts?.lookup ?? defaultPeerLookup),
+    deadlineAt,
+  );
   const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
   if (!Number.isInteger(port) || port <= 0) throw new OrgPeerError("invalid_peer_url", "invalid_peer_url");
-  const { status, body } = await pinnedFedInfoGet({
-    https: url.protocol === "https:",
-    connectIp: pin,
-    port,
-    hostHeader: url.host,
-    servername: host,
-  });
-  if (status < 200 || status >= 300) throw new OrgPeerError("info_failed", "info_failed");
-  try {
-    return JSON.parse(body.toString("utf8"));
-  } catch {
-    throw new OrgPeerError("info_failed", "info_failed");
+  for (const pin of addrs) {
+    if (Date.now() >= deadlineAt) break;
+    try {
+      const { status, body } = await pinnedFedInfoGet({
+        https: url.protocol === "https:",
+        connectIp: pin,
+        port,
+        hostHeader: url.host,
+        servername: host,
+        deadlineAt,
+      });
+      if (status < 200 || status >= 300) throw new OrgPeerError("info_failed", "info_failed");
+      try {
+        return JSON.parse(body.toString("utf8"));
+      } catch {
+        throw new OrgPeerError("info_failed", "info_failed");
+      }
+    } catch (err) {
+      if (err instanceof OrgPeerError && err.code === "info_connect") continue;
+      throw err;
+    }
   }
+  throw new OrgPeerError("info_failed", "info_failed");
 }
 
 async function defaultPeerLookup(hostname: string): Promise<Array<{ address: string; family: number }>> {
   return dnsLookup(hostname, { all: true });
+}
+
+function raceDeadline<T>(p: Promise<T>, deadlineAt: number): Promise<T> {
+  const ms = deadlineAt - Date.now();
+  if (ms <= 0) return Promise.reject(new OrgPeerError("info_failed", "info_failed"));
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new OrgPeerError("info_failed", "info_failed")), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(t);
+        reject(err);
+      },
+    );
+  });
 }
 
 function pinnedFedInfoGet(opts: {
@@ -643,14 +674,23 @@ function pinnedFedInfoGet(opts: {
   port: number;
   hostHeader: string;
   servername: string;
+  deadlineAt: number;
 }): Promise<{ status: number; body: Buffer }> {
   return new Promise((resolve, reject) => {
     let settled = false;
+    let gotResponse = false;
+    let kill: ReturnType<typeof setTimeout> | undefined;
     const fail = (err: OrgPeerError) => {
       if (settled) return;
       settled = true;
+      if (kill) clearTimeout(kill);
       reject(err);
     };
+    const remaining = opts.deadlineAt - Date.now();
+    if (remaining <= 0) {
+      reject(new OrgPeerError("info_connect", "info_failed"));
+      return;
+    }
     const family = expandIpv6(opts.connectIp) ? 6 : 4;
     const reqFn = opts.https ? httpsRequest : httpRequest;
     const req = reqFn(
@@ -661,10 +701,10 @@ function pinnedFedInfoGet(opts: {
         method: "GET",
         family,
         headers: { accept: "application/json", host: opts.hostHeader },
-        timeout: FED_INFO_FETCH_TIMEOUT_MS,
         ...(opts.https ? { servername: opts.servername } : {}),
       },
       (res) => {
+        gotResponse = true;
         const cl = res.headers["content-length"];
         if (cl && Number(cl) > FED_INFO_FETCH_MAX_BYTES) {
           req.destroy();
@@ -686,16 +726,17 @@ function pinnedFedInfoGet(opts: {
         res.on("end", () => {
           if (settled) return;
           settled = true;
+          clearTimeout(kill);
           resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks) });
         });
         res.on("error", () => fail(new OrgPeerError("info_failed", "info_failed")));
       },
     );
-    req.on("timeout", () => {
+    kill = setTimeout(() => {
       req.destroy();
-      fail(new OrgPeerError("info_failed", "info_failed"));
-    });
-    req.on("error", () => fail(new OrgPeerError("info_failed", "info_failed")));
+      fail(new OrgPeerError(gotResponse ? "info_failed" : "info_connect", "info_failed"));
+    }, remaining);
+    req.on("error", () => fail(new OrgPeerError(gotResponse ? "info_failed" : "info_connect", "info_failed")));
     req.end();
   });
 }
