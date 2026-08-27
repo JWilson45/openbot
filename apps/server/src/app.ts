@@ -1900,6 +1900,10 @@ export function createApp(cfg: HomeConfig): {
                 void runner.navigate(String(msg.url ?? ""), { duringTakeover: true });
                 return;
               }
+              if (msg.type === "viewport") {
+                void runner.setScreencastViewport(Number(msg.width), Number(msg.height));
+                return;
+              }
               void runner.dispatchInput(msg);
             } catch {
               /* ignore */

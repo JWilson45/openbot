@@ -270,7 +270,7 @@ export const SPA_HTML = `<!DOCTYPE html>
     }
     .modal-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; flex: 0 0 auto; }
     #takeover-frame {
-      width: 100%; height: 100%; max-width: 100%; max-height: 100%;
+      width: auto; height: auto; max-width: 100%; max-height: 100%;
       object-fit: contain; background: #11161e; display: block; border: 0; border-radius: 0;
     }
     .empty { margin: auto; text-align: center; color: var(--muted); padding: 24px; }
@@ -2870,8 +2870,8 @@ export const SPA_HTML = `<!DOCTYPE html>
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(proto + '://' + location.host + '/v1/takeover');
     ws.binaryType = 'arraybuffer';
-    const close = openOverlay(overlay, () => { try { ws.close(); } catch {} });
-    function endTakeover() { try { ws.close(); } catch {} close(); }
+    const close = openOverlay(overlay, () => { try { ws.close(); } catch {} window.removeEventListener('resize', sendViewport); });
+    function endTakeover() { try { ws.close(); } catch {} window.removeEventListener('resize', sendViewport); close(); }
     overlay.querySelector('#done').onclick = endTakeover;
     const canvas = overlay.querySelector('#takeover-frame');
     canvas.tabIndex = 0;
@@ -2883,7 +2883,18 @@ export const SPA_HTML = `<!DOCTYPE html>
       overlay.querySelector('#tk-url').value = url;
       ws.send(JSON.stringify({ type:'navigate', url }));
     };
-    ws.onopen = () => ws.send(JSON.stringify({ type:'auth', ticket: t.ticket }));
+    function sendViewport() {
+      const stage = overlay.querySelector('.tk-stage');
+      if (!stage || ws.readyState !== 1) return;
+      const r = stage.getBoundingClientRect();
+      if (r.width < 40 || r.height < 40) return;
+      ws.send(JSON.stringify({ type:'viewport', width: Math.round(r.width), height: Math.round(r.height) }));
+    }
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type:'auth', ticket: t.ticket }));
+      setTimeout(sendViewport, 200);
+    };
+    window.addEventListener('resize', sendViewport);
     let frameUrl = '';
     ws.onmessage = (ev) => {
       if (typeof ev.data === 'string') {

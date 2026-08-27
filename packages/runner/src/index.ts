@@ -293,12 +293,34 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     });
     this.browser!.screencast = conn;
     await conn.send("Page.enable");
+    const vp = this.browser!.viewport ?? { width: 1280, height: 720 };
+    await conn.send("Emulation.setDeviceMetricsOverride", {
+      width: vp.width,
+      height: vp.height,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
     await conn.send("Page.startScreencast", {
       format: "jpeg",
-      quality: 60,
-      maxWidth: 1280,
-      maxHeight: 720,
+      quality: 70,
+      maxWidth: Math.max(vp.width, 1280),
+      maxHeight: Math.max(vp.height, 720),
       everyNthFrame: 1,
+    });
+  }
+
+  async setScreencastViewport(width: number, height: number): Promise<void> {
+    const w = Math.max(640, Math.min(2560, Math.round(width)));
+    const h = Math.max(400, Math.min(1440, Math.round(height)));
+    if (!this.browser) return;
+    this.browser.viewport = { width: w, height: h };
+    const conn = this.browser.screencast;
+    if (!conn) return;
+    await conn.send("Emulation.setDeviceMetricsOverride", {
+      width: w,
+      height: h,
+      deviceScaleFactor: 1,
+      mobile: false,
     });
   }
 
@@ -622,6 +644,7 @@ async function launchChromium(
       "--disable-gpu",
       "--no-first-run",
       "--disable-extensions",
+      "--window-size=1280,720",
       "about:blank",
     ],
     stdout: "pipe",
