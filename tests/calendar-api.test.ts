@@ -194,6 +194,10 @@ describe("calendar api", () => {
     expect(proposed.kind).toBe("routine");
     expect(proposed.status).toBe("proposed");
     expect(proposed.created_by).toBe("learn");
+    const before = (await fetch(`${origin}/v1/calendar/series/${proposed.id}`, { headers }).then((r) => r.json())) as {
+      nextFire: number | null;
+    };
+    expect(before.nextFire).toBeNull();
 
     const ok = await fetch(`${origin}/v1/calendar/series/${proposed.id}/confirm`, { method: "POST", headers });
     expect(ok.status).toBe(200);
@@ -276,6 +280,33 @@ describe("calendar api", () => {
       body: JSON.stringify({ threadId: id() }),
     });
     expect(missing.status).toBe(404);
+
+    const a2aId = id();
+    ctx.db.run(
+      `INSERT INTO threads (id, account_id, bot_id, title, kind, peer_bot_id, created_at)
+       VALUES (?, ?, ?, 'a2a', 'a2a', ?, ?)`,
+      [a2aId, ctx.db.get<{ account_id: string }>("SELECT account_id FROM bots WHERE id = ?", [ada.bot.id])!.account_id, ada.bot.id, bob.bot.id, t],
+    );
+    const learnA2a = await fetch(`${origin}/v1/calendar/learn`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ threadId: a2aId }),
+    });
+    expect(learnA2a.status).toBe(400);
+    expect(((await learnA2a.json()) as { error: string }).error).toBe("invalid_thread");
+    const createA2a = await fetch(`${origin}/v1/calendar/series`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        title: "a2a",
+        prompt: "nope",
+        botId: ada.bot.id,
+        dtstart: futureDtstart(),
+        threadId: a2aId,
+      }),
+    });
+    expect(createA2a.status).toBe(400);
+    expect(((await createA2a.json()) as { error: string }).error).toBe("invalid_thread");
     server.stop(true);
   });
 
@@ -364,6 +395,101 @@ describe("calendar api", () => {
     expect(ctx.db.get<{ status: string }>("SELECT status FROM calendar_series WHERE id = ?", [seriesId])?.status).toBe(
       "paused",
     );
+    server.stop(true);
+  });
+
+  test("pause then unpause restores scheduled instances; occurrence cancel stays EXDATE", async () => {
+    const { ctx, server, origin, headers } = startWorld();
+    const ada = await createBot(origin, headers, "Ada");
+    const dtstart = futureDtstart();
+    const created = await fetch(`${origin}/v1/calendar/series`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        title: "daily",
+        prompt: "ping",
+        botId: ada.bot.id,
+        dtstart,
+        rrule: "FREQ=DAILY",
+      }),
+    });
+    expect(created.status).toBe(201);
+    const series = ((await created.json()) as { series: Series & { next_due_at: number | null } }).series;
+    const before = ctx.db.all<{ id: string; scheduled_at: number; status: string }>(
+      "SELECT id, scheduled_at, status FROM calendar_instances WHERE series_id = ? ORDER BY scheduled_at",
+      [series.id],
+    );
+    expect(before.length).toBeGreaterThan(1);
+    expect(before.every((i) => i.status === "scheduled")).toBe(true);
+    const times = before.map((i) => i.scheduled_at);
+    expect(series.next_due_at).toBe(times[0]);
+
+    const cancelledOcc = await fetch(`${origin}/v1/calendar/instances/${before[0]!.id}/cancel`, {
+      method: "POST",
+      headers,
+    });
+    expect(cancelledOcc.status).toBe(200);
+
+    const queuedInst = id();
+    const turnId = id();
+    const t = now();
+    ctx.db.run(
+      `INSERT INTO turns (id, thread_id, bot_id, status, sent_message_count, assistant_text, created_at)
+       VALUES (?, ?, ?, 'queued', 0, '', ?)`,
+      [turnId, ada.threadId, ada.bot.id, t],
+    );
+    ctx.db.run(
+      `INSERT INTO calendar_instances (id, series_id, scheduled_at, status, turn_id, created_at)
+       VALUES (?, ?, ?, 'queued', ?, ?)`,
+      [queuedInst, series.id, times[1]! + 1, turnId, t],
+    );
+
+    const paused = await fetch(`${origin}/v1/calendar/series/${series.id}/pause`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ paused: true }),
+    });
+    expect(paused.status).toBe(200);
+    const pausedRows = ctx.db.all<{ id: string; status: string }>(
+      "SELECT id, status FROM calendar_instances WHERE series_id = ?",
+      [series.id],
+    );
+    expect(pausedRows.find((i) => i.id === before[0]!.id)?.status).toBe("cancelled");
+    expect(pausedRows.find((i) => i.id === queuedInst)?.status).toBe("cancelled");
+    expect(ctx.db.get<{ status: string }>("SELECT status FROM turns WHERE id = ?", [turnId])?.status).toBe("cancelled");
+    expect(pausedRows.filter((i) => i.status === "skipped_paused").length).toBeGreaterThan(0);
+    const pausedGet = (await fetch(`${origin}/v1/calendar/series/${series.id}`, { headers }).then((r) => r.json())) as {
+      nextFire: number | null;
+      series: { status: string };
+    };
+    expect(pausedGet.series.status).toBe("paused");
+    expect(pausedGet.nextFire).toBeNull();
+
+    const unpaused = await fetch(`${origin}/v1/calendar/series/${series.id}/pause`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ paused: false }),
+    });
+    expect(unpaused.status).toBe(200);
+    const after = ctx.db.all<{ scheduled_at: number; status: string }>(
+      "SELECT scheduled_at, status FROM calendar_instances WHERE series_id = ? ORDER BY scheduled_at",
+      [series.id],
+    );
+    expect(after.filter((i) => i.status === "skipped_paused")).toEqual([]);
+    expect(after.find((i) => i.scheduled_at === times[0])?.status).toBe("cancelled");
+    expect(after.find((i) => i.scheduled_at === times[1]! + 1)?.status).toBe("cancelled");
+    const restored = after.filter((i) => i.status === "scheduled").map((i) => i.scheduled_at);
+    expect(restored).toEqual(times.slice(1));
+    const active = ctx.db.get<{ status: string; next_due_at: number | null }>(
+      "SELECT status, next_due_at FROM calendar_series WHERE id = ?",
+      [series.id],
+    );
+    expect(active?.status).toBe("active");
+    expect(active?.next_due_at).toBe(times[1]);
+    const activeGet = (await fetch(`${origin}/v1/calendar/series/${series.id}`, { headers }).then((r) => r.json())) as {
+      nextFire: number | null;
+    };
+    expect(activeGet.nextFire).toBe(times[1]);
     server.stop(true);
   });
 });

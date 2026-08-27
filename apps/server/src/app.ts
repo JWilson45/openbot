@@ -1003,6 +1003,7 @@ export function createApp(cfg: HomeConfig): {
       [parsed.data.threadId, s.accountId],
     );
     if (!thread) return c.json({ error: "not_found" }, 404);
+    if (!isCalendarFiringThreadKind(thread.kind)) return c.json({ error: "invalid_thread" }, 400);
     const assigneeId = parsed.data.botId ?? thread.bot_id;
     const bot = resolveCalendarAssignee(db, s.accountId, assigneeId);
     if ("error" in bot) return c.json({ error: bot.error }, bot.status);
@@ -2175,6 +2176,11 @@ function resolveCalendarAssignee(
   return { id: bot.id, name: bot.name, require_human_approval: bot.require_human_approval };
 }
 
+function isCalendarFiringThreadKind(kind: string | null | undefined): boolean {
+  const k = kind || "human";
+  return k === "human" || k === "group";
+}
+
 function resolveCalendarThread(
   db: OpenbotDb,
   accountId: string,
@@ -2187,6 +2193,7 @@ function resolveCalendarThread(
       [threadId, accountId],
     );
     if (!thread) return { error: "not_found", status: 404 };
+    if (!isCalendarFiringThreadKind(thread.kind)) return { error: "invalid_thread", status: 400 };
     return thread;
   }
   const dm = humanThread(db, botId);
@@ -2196,11 +2203,18 @@ function resolveCalendarThread(
 
 function suppressOpenCalendarInstances(db: OpenbotDb, seriesId: string, mode: "pause" | "cancel"): void {
   const t = now();
-  const next = mode === "pause" ? "skipped_paused" : "cancelled";
-  db.run(
-    `UPDATE calendar_instances SET status = ? WHERE series_id = ? AND status IN ('scheduled', 'due')`,
-    [next, seriesId],
-  );
+  if (mode === "pause") {
+    db.run(
+      `UPDATE calendar_instances SET status = 'skipped_paused' WHERE series_id = ? AND status IN ('scheduled', 'due')`,
+      [seriesId],
+    );
+  } else {
+    db.run(
+      `UPDATE calendar_instances SET status = 'cancelled', skipped_reason = 'series_cancelled'
+        WHERE series_id = ? AND status IN ('scheduled', 'due')`,
+      [seriesId],
+    );
+  }
   const queued = db.all<{ id: string; turn_id: string | null }>(
     `SELECT id, turn_id FROM calendar_instances WHERE series_id = ? AND status = 'queued'`,
     [seriesId],
@@ -2212,7 +2226,10 @@ function suppressOpenCalendarInstances(db: OpenbotDb, seriesId: string, mode: "p
         inst.turn_id,
       ]);
     }
-    db.run(`UPDATE calendar_instances SET status = ? WHERE id = ?`, [next, inst.id]);
+    db.run(
+      `UPDATE calendar_instances SET status = 'cancelled', skipped_reason = ? WHERE id = ?`,
+      [mode === "cancel" ? "series_cancelled" : null, inst.id],
+    );
   }
 }
 
@@ -2231,7 +2248,14 @@ function rematerializeScheduledInstances(db: OpenbotDb, series: CalendarSeriesRo
     }
     db.run(`UPDATE calendar_instances SET status = 'cancelled' WHERE id = ?`, [inst.id]);
   }
-  db.run(`DELETE FROM calendar_instances WHERE series_id = ? AND status IN ('scheduled', 'due')`, [series.id]);
+  db.run(
+    `DELETE FROM calendar_instances
+      WHERE series_id = ? AND (
+        status IN ('scheduled', 'due', 'skipped_paused')
+        OR (status = 'cancelled' AND skipped_reason = 'series_cancelled')
+      )`,
+    [series.id],
+  );
   let times: number[] = [];
   try {
     const horizon = materializeHorizon({
@@ -2273,6 +2297,7 @@ function rematerializeScheduledInstances(db: OpenbotDb, series: CalendarSeriesRo
 }
 
 function nextCalendarFireUtc(db: OpenbotDb, series: CalendarSeriesRow): number | null {
+  if (series.status !== "active") return null;
   const inst = db.get<{ scheduled_at: number }>(
     `SELECT scheduled_at FROM calendar_instances
       WHERE series_id = ? AND status IN ('scheduled', 'due') AND scheduled_at >= ?
