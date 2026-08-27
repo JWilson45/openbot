@@ -309,13 +309,13 @@ describe("calendar fire", () => {
     server.stop(true);
   });
 
-  test("5-minute follow-up waits for the enqueue floor", async () => {
+  test("min-interval follow-up waits for the enqueue floor", async () => {
     const { ctx, server, origin, headers } = startWorld();
     const ada = await createBot(origin, headers, "Ada");
     const accountId = ctx.db.get<{ account_id: string }>("SELECT account_id FROM bots WHERE id = ?", [ada.bot.id])!
       .account_id;
     const firedAt = Date.UTC(2026, 0, 1, 10, 0, 0);
-    const followUp = Date.UTC(2026, 0, 1, 10, 3, 0);
+    const followUp = Date.UTC(2026, 0, 1, 10, 1, 0);
     const seriesId = insertSeries(ctx, {
       accountId,
       botId: ada.bot.id,
@@ -335,7 +335,7 @@ describe("calendar fire", () => {
        VALUES (?, ?, ?, 'due', ?)`,
       [id(), seriesId, followUp, followUp],
     );
-    ctx.engine.tickCalendar(firedAt + 4 * 60_000);
+    ctx.engine.tickCalendar(firedAt + 90_000);
     expect(
       ctx.db.get<{ status: string }>(
         "SELECT status FROM calendar_instances WHERE series_id = ? AND scheduled_at = ?",

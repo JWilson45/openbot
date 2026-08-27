@@ -786,7 +786,7 @@ export const LIST_CALENDAR_TOOL = {
 export const CREATE_EVENT_TOOL = {
   name: "CreateEvent",
   description:
-    "Create a calendar schedule (one-shot or recurring) for a desk bot (you or another). Always status=proposed — it does not fire until ConfirmSeries (after the human agrees in chat) or they Confirm in Calendar. Never auto-activates. Min interval 5 minutes. Cap 32 non-cancelled series. SendMessage urgency=normal when telling them it is waiting. Do not curl OpenBot HTTP.",
+    "Create a calendar schedule (one-shot or recurring) for a desk bot (you or another). Always status=proposed — it does not fire until ConfirmSeries (after the human agrees in chat) or they Confirm in Calendar. Never auto-activates. Min interval 2 minutes. Cap 32 non-cancelled series. SendMessage urgency=normal when telling them it is waiting. Do not curl OpenBot HTTP.",
   inputSchema: {
     type: "object",
     properties: {
