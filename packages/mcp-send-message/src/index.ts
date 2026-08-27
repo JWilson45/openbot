@@ -3,6 +3,7 @@ import {
   ensureThreadBridge,
   humanThread,
   id,
+  isGatewayRole,
   MAX_ACTIVE_BOTS,
   now,
   orderedBotPair,
@@ -16,13 +17,29 @@ import {
 import {
   McpError,
   createBotInput,
+  createEventInput,
   inboxInput,
+  listCalendarInput,
+  pauseSeriesInput,
+  proposeRoutineInput,
   sendMessageInput,
   sendToAgentInput,
   sendToOrgInput,
   sendToThreadInput,
   type SendMessageInput,
 } from "@openbot/api-types";
+import {
+  CAL_CREATE_PER_HOUR,
+  CAL_CREATE_PER_TURN,
+  CAL_MAX_SERIES,
+  CAL_MIN_INTERVAL_MS,
+  RruleError,
+  civilToUtc,
+  isValidTimeZone,
+  materializeHorizon,
+  parseRrule,
+  utcToCivil,
+} from "@openbot/calendar";
 import { signFedJws } from "@openbot/federation";
 import { insertMessage } from "@openbot/live-work";
 
@@ -745,10 +762,78 @@ export const CREATE_BOT_TOOL = {
   },
 };
 
+export const LIST_CALENDAR_TOOL = {
+  name: "ListCalendar",
+  description:
+    "List this org's calendar series (title, kind, status, next fire, assignee). Use before CreateEvent. The human edits the same calendar in the UI.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      status: { type: "string", enum: ["proposed", "active", "paused", "cancelled"] },
+      kind: { type: "string", enum: ["schedule", "routine"] },
+    },
+  },
+};
+
+export const CREATE_EVENT_TOOL = {
+  name: "CreateEvent",
+  description:
+    "Create a calendar schedule (one-shot or recurring) for a desk bot (you or another). Always status=proposed — the human must confirm in Calendar. Never auto-activates. Min interval 5 minutes. Cap 32 non-cancelled series. Do not install every-minute jobs. Do not curl OpenBot HTTP.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      title: { type: "string" },
+      prompt: { type: "string", description: "Work the assignee does when it fires" },
+      botId: { type: "string" },
+      name: { type: "string", description: "Assignee desk bot name" },
+      dtstart: { type: "string", description: "ISO-8601 instant or local civil time" },
+      timezone: { type: "string", description: "IANA tz; default org timezone" },
+      rrule: { type: "string", description: "RFC 5545 subset; omit for one-shot" },
+      threadId: { type: "string" },
+      requireHumanApproval: { type: "boolean" },
+    },
+    required: ["title", "prompt"],
+  },
+};
+
+export const PROPOSE_ROUTINE_TOOL = {
+  name: "ProposeRoutine",
+  description:
+    "Draft a learned routine on the calendar as status=proposed. The human must confirm in Calendar. Not a CDP replay. Not CreateEvent.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      title: { type: "string" },
+      prompt: { type: "string" },
+      botId: { type: "string" },
+      name: { type: "string" },
+      rrule: { type: "string" },
+      dtstart: { type: "string" },
+      timezone: { type: "string" },
+      threadId: { type: "string" },
+    },
+    required: ["title", "prompt"],
+  },
+};
+
+export const PAUSE_SERIES_TOOL = {
+  name: "PauseSeries",
+  description:
+    "Pause or resume a calendar series by id. Pausing skips future fires. The human can also pause in the UI.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      seriesId: { type: "string" },
+      paused: { type: "boolean" },
+    },
+    required: ["seriesId", "paused"],
+  },
+};
+
 export function mcpToolsForRole(role: string | null | undefined): unknown[] {
   const tools: unknown[] = [SEND_MESSAGE_TOOL, SEND_TO_AGENT_TOOL, SEND_TO_THREAD_TOOL, LIST_BOTS_TOOL];
   if (role === "gateway") tools.push(SEND_TO_ORG_TOOL, INBOX_TOOL);
-  else tools.push(CREATE_BOT_TOOL);
+  else tools.push(CREATE_BOT_TOOL, LIST_CALENDAR_TOOL, CREATE_EVENT_TOOL, PROPOSE_ROUTINE_TOOL, PAUSE_SERIES_TOOL);
   return tools;
 }
 
@@ -768,6 +853,7 @@ export type McpHooks = {
   orgPrivateKey?: () => KeyObject;
   fetchFed?: typeof fetch;
   onCreateBot?: (bot: { accountId: string; botId: string; name: string }) => void | Promise<void>;
+  onCalendarDue?: () => void;
 };
 
 const INBOX_PREVIEW = 240;
@@ -950,6 +1036,506 @@ export async function createBot(
   }
 }
 
+type CalendarSeriesRow = {
+  id: string;
+  account_id: string;
+  title: string;
+  prompt: string;
+  assignee_bot_id: string | null;
+  thread_id: string | null;
+  kind: string;
+  status: string;
+  rrule: string | null;
+  dtstart_utc: number;
+  timezone: string;
+  require_human_approval: number;
+  created_by: string;
+  created_by_bot_id: string | null;
+  source_turn_id: string | null;
+  source_thread_id: string | null;
+  capture_summary: string | null;
+  min_interval_ms: number;
+  last_fired_at: number | null;
+  next_due_at: number | null;
+  created_at: number;
+  updated_at: number;
+};
+
+function emptyToNull(value: string | null | undefined): string | null {
+  if (value == null) return null;
+  const t = value.trim();
+  return t ? t : null;
+}
+
+function parseCalendarDtstart(raw: string | number, timeZone: string): number {
+  if (typeof raw === "number") {
+    if (!Number.isFinite(raw)) throw new RruleError("invalid_dtstart");
+    return Math.trunc(raw);
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) throw new RruleError("invalid_dtstart");
+  if (/^-?\d+$/.test(trimmed)) {
+    const n = Number(trimmed);
+    if (!Number.isFinite(n)) throw new RruleError("invalid_dtstart");
+    return n;
+  }
+  if (/Z$|[+-]\d{2}:?\d{2}$/i.test(trimmed)) {
+    const ms = Date.parse(trimmed);
+    if (!Number.isFinite(ms)) throw new RruleError("invalid_dtstart");
+    return ms;
+  }
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(trimmed);
+  if (!m) throw new RruleError("invalid_dtstart");
+  const utc = civilToUtc(
+    Number(m[1]),
+    Number(m[2]),
+    Number(m[3]),
+    m[4] != null ? Number(m[4]) : 0,
+    m[5] != null ? Number(m[5]) : 0,
+    timeZone,
+  );
+  if (utc == null) throw new RruleError("invalid_dtstart");
+  return utc;
+}
+
+function localNineTomorrow(timeZone: string, nowMs: number): number {
+  const later = utcToCivil(nowMs + 24 * 60 * 60 * 1000, timeZone);
+  for (const hour of [9, 10, 11, 8, 12]) {
+    const utc = civilToUtc(later.year, later.month, later.day, hour, 0, timeZone);
+    if (utc != null) return utc;
+  }
+  return nowMs + 24 * 60 * 60 * 1000;
+}
+
+function orgTimezone(db: OpenbotDb): string {
+  return db.get<{ timezone: string }>("SELECT timezone FROM org_meta WHERE id = 'current'")?.timezone ?? "UTC";
+}
+
+function isCalendarFiringThreadKind(kind: string | null | undefined): boolean {
+  const k = kind || "human";
+  return k === "human" || k === "group";
+}
+
+function nonCancelledSeriesCount(db: OpenbotDb, accountId: string, excludeId?: string): number {
+  const row = excludeId
+    ? db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM calendar_series
+          WHERE account_id = ? AND status IN ('active', 'paused', 'proposed') AND id != ?`,
+        [accountId, excludeId],
+      )
+    : db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM calendar_series
+          WHERE account_id = ? AND status IN ('active', 'paused', 'proposed')`,
+        [accountId],
+      );
+  return row?.n ?? 0;
+}
+
+function countCalendarCreatesHourly(db: OpenbotDb, accountId: string): number {
+  return (
+    db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM audit_events
+        WHERE type = 'calendar.create' AND account_id = ? AND created_at > ?`,
+      [accountId, now() - 60 * 60 * 1000],
+    )?.n ?? 0
+  );
+}
+
+function countCalendarCreatesThisTurn(db: OpenbotDb, accountId: string, turnId: string): number {
+  return (
+    db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM audit_events
+        WHERE type = 'calendar.create' AND account_id = ? AND json_extract(payload, '$.turnId') = ?`,
+      [accountId, turnId],
+    )?.n ?? 0
+  );
+}
+
+function resolveMcpCalendarAssignee(
+  db: OpenbotDb,
+  claims: McpClaims,
+  input: { botId?: string; name?: string },
+): { id: string; name: string; require_human_approval: number } {
+  const bot = input.botId
+    ? db.get<{
+        id: string;
+        name: string;
+        status: string;
+        role: string | null;
+        require_human_approval: number;
+      }>("SELECT id, name, status, role, require_human_approval FROM bots WHERE id = ? AND account_id = ?", [
+        input.botId,
+        claims.accountId,
+      ])
+    : input.name
+      ? db.get<{
+          id: string;
+          name: string;
+          status: string;
+          role: string | null;
+          require_human_approval: number;
+        }>(
+          `SELECT id, name, status, role, require_human_approval FROM bots
+           WHERE account_id = ? AND status = 'active' AND lower(name) = lower(?)`,
+          [claims.accountId, input.name],
+        )
+      : db.get<{
+          id: string;
+          name: string;
+          status: string;
+          role: string | null;
+          require_human_approval: number;
+        }>("SELECT id, name, status, role, require_human_approval FROM bots WHERE id = ?", [claims.botId]);
+  if (!bot) throw new McpError("not_found", "assignee bot not found", 404);
+  if (isGatewayRole(bot.role)) throw new McpError("forbidden", "cannot target Gateway", 403);
+  if (bot.status !== "active") throw new McpError("invalid_assignee", "assignee is not an active desk bot", 400);
+  return { id: bot.id, name: bot.name, require_human_approval: bot.require_human_approval };
+}
+
+function resolveMcpCalendarThread(db: OpenbotDb, accountId: string, threadId: string): { id: string; kind: string } {
+  const thread = db.get<{ id: string; kind: string; account_id: string }>(
+    "SELECT id, kind, account_id FROM threads WHERE id = ?",
+    [threadId],
+  );
+  if (!thread || thread.account_id !== accountId) throw new McpError("not_found", "thread not found", 404);
+  if (!isCalendarFiringThreadKind(thread.kind)) {
+    throw new McpError("invalid_thread", "calendar thread must be a human DM or group", 400);
+  }
+  return { id: thread.id, kind: thread.kind };
+}
+
+function suppressOpenCalendarInstances(db: OpenbotDb, seriesId: string, mode: "pause" | "cancel"): void {
+  const t = now();
+  if (mode === "pause") {
+    db.run(
+      `UPDATE calendar_instances SET status = 'skipped_paused' WHERE series_id = ? AND status IN ('scheduled', 'due')`,
+      [seriesId],
+    );
+  } else {
+    db.run(
+      `UPDATE calendar_instances SET status = 'cancelled', skipped_reason = 'series_cancelled'
+        WHERE series_id = ? AND status IN ('scheduled', 'due')`,
+      [seriesId],
+    );
+  }
+  const queued = db.all<{ id: string; turn_id: string | null }>(
+    `SELECT id, turn_id FROM calendar_instances WHERE series_id = ? AND status = 'queued'`,
+    [seriesId],
+  );
+  for (const inst of queued) {
+    if (inst.turn_id) {
+      db.run(`UPDATE turns SET status = 'cancelled', finished_at = ? WHERE id = ? AND status = 'queued'`, [
+        t,
+        inst.turn_id,
+      ]);
+    }
+    db.run(`UPDATE calendar_instances SET status = 'cancelled', skipped_reason = ? WHERE id = ?`, [
+      mode === "cancel" ? "series_cancelled" : null,
+      inst.id,
+    ]);
+  }
+}
+
+function rematerializeScheduledInstances(db: OpenbotDb, series: CalendarSeriesRow): void {
+  const t = now();
+  const queued = db.all<{ id: string; turn_id: string | null }>(
+    `SELECT id, turn_id FROM calendar_instances WHERE series_id = ? AND status = 'queued'`,
+    [series.id],
+  );
+  for (const inst of queued) {
+    if (inst.turn_id) {
+      db.run(`UPDATE turns SET status = 'cancelled', finished_at = ? WHERE id = ? AND status = 'queued'`, [
+        t,
+        inst.turn_id,
+      ]);
+    }
+    db.run(`UPDATE calendar_instances SET status = 'cancelled' WHERE id = ?`, [inst.id]);
+  }
+  db.run(
+    `DELETE FROM calendar_instances
+      WHERE series_id = ? AND (
+        status IN ('scheduled', 'due', 'skipped_paused')
+        OR (status = 'cancelled' AND skipped_reason = 'series_cancelled')
+      )`,
+    [series.id],
+  );
+  let times: number[] = [];
+  try {
+    const horizon = materializeHorizon({
+      dtstartUtc: series.dtstart_utc,
+      timezone: series.timezone,
+      rrule: series.rrule,
+      nowMs: t,
+    });
+    times = [...(horizon.catchup != null ? [horizon.catchup] : []), ...horizon.future];
+  } catch {
+    if (series.dtstart_utc >= t) times = [series.dtstart_utc];
+  }
+  const seen = new Set<number>();
+  for (const scheduledAt of times) {
+    if (seen.has(scheduledAt)) continue;
+    seen.add(scheduledAt);
+    const exists = db.get("SELECT id FROM calendar_instances WHERE series_id = ? AND scheduled_at = ?", [
+      series.id,
+      scheduledAt,
+    ]);
+    if (exists) continue;
+    db.run(
+      `INSERT INTO calendar_instances (id, series_id, scheduled_at, status, created_at)
+       VALUES (?, ?, ?, 'scheduled', ?)`,
+      [id(), series.id, scheduledAt, t],
+    );
+  }
+  const next = db.get<{ scheduled_at: number }>(
+    `SELECT scheduled_at FROM calendar_instances
+      WHERE series_id = ? AND status IN ('scheduled', 'due')
+      ORDER BY scheduled_at LIMIT 1`,
+    [series.id],
+  );
+  db.run(`UPDATE calendar_series SET next_due_at = ?, updated_at = ? WHERE id = ?`, [
+    next?.scheduled_at ?? null,
+    t,
+    series.id,
+  ]);
+}
+
+export function listCalendar(
+  db: OpenbotDb,
+  inflight: McpInflight,
+  bearer: string | undefined,
+  rawInput: unknown,
+): {
+  ok: true;
+  timezone: string;
+  series: Array<{
+    id: string;
+    title: string;
+    kind: string;
+    status: string;
+    nextFire: number | null;
+    assigneeBotId: string | null;
+    assigneeName: string | null;
+  }>;
+} {
+  const input = parseOrThrow(listCalendarInput, coerceToolArgs(rawInput));
+  const claims = verifyMcpToken(db, bearer);
+  inflight.add(claims.harnessSessionId);
+  try {
+    requireDesk(db, claims, "ListCalendar");
+    const turn = lockRunningTurn(db, claims);
+    if (!turn) throw new McpError("no_active_turn", "no running turn for this harness session", 409);
+    const rows = db.all<{
+      id: string;
+      title: string;
+      kind: string;
+      status: string;
+      next_due_at: number | null;
+      assignee_bot_id: string | null;
+      assignee_name: string | null;
+    }>(
+      `SELECT s.id, s.title, s.kind, s.status, s.next_due_at, s.assignee_bot_id, b.name AS assignee_name
+       FROM calendar_series s
+       LEFT JOIN bots b ON b.id = s.assignee_bot_id
+       WHERE s.account_id = ?
+         AND (? IS NULL OR s.status = ?)
+         AND (? IS NULL OR s.kind = ?)
+       ORDER BY s.created_at, s.id`,
+      [claims.accountId, input.status ?? null, input.status ?? null, input.kind ?? null, input.kind ?? null],
+    );
+    return {
+      ok: true,
+      timezone: orgTimezone(db),
+      series: rows.map((row) => ({
+        id: row.id,
+        title: row.title,
+        kind: row.kind,
+        status: row.status,
+        nextFire: row.status === "active" ? row.next_due_at : null,
+        assigneeBotId: row.assignee_bot_id,
+        assigneeName: row.assignee_name,
+      })),
+    };
+  } finally {
+    inflight.remove(claims.harnessSessionId);
+  }
+}
+
+function insertProposedSeries(
+  db: OpenbotDb,
+  inflight: McpInflight,
+  bearer: string | undefined,
+  rawInput: unknown,
+  opts: { tool: "CreateEvent" | "ProposeRoutine"; kind: "schedule" | "routine" },
+): { ok: true; seriesId: string; status: "proposed"; kind: "schedule" | "routine"; threadId: string; assigneeBotId: string } {
+  const input = parseOrThrow(opts.tool === "CreateEvent" ? createEventInput : proposeRoutineInput, coerceToolArgs(rawInput));
+  const claims = verifyMcpToken(db, bearer);
+  requireDesk(db, claims, opts.tool);
+  inflight.add(claims.harnessSessionId);
+  try {
+    return db.immediate(() => {
+      const turn = lockRunningTurn(db, claims);
+      if (!turn) throw new McpError("no_active_turn", "no running turn for this harness session", 409);
+      if (countCalendarCreatesThisTurn(db, claims.accountId, turn.id) >= CAL_CREATE_PER_TURN) {
+        throw new McpError("rate_limited", "per-turn calendar create limit", 429);
+      }
+      if (countCalendarCreatesHourly(db, claims.accountId) >= CAL_CREATE_PER_HOUR) {
+        throw new McpError("rate_limited", "hourly calendar create limit", 429);
+      }
+      const assignee = resolveMcpCalendarAssignee(db, claims, input);
+      const thread = resolveMcpCalendarThread(db, claims.accountId, input.threadId ?? turn.thread_id);
+      const timezone = (input.timezone ?? orgTimezone(db)).trim();
+      if (!isValidTimeZone(timezone)) throw new McpError("invalid_timezone", "invalid timezone", 400);
+      const rrule = emptyToNull(input.rrule);
+      if (rrule) {
+        try {
+          parseRrule(rrule);
+        } catch (err) {
+          const code = err instanceof RruleError ? err.code : "invalid_rrule";
+          throw new McpError(code, code, 400);
+        }
+      }
+      let dtstartUtc: number;
+      try {
+        dtstartUtc =
+          input.dtstart != null ? parseCalendarDtstart(input.dtstart, timezone) : localNineTomorrow(timezone, now());
+      } catch (err) {
+        const code = err instanceof RruleError ? err.code : "invalid_dtstart";
+        throw new McpError(code, code, 400);
+      }
+      if (nonCancelledSeriesCount(db, claims.accountId) >= CAL_MAX_SERIES) {
+        throw new McpError("cap", `calendar cap ${CAL_MAX_SERIES} reached`, 409);
+      }
+      const requireHuman =
+        Boolean("requireHumanApproval" in input && input.requireHumanApproval) ||
+        thread.kind === "group" ||
+        Boolean(assignee.require_human_approval);
+      const seriesId = id();
+      const t = now();
+      db.run(
+        `INSERT INTO calendar_series (
+           id, account_id, title, prompt, assignee_bot_id, thread_id, kind, status, rrule,
+           dtstart_utc, timezone, require_human_approval, created_by, created_by_bot_id,
+           source_turn_id, source_thread_id, min_interval_ms, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, 'bot', ?, ?, ?, ?, ?, ?)`,
+        [
+          seriesId,
+          claims.accountId,
+          input.title,
+          input.prompt,
+          assignee.id,
+          thread.id,
+          opts.kind,
+          rrule,
+          dtstartUtc,
+          timezone,
+          requireHuman ? 1 : 0,
+          claims.botId,
+          turn.id,
+          thread.id,
+          CAL_MIN_INTERVAL_MS,
+          t,
+          t,
+        ],
+      );
+      db.run(
+        `INSERT INTO audit_events (id, account_id, actor, type, payload, created_at)
+         VALUES (?, ?, 'harness', 'calendar.create', ?, ?)`,
+        [
+          id(),
+          claims.accountId,
+          JSON.stringify({ seriesId, title: input.title.slice(0, 200), turnId: turn.id, kind: opts.kind }),
+          t,
+        ],
+      );
+      return {
+        ok: true as const,
+        seriesId,
+        status: "proposed" as const,
+        kind: opts.kind,
+        threadId: thread.id,
+        assigneeBotId: assignee.id,
+      };
+    });
+  } finally {
+    inflight.remove(claims.harnessSessionId);
+  }
+}
+
+export function createEvent(
+  db: OpenbotDb,
+  inflight: McpInflight,
+  bearer: string | undefined,
+  rawInput: unknown,
+): { ok: true; seriesId: string; status: "proposed"; kind: "schedule"; threadId: string; assigneeBotId: string } {
+  const result = insertProposedSeries(db, inflight, bearer, rawInput, { tool: "CreateEvent", kind: "schedule" });
+  return { ...result, kind: "schedule" };
+}
+
+export function proposeRoutine(
+  db: OpenbotDb,
+  inflight: McpInflight,
+  bearer: string | undefined,
+  rawInput: unknown,
+): { ok: true; seriesId: string; status: "proposed"; kind: "routine"; threadId: string; assigneeBotId: string } {
+  const result = insertProposedSeries(db, inflight, bearer, rawInput, { tool: "ProposeRoutine", kind: "routine" });
+  return { ...result, kind: "routine" };
+}
+
+export function pauseSeries(
+  db: OpenbotDb,
+  inflight: McpInflight,
+  bearer: string | undefined,
+  rawInput: unknown,
+  hooks?: McpHooks,
+): { ok: true; seriesId: string; status: string } {
+  const input = parseOrThrow(pauseSeriesInput, coerceToolArgs(rawInput));
+  const claims = verifyMcpToken(db, bearer);
+  requireDesk(db, claims, "PauseSeries");
+  inflight.add(claims.harnessSessionId);
+  try {
+    let tick = false;
+    const result = db.immediate(() => {
+      const turn = lockRunningTurn(db, claims);
+      if (!turn) throw new McpError("no_active_turn", "no running turn for this harness session", 409);
+      const series = db.get<CalendarSeriesRow>("SELECT * FROM calendar_series WHERE id = ? AND account_id = ?", [
+        input.seriesId,
+        claims.accountId,
+      ]);
+      if (!series) throw new McpError("not_found", "series not found", 404);
+      if (input.paused) {
+        if (series.status === "cancelled") throw new McpError("cancelled", "series is cancelled", 409);
+        if (series.status !== "paused") {
+          db.run(`UPDATE calendar_series SET status = 'paused', updated_at = ? WHERE id = ?`, [now(), series.id]);
+          suppressOpenCalendarInstances(db, series.id, "pause");
+        }
+      } else {
+        if (series.status === "active") {
+          return { ok: true as const, seriesId: series.id, status: "active" };
+        }
+        if (series.status !== "paused") throw new McpError("not_paused", "series is not paused", 409);
+        if (nonCancelledSeriesCount(db, claims.accountId, series.id) >= CAL_MAX_SERIES) {
+          throw new McpError("cap", `calendar cap ${CAL_MAX_SERIES} reached`, 409);
+        }
+        db.run(`UPDATE calendar_series SET status = 'active', updated_at = ? WHERE id = ?`, [now(), series.id]);
+        const updated = db.get<CalendarSeriesRow>("SELECT * FROM calendar_series WHERE id = ?", [series.id]);
+        if (updated) rematerializeScheduledInstances(db, updated);
+        tick = true;
+      }
+      const after = db.get<CalendarSeriesRow>("SELECT * FROM calendar_series WHERE id = ?", [series.id]);
+      db.run(
+        `INSERT INTO audit_events (id, account_id, actor, type, payload, created_at)
+         VALUES (?, ?, 'harness', 'calendar.pause', ?, ?)`,
+        [id(), claims.accountId, JSON.stringify({ seriesId: series.id, paused: input.paused }), now()],
+      );
+      return { ok: true as const, seriesId: series.id, status: after?.status ?? series.status };
+    });
+    if (tick) hooks?.onCalendarDue?.();
+    return result;
+  } finally {
+    inflight.remove(claims.harnessSessionId);
+  }
+}
+
 function federationIsOn(db: OpenbotDb, hooks?: McpHooks): boolean {
   if (hooks?.federationEffective) return hooks.federationEffective();
   const row = db.get<{ federation_enabled: number }>(
@@ -1072,7 +1658,7 @@ export async function handleMcpJsonRpc(
           result: {
             protocolVersion: requested,
             capabilities: { tools: { listChanged: false } },
-            serverInfo: { name: "openbot", version: "0.3.0" },
+            serverInfo: { name: "openbot", version: "0.4.0" },
           },
         },
       };
@@ -1109,6 +1695,14 @@ export async function handleMcpJsonRpc(
         result = listBots(db, inflight, bearer);
       } else if (name === "CreateBot") {
         result = await createBot(db, inflight, bearer, args, hooks);
+      } else if (name === "ListCalendar") {
+        result = listCalendar(db, inflight, bearer, args);
+      } else if (name === "CreateEvent") {
+        result = createEvent(db, inflight, bearer, args);
+      } else if (name === "ProposeRoutine") {
+        result = proposeRoutine(db, inflight, bearer, args);
+      } else if (name === "PauseSeries") {
+        result = pauseSeries(db, inflight, bearer, args, hooks);
       } else {
         throw new McpError("unknown_tool", `unknown tool ${name}`, 400);
       }

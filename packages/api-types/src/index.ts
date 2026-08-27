@@ -98,6 +98,47 @@ export const learnRoutineInput = z.object({
 
 export type LearnRoutineInput = z.infer<typeof learnRoutineInput>;
 
+export const listCalendarInput = z.object({
+  status: z.enum(["proposed", "active", "paused", "cancelled"]).optional(),
+  kind: z.enum(["schedule", "routine"]).optional(),
+});
+
+export type ListCalendarInput = z.infer<typeof listCalendarInput>;
+
+export const createEventInput = z.object({
+  title: z.string().trim().min(1).max(200),
+  prompt: z.string().min(1).max(32_000),
+  botId: z.string().min(1).optional(),
+  name: z.string().min(1).max(80).optional(),
+  dtstart: z.union([z.number().int(), z.string().min(1)]).optional(),
+  timezone: z.string().min(1).max(80).optional(),
+  rrule: z.string().max(512).nullable().optional(),
+  threadId: z.string().min(1).optional(),
+  requireHumanApproval: z.boolean().optional(),
+});
+
+export type CreateEventInput = z.infer<typeof createEventInput>;
+
+export const proposeRoutineInput = z.object({
+  title: z.string().trim().min(1).max(200),
+  prompt: z.string().min(1).max(32_000),
+  botId: z.string().min(1).optional(),
+  name: z.string().min(1).max(80).optional(),
+  rrule: z.string().max(512).nullable().optional(),
+  dtstart: z.union([z.number().int(), z.string().min(1)]).optional(),
+  timezone: z.string().min(1).max(80).optional(),
+  threadId: z.string().min(1).optional(),
+});
+
+export type ProposeRoutineInput = z.infer<typeof proposeRoutineInput>;
+
+export const pauseSeriesInput = z.object({
+  seriesId: z.string().min(1),
+  paused: z.boolean(),
+});
+
+export type PauseSeriesInput = z.infer<typeof pauseSeriesInput>;
+
 export const createGroupThreadInput = z.object({
   kind: z.literal("group"),
   title: z.string().max(200).optional(),

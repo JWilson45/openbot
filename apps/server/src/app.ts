@@ -1767,6 +1767,10 @@ export function createApp(cfg: HomeConfig): {
           runner.ensureProject(botId, name);
           onPush(accountId, { type: "bots.updated" });
         },
+        onCalendarDue: () => {
+          ctx.engine.tickCalendar();
+          ctx.engine.kick();
+        },
       });
       const json = result.json as { result?: { content?: unknown[] } };
       if (result.status === 200 && json?.result?.content) {

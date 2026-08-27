@@ -11,6 +11,10 @@
  *   [[echo-prompt]]   SendMessage "got-digest" or "no-digest" based on ACP reset block
  *   [[echo-prefix]]   SendMessage "got-group-prefix" if the group runTurn prefix is present
  *   [[echo-cal-prefix]] SendMessage "got-calendar-prefix" if the calendar runTurn block is present
+ *   [[listcal]]
+ *   [[createevent:Title:Prompt:RRULE]]
+ *   [[propose:Title:Prompt]]
+ *   [[pause:seriesId]]
  *   [[thread:Title:body]]  SendToThread by group title (empty Title omits name/threadId)
  *   [[threadid:uuid:body]] SendToThread by group thread id
  *   [[write:name]]    write name into cwd
@@ -268,6 +272,50 @@ async function handle(msg: {
         }
       }
 
+      if (current.includes("[[listcal]]")) {
+        try {
+          const listed = await callTool(mcpUrl, mcpToken, "ListCalendar", {});
+          await callSend(mcpUrl, mcpToken, JSON.stringify(listed));
+        } catch (err) {
+          noteMcpError(err);
+        }
+      }
+
+      const createevent = /\[\[createevent:([^:\]]+):([^:\]]+):([^\]]*)\]\]/.exec(current);
+      if (createevent) {
+        try {
+          const rrule = createevent[3]!.trim();
+          await callTool(mcpUrl, mcpToken, "CreateEvent", {
+            title: createevent[1]!.trim(),
+            prompt: createevent[2]!.trim(),
+            ...(rrule ? { rrule } : {}),
+          });
+        } catch (err) {
+          noteMcpError(err);
+        }
+      }
+
+      const propose = /\[\[propose:([^:\]]+):([^\]]+)\]\]/.exec(current);
+      if (propose) {
+        try {
+          await callTool(mcpUrl, mcpToken, "ProposeRoutine", {
+            title: propose[1]!.trim(),
+            prompt: propose[2]!.trim(),
+          });
+        } catch (err) {
+          noteMcpError(err);
+        }
+      }
+
+      const pause = /\[\[pause:([^\]]+)\]\]/.exec(current);
+      if (pause) {
+        try {
+          await callTool(mcpUrl, mcpToken, "PauseSeries", { seriesId: pause[1]!.trim(), paused: true });
+        } catch (err) {
+          noteMcpError(err);
+        }
+      }
+
       const inboxack = /\[\[inboxack:([^\]]+)\]\]/.exec(current);
       if (inboxack) {
         try {
@@ -308,6 +356,10 @@ async function handle(msg: {
           !current.includes("[[echo-prompt]]") &&
           !current.includes("[[echo-prefix]]") &&
           !current.includes("[[echo-cal-prefix]]") &&
+          !current.includes("[[listcal]]") &&
+          !current.includes("[[createevent:") &&
+          !current.includes("[[propose:") &&
+          !current.includes("[[pause:") &&
           !current.includes("[[sendto:") &&
           !current.includes("[[sendorg:") &&
           !current.includes("[[inbox]]") &&
