@@ -145,6 +145,16 @@ export const confirmSeriesInput = z.object({
 
 export type ConfirmSeriesInput = z.infer<typeof confirmSeriesInput>;
 
+export const navigateBrowserInput = z.object({
+  url: z.string().trim().min(1).max(2048),
+});
+
+export type NavigateBrowserInput = z.infer<typeof navigateBrowserInput>;
+
+export const browserSnapshotInput = z.object({});
+
+export type BrowserSnapshotInput = z.infer<typeof browserSnapshotInput>;
+
 export const createGroupThreadInput = z.object({
   kind: z.literal("group"),
   title: z.string().max(200).optional(),

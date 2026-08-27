@@ -13,6 +13,7 @@ import { botProjectDir, deleteBotProject, ensureBotProject, ensureGatewayWorkspa
 
 export const DEFAULT_ACP_IDLE_MS = 10 * 60 * 1000;
 export const DEFAULT_GATEWAY_ACP_IDLE_MS = 30 * 60 * 1000;
+export const BROWSER_SNAPSHOT_MAX_CHARS = 12_000;
 
 function envTtlMs(raw: string | undefined, fallback: number): number {
   if (raw == null || raw === "") return fallback;
@@ -293,6 +294,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     });
     this.browser!.screencast = conn;
     await conn.send("Page.enable");
+    await conn.send("Runtime.enable");
     const vp = this.browser!.viewport ?? { width: 1280, height: 720 };
     await conn.send("Emulation.setDeviceMetricsOverride", {
       width: vp.width,
@@ -534,11 +536,53 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   async snapshot(): Promise<{ ok: boolean; html?: string; error?: string }> {
     if (!this.browser?.cdpUrl) return { ok: false, error: "browser down" };
     try {
-      const html = await cdpEvaluate<string>(this.browser.cdpUrl, "document.documentElement.outerHTML");
+      const html = await this.runtimeEval<string>("document.documentElement.outerHTML");
       return { ok: true, html };
     } catch (err) {
       return { ok: false, error: String(err) };
     }
+  }
+
+  async pageText(): Promise<{ ok: boolean; url?: string; title?: string; text?: string; error?: string }> {
+    try {
+      await this.ensureBrowser();
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+    try {
+      const page = await this.runtimeEval<{ url?: string; title?: string; text?: string }>(
+        `(() => {
+          const text = document.body ? String(document.body.innerText || document.body.textContent || "") : "";
+          return {
+            url: location.href,
+            title: String(document.title || ""),
+            text: text.slice(0, ${BROWSER_SNAPSHOT_MAX_CHARS}),
+          };
+        })()`,
+      );
+      return {
+        ok: true,
+        url: page?.url,
+        title: page?.title,
+        text: String(page?.text ?? "").slice(0, BROWSER_SNAPSHOT_MAX_CHARS),
+      };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  }
+
+  private async runtimeEval<T>(expression: string): Promise<T> {
+    if (!this.browser?.cdpUrl) throw new Error("browser down");
+    const conn = this.browser.screencast;
+    if (conn) {
+      await conn.send("Runtime.enable").catch(() => undefined);
+      const result = (await conn.send("Runtime.evaluate", {
+        expression,
+        returnByValue: true,
+      })) as { result?: { value?: T } };
+      return result.result?.value as T;
+    }
+    return cdpEvaluate<T>(this.browser.cdpUrl, expression);
   }
 
   async dispatchInput(event: Record<string, unknown>): Promise<void> {

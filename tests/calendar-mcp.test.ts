@@ -107,13 +107,24 @@ describe("calendar MCP", () => {
     expect(names).not.toContain("ProposeRoutine");
     expect(names).not.toContain("PauseSeries");
     expect(names).not.toContain("ConfirmSeries");
+    expect(names).not.toContain("Navigate");
+    expect(names).not.toContain("BrowserSnapshot");
 
-    for (const name of ["ListCalendar", "CreateEvent", "ProposeRoutine", "ConfirmSeries", "PauseSeries"]) {
+    for (const name of [
+      "ListCalendar",
+      "CreateEvent",
+      "ProposeRoutine",
+      "ConfirmSeries",
+      "PauseSeries",
+      "Navigate",
+      "BrowserSnapshot",
+    ]) {
       const res = await call(db, w.token, name, {
         title: "t",
         prompt: "p",
         seriesId: id(),
         paused: true,
+        url: "https://example.com",
       });
       expect(res.status).toBe(403);
       expect(rpc(res.json).error?.data?.code).toBe("forbidden");

@@ -20,9 +20,11 @@ import {
 import {
   McpError,
   createBotInput,
+  browserSnapshotInput,
   confirmSeriesInput,
   createEventInput,
   inboxInput,
+  navigateBrowserInput,
   listCalendarInput,
   pauseSeriesInput,
   proposeRoutineInput,
@@ -833,6 +835,24 @@ export const PAUSE_SERIES_TOOL = {
   },
 };
 
+export const NAVIGATE_TOOL = {
+  name: "Navigate",
+  description:
+    "Open a URL in the shared desk Chromium (same browser as Takeover). http(s) only. Fails with takeover_active while the human is in Takeover. Then call BrowserSnapshot to read the page.",
+  inputSchema: {
+    type: "object",
+    properties: { url: { type: "string", description: "http(s) URL" } },
+    required: ["url"],
+  },
+};
+
+export const BROWSER_SNAPSHOT_TOOL = {
+  name: "BrowserSnapshot",
+  description:
+    "Read the current shared desk Chromium page (URL, title, visible text, max 12k). Same browser as Takeover — this is how you see the page the human is showing. Read-only; does not steal the session. Navigate fails with takeover_active while the human is driving.",
+  inputSchema: { type: "object", properties: {} },
+};
+
 export const CONFIRM_SERIES_TOOL = {
   name: "ConfirmSeries",
   description:
@@ -857,6 +877,8 @@ export function mcpToolsForRole(role: string | null | undefined): unknown[] {
       PROPOSE_ROUTINE_TOOL,
       CONFIRM_SERIES_TOOL,
       PAUSE_SERIES_TOOL,
+      NAVIGATE_TOOL,
+      BROWSER_SNAPSHOT_TOOL,
     );
   return tools;
 }
@@ -878,6 +900,17 @@ export type McpHooks = {
   fetchFed?: typeof fetch;
   onCreateBot?: (bot: { accountId: string; botId: string; name: string }) => void | Promise<void>;
   onCalendarDue?: () => void;
+  browserNavigate?: (
+    accountId: string,
+    url: string,
+  ) => Promise<{ ok: boolean; title?: string; error?: string }>;
+  browserSnapshot?: (accountId: string) => Promise<{
+    ok: boolean;
+    url?: string;
+    title?: string;
+    text?: string;
+    error?: string;
+  }>;
 };
 
 const INBOX_PREVIEW = 240;
@@ -1467,6 +1500,60 @@ export function confirmSeries(
   }
 }
 
+function httpUrlOrInvalid(raw: string): string | null {
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    return raw;
+  } catch {
+    return null;
+  }
+}
+
+export async function navigateBrowser(
+  db: OpenbotDb,
+  inflight: McpInflight,
+  bearer: string | undefined,
+  rawInput: unknown,
+  hooks?: McpHooks,
+): Promise<{ ok: boolean; title?: string; error?: string }> {
+  const input = parseOrThrow(navigateBrowserInput, coerceToolArgs(rawInput));
+  const claims = verifyMcpToken(db, bearer);
+  requireDesk(db, claims, "Navigate");
+  inflight.add(claims.harnessSessionId);
+  try {
+    const turn = lockRunningTurn(db, claims);
+    if (!turn) throw new McpError("no_active_turn", "no running turn for this harness session", 409);
+    const url = httpUrlOrInvalid(input.url.trim());
+    if (!url) return { ok: false, error: "invalid_url" };
+    if (!hooks?.browserNavigate) return { ok: false, error: "browser_unavailable" };
+    return await hooks.browserNavigate(claims.accountId, url);
+  } finally {
+    inflight.remove(claims.harnessSessionId);
+  }
+}
+
+export async function browserSnapshot(
+  db: OpenbotDb,
+  inflight: McpInflight,
+  bearer: string | undefined,
+  rawInput: unknown,
+  hooks?: McpHooks,
+): Promise<{ ok: boolean; url?: string; title?: string; text?: string; error?: string }> {
+  parseOrThrow(browserSnapshotInput, coerceToolArgs(rawInput));
+  const claims = verifyMcpToken(db, bearer);
+  requireDesk(db, claims, "BrowserSnapshot");
+  inflight.add(claims.harnessSessionId);
+  try {
+    const turn = lockRunningTurn(db, claims);
+    if (!turn) throw new McpError("no_active_turn", "no running turn for this harness session", 409);
+    if (!hooks?.browserSnapshot) return { ok: false, error: "browser_unavailable" };
+    return await hooks.browserSnapshot(claims.accountId);
+  } finally {
+    inflight.remove(claims.harnessSessionId);
+  }
+}
+
 function federationIsOn(db: OpenbotDb, hooks?: McpHooks): boolean {
   if (hooks?.federationEffective) return hooks.federationEffective();
   const row = db.get<{ federation_enabled: number }>(
@@ -1636,6 +1723,10 @@ export async function handleMcpJsonRpc(
         result = pauseSeries(db, inflight, bearer, args, hooks);
       } else if (name === "ConfirmSeries") {
         result = confirmSeries(db, inflight, bearer, args, hooks);
+      } else if (name === "Navigate") {
+        result = await navigateBrowser(db, inflight, bearer, args, hooks);
+      } else if (name === "BrowserSnapshot") {
+        result = await browserSnapshot(db, inflight, bearer, args, hooks);
       } else {
         throw new McpError("unknown_tool", `unknown tool ${name}`, 400);
       }

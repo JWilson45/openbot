@@ -1774,6 +1774,8 @@ export function createApp(cfg: HomeConfig): {
           ctx.engine.tickCalendar();
           ctx.engine.kick();
         },
+        browserNavigate: (accountId, url) => ctx.engine.runnerFor(accountId).navigate(url),
+        browserSnapshot: (accountId) => ctx.engine.runnerFor(accountId).pageText(),
       });
       const json = result.json as { result?: { content?: unknown[] } };
       if (result.status === 200 && json?.result?.content) {

@@ -36,6 +36,17 @@ describe("CDP + takeover", () => {
       const snap = await runner.snapshot();
       expect(snap.ok).toBe(true);
       expect(snap.html ?? "").toContain("OpenBot");
+      const text = await runner.pageText();
+      expect(text.ok).toBe(true);
+      expect(text.url ?? "").toContain(origin);
+      expect((text.text ?? "") + (text.title ?? "")).toMatch(/OpenBot/i);
+      runner.browser!.takeoverActive = true;
+      const blocked = await runner.navigate(`${origin}/`);
+      expect(blocked.ok).toBe(false);
+      expect(blocked.error).toBe("takeover_active");
+      const during = await runner.pageText();
+      expect(during.ok).toBe(true);
+      runner.browser!.takeoverActive = false;
       log.push("navigate_ok");
     }
 

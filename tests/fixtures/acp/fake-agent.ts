@@ -16,6 +16,8 @@
  *   [[propose:Title:Prompt]]
  *   [[pause:seriesId]]
  *   [[confirm:seriesId]]
+ *   [[nav:url]]       Navigate the shared desk Chromium
+ *   [[snap]]          BrowserSnapshot, then SendMessage the JSON
  *   [[thread:Title:body]]  SendToThread by group title (empty Title omits name/threadId)
  *   [[threadid:uuid:body]] SendToThread by group thread id
  *   [[write:name]]    write name into cwd
@@ -326,6 +328,25 @@ async function handle(msg: {
         }
       }
 
+      const nav = /\[\[nav:([^\]]+)\]\]/.exec(current);
+      if (nav) {
+        try {
+          const result = await callTool(mcpUrl, mcpToken, "Navigate", { url: nav[1]!.trim() });
+          await callSend(mcpUrl, mcpToken, JSON.stringify(result));
+        } catch (err) {
+          noteMcpError(err);
+        }
+      }
+
+      if (current.includes("[[snap]]")) {
+        try {
+          const result = await callTool(mcpUrl, mcpToken, "BrowserSnapshot", {});
+          await callSend(mcpUrl, mcpToken, JSON.stringify(result));
+        } catch (err) {
+          noteMcpError(err);
+        }
+      }
+
       const inboxack = /\[\[inboxack:([^\]]+)\]\]/.exec(current);
       if (inboxack) {
         try {
@@ -371,6 +392,8 @@ async function handle(msg: {
           !current.includes("[[propose:") &&
           !current.includes("[[pause:") &&
           !current.includes("[[confirm:") &&
+          !current.includes("[[nav:") &&
+          !current.includes("[[snap]]") &&
           !current.includes("[[sendto:") &&
           !current.includes("[[sendorg:") &&
           !current.includes("[[inbox]]") &&

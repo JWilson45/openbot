@@ -225,8 +225,11 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     expect(desk).toContain("Time:");
     expect(desk).toContain("ListCalendar");
     expect(desk).toContain("ConfirmSeries");
+    expect(desk).toContain("Navigate");
+    expect(desk).toContain("BrowserSnapshot");
     expect(gw).not.toContain("ListCalendar");
     expect(gw).not.toContain("CreateEvent");
+    expect(gw).not.toContain("BrowserSnapshot");
     expect(gw).toContain("You do not hire desk bots");
     expect(gw).not.toMatch(/Hire a new teammate: CreateBot/);
   });
@@ -254,6 +257,8 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
       "ProposeRoutine",
       "ConfirmSeries",
       "PauseSeries",
+      "Navigate",
+      "BrowserSnapshot",
     ]);
     expect(mcpToolsForRole("desk").map((t) => (t as { name: string }).name)).toEqual([
       "SendMessage",
@@ -266,6 +271,8 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
       "ProposeRoutine",
       "ConfirmSeries",
       "PauseSeries",
+      "Navigate",
+      "BrowserSnapshot",
     ]);
 
     db.run("UPDATE bots SET role = 'gateway' WHERE id = ?", [w.botId]);
