@@ -1,9 +1,22 @@
 import { describe, expect, test } from "bun:test";
 import { sha256Hex } from "@openbot/db";
+import { cdpKeyEvent, TAKEOVER_TAB } from "@openbot/runner";
 import { fakeAgentCommand, tempHome } from "./helpers.ts";
 import { loginCookie, startTestServer } from "../apps/server/src/test-helpers.ts";
 
 describe("CDP + takeover", () => {
+  test("Backspace is a virtual key, not an empty char", () => {
+    const down = cdpKeyEvent({ action: "rawKeyDown", key: "Backspace", code: "Backspace" });
+    expect(down.type).toBe("rawKeyDown");
+    expect(down.windowsVirtualKeyCode).toBe(8);
+    expect(down.text).toBeUndefined();
+    const del = cdpKeyEvent({ action: "rawKeyDown", key: "Delete", code: "Delete" });
+    expect(del.windowsVirtualKeyCode).toBe(46);
+    const letter = cdpKeyEvent({ action: "char", key: "a", code: "KeyA", text: "a" });
+    expect(letter.text).toBe("a");
+    expect(letter.windowsVirtualKeyCode).toBe(65);
+  });
+
   test("display reports loopback CDP; Chromium is not root; navigate/snapshot; takeover tickets", async () => {
     const home = tempHome();
     process.env.OPENBOT_ACP_COMMAND = fakeAgentCommand();
@@ -36,6 +49,46 @@ describe("CDP + takeover", () => {
       const snap = await runner.snapshot();
       expect(snap.ok).toBe(true);
       expect(snap.html ?? "").toContain("OpenBot");
+      const text = await runner.pageText();
+      expect(text.ok).toBe(true);
+      expect(text.url ?? "").toContain(origin);
+      expect((text.text ?? "") + (text.title ?? "")).toMatch(/OpenBot/i);
+      runner.browser!.takeoverActive = true;
+      const blocked = await runner.navigate(`${origin}/`, { owner: TAKEOVER_TAB });
+      expect(blocked.ok).toBe(false);
+      expect(blocked.error).toBe("takeover_active");
+      const during = await runner.pageText(TAKEOVER_TAB);
+      expect(during.ok).toBe(true);
+      expect((await runner.click({ text: "OpenBot" }, TAKEOVER_TAB)).error).toBe("takeover_active");
+      expect((await runner.typeText({ text: "x" }, TAKEOVER_TAB)).error).toBe("takeover_active");
+      const botPage =
+        "data:text/html," + encodeURIComponent(`<!doctype html><title>BotTab</title><p>bot-only-page</p>`);
+      expect((await runner.navigate(botPage, { owner: "bot-a" })).ok).toBe(true);
+      const botSnap = await runner.pageText("bot-a");
+      expect(botSnap.text ?? "").toContain("bot-only-page");
+      const humanSnap = await runner.pageText(TAKEOVER_TAB);
+      expect(humanSnap.text ?? "").not.toContain("bot-only-page");
+      runner.browser!.takeoverActive = false;
+      const demo =
+        "data:text/html," +
+        encodeURIComponent(
+          `<!doctype html><button id="b">Add to Cart</button><input id="t"><p id="out"></p>
+           <script>
+             document.getElementById("b").addEventListener("click", function() {
+               var t = document.getElementById("t");
+               t.value = "clicked";
+               t.focus();
+               document.getElementById("out").textContent = "clicked";
+             });
+           </script>`,
+        );
+      expect((await runner.navigate(demo)).ok).toBe(true);
+      const c = await runner.click({ text: "Add to Cart" });
+      expect(c.ok).toBe(true);
+      const typed = await runner.typeText({ text: " hi" });
+      expect(typed.ok).toBe(true);
+      const html = await runner.snapshot();
+      expect(html.html ?? "").toContain("clicked");
       log.push("navigate_ok");
     }
 
@@ -68,6 +121,16 @@ describe("CDP + takeover", () => {
       expect(runner.lastDispatchedInput).toBeTruthy();
       expect(runner.lastDispatchedInput?.type).toBe("mouse");
       expect(runner.screencastFrames).toBeGreaterThan(0);
+      expect(runner.browser?.inputViewport?.width).toBeGreaterThan(0);
+      session.ws.send(JSON.stringify({ type: "wheel", x: 0.5, y: 0.5, deltaX: 0, deltaY: 120 }));
+      const wheelStart = Date.now();
+      while (Date.now() - wheelStart < 3000 && runner.lastDispatchedInput?.type !== "wheel") await Bun.sleep(50);
+      expect(runner.lastDispatchedInput?.type).toBe("wheel");
+      expect(runner.lastDispatchedInput?.deltaY).toBe(120);
+      session.ws.send(JSON.stringify({ type: "viewport", width: 1600, height: 900 }));
+      const vpStart = Date.now();
+      while (Date.now() - vpStart < 2000 && runner.browser?.viewport?.width !== 1600) await Bun.sleep(40);
+      expect(runner.browser?.viewport).toEqual({ width: 1600, height: 900 });
       session.ws.close();
     }
 

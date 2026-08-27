@@ -2,7 +2,7 @@
   "name": "openbot",
   "private": true,
   "type": "module",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "bin": {
     "openbot": "./apps/server/src/cli.ts"
   },
@@ -24,6 +24,7 @@
     "@openbot/acp-grok": "workspace:*",
     "@openbot/api-types": "workspace:*",
     "@openbot/auth": "workspace:*",
+    "@openbot/calendar": "workspace:*",
     "@openbot/compute-protocol": "workspace:*",
     "@openbot/db": "workspace:*",
     "@openbot/federation": "workspace:*",

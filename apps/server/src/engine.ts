@@ -12,6 +12,12 @@ import {
 import { DEFAULT_GROK_MODEL, DEFAULT_REASONING_EFFORT, grokCliSignedIn } from "@openbot/acp-grok";
 import { currentOrgMeta, FEDERATION_OFF_NOTICE, federationEffective } from "./org.ts";
 import { maybeEnqueueGatewayDrain } from "./inbox.ts";
+import {
+  markCalendarPendingAsSend,
+  reconcileCalendarInstance,
+  tickCalendar as runTickCalendar,
+  type TickCalendarResult,
+} from "./calendar-tick.ts";
 
 export type EngineOpts = {
   db: OpenbotDb;
@@ -79,6 +85,11 @@ export class TurnEngine {
     void this.loop();
   }
 
+  /** Sibling of maintenance(); rematerialize/catch-up/enqueue. Does not start turns. */
+  tickCalendar(nowMs = Date.now()): TickCalendarResult {
+    return runTickCalendar(this.opts.db, nowMs);
+  }
+
   /** Reap orphans, idle ACPs, archived bots, and expired inbox rows. Does not start turns. */
   maintenance(): void {
     this.reapOrphans();
@@ -94,7 +105,7 @@ export class TurnEngine {
     ]);
     if (bot) {
       for (const m of result.push) {
-        if (m.origin === "prompt") continue;
+        if (m.origin === "prompt" || m.origin === "calendar") continue;
         this.opts.onPush(bot.account_id, { type: "message.created", message: m });
       }
     }
@@ -164,7 +175,7 @@ export class TurnEngine {
           [turn.id],
         );
         for (const m of msgs) {
-          if (m.origin === "prompt") continue; // per-turn clones, not transcript bubbles
+          if (m.origin === "prompt" || m.origin === "calendar") continue; // per-turn clones, not transcript bubbles
           this.opts.onPush(bot.account_id, { type: "message.created", message: m });
         }
       }
@@ -268,7 +279,7 @@ export class TurnEngine {
         [turn.id],
       );
       for (const m of msgs) {
-        if (m.origin === "prompt") continue;
+        if (m.origin === "prompt" || m.origin === "calendar") continue;
         this.opts.onPush(bot.account_id, { type: "message.created", message: m });
       }
       this.maybeKickGatewayDrain(bot.id, turn.id);
@@ -311,9 +322,15 @@ export class TurnEngine {
       }
     }
 
+    const runningAt = now();
     this.opts.db.run(
       "UPDATE turns SET status = 'running', started_at = ?, harness_session_id = ? WHERE id = ?",
-      [now(), harnessId, turn.id],
+      [runningAt, harnessId, turn.id],
+    );
+    this.opts.db.run(
+      `UPDATE calendar_instances SET status = 'running', started_at = COALESCE(started_at, ?)
+        WHERE turn_id = ? AND status = 'queued'`,
+      [runningAt, turn.id],
     );
     if (!warm) {
       appendLiveWork(this.opts.db, turn.id, "harness_session_reset", { reason: "cold_start" });
@@ -332,6 +349,7 @@ export class TurnEngine {
       });
       this.opts.db.run("UPDATE turns SET status = 'running' WHERE id = ?", [turn.id]);
       promote(this.opts.db, turn.id, { kind: "crash", assistantText: "" });
+      reconcileCalendarInstance(this.opts.db, turn.id);
       this.opts.onPush(bot.account_id, { type: "turn.updated", turnId: turn.id, status: "failed" });
       if (isGateway) this.maybeKickGatewayDrain(bot.id, turn.id);
       return;
@@ -390,13 +408,16 @@ export class TurnEngine {
         harnessId,
       ]);
 
-      const userMsg = this.opts.db.get<{ body: string }>(
-        "SELECT body FROM messages WHERE turn_id = ? AND role = 'user' ORDER BY created_at DESC LIMIT 1",
+      const userMsg = this.opts.db.get<{ origin: string; body: string }>(
+        "SELECT origin, body FROM messages WHERE turn_id = ? AND role = 'user' ORDER BY created_at DESC LIMIT 1",
         [turn.id],
       );
       let prompt = userMsg?.body ?? "";
       if (thread.kind === "group") {
         prompt = `Group thread "${thread.title}". To speak here call SendToThread. SendMessage still DMs the human privately. SendToAgent is 1:1, not this group.\n\n${prompt}`;
+      }
+      if (userMsg?.origin === "calendar") {
+        prompt = `${calendarTurnBlock(this.opts.db, turn.id)}\n\n${prompt}`;
       }
       if (!warm) {
         const digest = buildThreadDigest(this.opts.db, {
@@ -408,18 +429,22 @@ export class TurnEngine {
         prompt = wrapPromptWithDigest(digest, prompt);
       }
       const result = await runner.prompt(prompt, bot.id);
+      markCalendarPendingAsSend(this.opts.db, turn.id);
       promote(this.opts.db, turn.id, {
         kind: "acp_done",
         stopReason: result.stopReason,
         assistantText: result.assistantText,
         telemetrySentMessageCount: 0,
       });
+      reconcileCalendarInstance(this.opts.db, turn.id);
     } catch (err) {
       const stderr = runner.acpFor(bot.id)?.lastStderr ?? "";
       const text = (err instanceof Error ? err.message : String(err)) + (stderr ? `\n${stderr.slice(-1500)}` : "");
       this.opts.db.run("UPDATE turns SET error = ? WHERE id = ?", [text, turn.id]);
       this.opts.db.run("UPDATE turns SET status = 'running' WHERE id = ?", [turn.id]);
+      markCalendarPendingAsSend(this.opts.db, turn.id);
       promote(this.opts.db, turn.id, { kind: "crash", assistantText: text });
+      reconcileCalendarInstance(this.opts.db, turn.id);
     }
 
     await this.opts.inflight.drain(harnessId, 2000);
@@ -434,11 +459,32 @@ export class TurnEngine {
       [turn.id],
     );
     for (const m of msgs) {
-      if (m.origin === "prompt") continue;
+      if (m.origin === "prompt" || m.origin === "calendar") continue;
       this.opts.onPush(bot.account_id, { type: "message.created", message: m });
     }
     if (isGateway) this.maybeKickGatewayDrain(bot.id, turn.id);
   }
+}
+
+function calendarTurnBlock(db: OpenbotDb, turnId: string): string {
+  const series = db.get<{ title: string; kind: string; rrule: string | null }>(
+    `SELECT s.title, s.kind, s.rrule
+     FROM calendar_instances i
+     JOIN calendar_series s ON s.id = i.series_id
+     WHERE i.turn_id = ?
+     LIMIT 1`,
+    [turnId],
+  );
+  const title = series?.title ?? "event";
+  const kind = series?.kind ?? "schedule";
+  const recurring = series?.rrule ? ", recurring" : "";
+  return [
+    `This turn was started by calendar event "${title}" (${kind}${recurring}).`,
+    "Do the work in the prompt. If the human should see a result, call SendMessage.",
+    "If this turn is on a group thread, speak there with SendToThread; SendMessage still DMs the human privately.",
+    "If you parked a SendMessage as pending_approval, you are done — do not ramble.",
+    "Do not announce that you are a cron job. Do not CreateEvent from this turn unless the prompt asks to schedule follow-up.",
+  ].join("\n");
 }
 
 export function deskPath(home: string): string {

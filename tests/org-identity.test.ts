@@ -74,6 +74,7 @@ describe("ensureOrgMeta", () => {
     );
     expect(row.slug).toBe("local");
     expect(row.federation_enabled).toBe(0);
+    expect(row.timezone).toBe("UTC");
     expect(row.pubkey).toBe("");
     expect(row.account_id == null).toBe(true);
     const again = ensureOrgMeta(db, { advertisedOrigin: "http://127.0.0.1:8787" });
@@ -228,11 +229,13 @@ describe("org HTTP", () => {
       name: string;
       publicOrigin: string | null;
       federationEnabled: boolean;
+      timezone: string;
     };
     const row = currentOrgMeta(ctx.db)!;
     expect(json.orgId).toBe(row.org_id);
     expect(json.slug).toBe(row.slug);
     expect(json.federationEnabled).toBe(false);
+    expect(json.timezone).toBe("UTC");
     expect(json).not.toHaveProperty("gateway");
     server.stop(true);
   });
@@ -277,6 +280,33 @@ describe("org HTTP", () => {
       body: JSON.stringify({ federationEnabled: false }),
     });
     expect(((await off.json()) as { federationEnabled: boolean }).federationEnabled).toBe(false);
+    server.stop(true);
+  });
+
+  test("PATCH /v1/org timezone is IANA, default UTC, unknown keys ignored", async () => {
+    const { server, origin, ctx } = startTestServer({ home: tempHome() });
+    const { cookie } = loginCookie({ ctx }, "alice");
+    const headers = { cookie, "content-type": "application/json" };
+    const before = (await fetch(`${origin}/v1/org`, { headers }).then((r) => r.json())) as { timezone: string };
+    expect(before.timezone).toBe("UTC");
+    const bad = await fetch(`${origin}/v1/org`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ timezone: "Not/A_Zone" }),
+    });
+    expect(bad.status).toBe(400);
+    expect(((await bad.json()) as { error: string }).error).toBe("invalid_timezone");
+    expect(currentOrgMeta(ctx.db)?.timezone).toBe("UTC");
+    const on = await fetch(`${origin}/v1/org`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ timezone: "America/New_York", ignored: true }),
+    });
+    expect(on.status).toBe(200);
+    const stored = (await on.json()) as { timezone: string; federationEnabled: boolean };
+    expect(stored.timezone).toBe("America/New_York");
+    expect(stored.federationEnabled).toBe(false);
+    expect(currentOrgMeta(ctx.db)?.timezone).toBe("America/New_York");
     server.stop(true);
   });
 });

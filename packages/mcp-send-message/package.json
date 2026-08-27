@@ -4,6 +4,7 @@
   "type": "module",
   "dependencies": {
     "@openbot/api-types": "workspace:*",
+    "@openbot/calendar": "workspace:*",
     "@openbot/db": "workspace:*",
     "@openbot/federation": "workspace:*",
     "@openbot/live-work": "workspace:*"

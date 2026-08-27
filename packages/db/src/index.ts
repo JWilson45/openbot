@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { materializeHorizon } from "@openbot/calendar";
 
 export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
@@ -191,6 +192,7 @@ CREATE TABLE IF NOT EXISTS org_meta (
   public_origin text,
   pubkey text NOT NULL DEFAULT '',
   federation_enabled integer NOT NULL DEFAULT 0,
+  timezone text NOT NULL DEFAULT 'UTC',
   created_at integer NOT NULL
 );
 
@@ -257,6 +259,53 @@ CREATE TABLE IF NOT EXISTS thread_bridges (
 CREATE UNIQUE INDEX IF NOT EXISTS thread_bridges_local ON thread_bridges(local_thread_id);
 CREATE UNIQUE INDEX IF NOT EXISTS thread_bridges_peer_thread
   ON thread_bridges(peer_org_id, peer_thread_id) WHERE peer_thread_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS calendar_series (
+  id text PRIMARY KEY,
+  account_id text NOT NULL REFERENCES accounts(id),
+  title text NOT NULL,
+  prompt text NOT NULL,
+  assignee_bot_id text REFERENCES bots(id),
+  thread_id text REFERENCES threads(id) ON DELETE SET NULL,
+  kind text NOT NULL,
+  status text NOT NULL,
+  rrule text,
+  dtstart_utc integer NOT NULL,
+  timezone text NOT NULL,
+  require_human_approval integer NOT NULL DEFAULT 0,
+  created_by text NOT NULL,
+  created_by_bot_id text REFERENCES bots(id),
+  source_turn_id text REFERENCES turns(id) ON DELETE SET NULL,
+  source_thread_id text REFERENCES threads(id) ON DELETE SET NULL,
+  capture_summary text,
+  min_interval_ms integer NOT NULL DEFAULT 120000,
+  last_fired_at integer,
+  next_due_at integer,
+  created_at integer NOT NULL,
+  updated_at integer NOT NULL
+);
+CREATE INDEX IF NOT EXISTS calendar_series_account_status
+  ON calendar_series(account_id, status);
+CREATE INDEX IF NOT EXISTS calendar_series_next
+  ON calendar_series(status, next_due_at);
+
+CREATE TABLE IF NOT EXISTS calendar_instances (
+  id text PRIMARY KEY,
+  series_id text NOT NULL REFERENCES calendar_series(id),
+  scheduled_at integer NOT NULL,
+  status text NOT NULL,
+  turn_id text REFERENCES turns(id) ON DELETE SET NULL,
+  skipped_reason text,
+  created_at integer NOT NULL,
+  started_at integer,
+  finished_at integer
+);
+CREATE UNIQUE INDEX IF NOT EXISTS calendar_instances_series_when
+  ON calendar_instances(series_id, scheduled_at);
+CREATE INDEX IF NOT EXISTS calendar_instances_status_when
+  ON calendar_instances(status, scheduled_at);
+CREATE INDEX IF NOT EXISTS calendar_instances_turn
+  ON calendar_instances(turn_id) WHERE turn_id IS NOT NULL;
 `;
 
 export type SqlValue = string | number | bigint | boolean | null | Uint8Array;
@@ -297,6 +346,7 @@ export class OpenbotDb {
     this.ensureColumn("bots", "reasoning_effort", "text NOT NULL DEFAULT 'high'");
     this.ensureColumn("bots", "role", "text NOT NULL DEFAULT 'desk'");
     this.ensureColumn("org_meta", "federation_enabled", "integer NOT NULL DEFAULT 0");
+    this.ensureColumn("org_meta", "timezone", "text NOT NULL DEFAULT 'UTC'");
     this.ensureColumn("messages", "remote_org_id", "text");
     this.ensureColumn("messages", "remote_actor_name", "text");
     this.raw.exec(
@@ -555,6 +605,15 @@ export function deleteBotPermanently(db: OpenbotDb, botId: string): void {
     db.run(`UPDATE messages SET from_bot_id = NULL WHERE from_bot_id = ?`, [botId]);
     db.run(`DELETE FROM mcp_tokens WHERE bot_id = ?`, [botId]);
     db.run(`UPDATE turns SET harness_session_id = NULL WHERE bot_id = ?`, [botId]);
+    db.run(
+      `UPDATE calendar_instances SET turn_id = NULL WHERE turn_id IN (SELECT id FROM turns WHERE bot_id = ?)`,
+      [botId],
+    );
+    db.run(
+      `UPDATE calendar_series SET created_by_bot_id = NULL, assignee_bot_id = NULL, status = 'cancelled', updated_at = ?
+        WHERE assignee_bot_id = ? OR created_by_bot_id = ?`,
+      [now(), botId, botId],
+    );
     db.run(`DELETE FROM turns WHERE bot_id = ?`, [botId]);
     db.run(`DELETE FROM harness_sessions WHERE bot_id = ?`, [botId]);
 
@@ -620,6 +679,131 @@ export function deleteBotPermanently(db: OpenbotDb, botId: string): void {
     db.run(`DELETE FROM threads WHERE bot_id = ?`, [botId]);
     db.run(`DELETE FROM bots WHERE id = ?`, [botId]);
   });
+}
+
+export function pauseCalendarSeriesForAssignee(db: OpenbotDb, botId: string): void {
+  db.run(
+    `UPDATE calendar_series SET status = 'paused', updated_at = ?
+      WHERE assignee_bot_id = ? AND status IN ('active', 'proposed')`,
+    [now(), botId],
+  );
+}
+
+export function nonCancelledSeriesCount(db: OpenbotDb, accountId: string, excludeId?: string): number {
+  const row = excludeId
+    ? db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM calendar_series
+          WHERE account_id = ? AND status IN ('active', 'paused', 'proposed') AND id != ?`,
+        [accountId, excludeId],
+      )
+    : db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM calendar_series
+          WHERE account_id = ? AND status IN ('active', 'paused', 'proposed')`,
+        [accountId],
+      );
+  return row?.n ?? 0;
+}
+
+export function suppressOpenCalendarInstances(
+  db: OpenbotDb,
+  seriesId: string,
+  mode: "pause" | "cancel",
+  nowMs = now(),
+): void {
+  if (mode === "pause") {
+    db.run(
+      `UPDATE calendar_instances SET status = 'skipped_paused' WHERE series_id = ? AND status IN ('scheduled', 'due')`,
+      [seriesId],
+    );
+  } else {
+    db.run(
+      `UPDATE calendar_instances SET status = 'cancelled', skipped_reason = 'series_cancelled'
+        WHERE series_id = ? AND status IN ('scheduled', 'due')`,
+      [seriesId],
+    );
+  }
+  const queued = db.all<{ id: string; turn_id: string | null }>(
+    `SELECT id, turn_id FROM calendar_instances WHERE series_id = ? AND status = 'queued'`,
+    [seriesId],
+  );
+  for (const inst of queued) {
+    if (inst.turn_id) {
+      db.run(`UPDATE turns SET status = 'cancelled', finished_at = ? WHERE id = ? AND status = 'queued'`, [
+        nowMs,
+        inst.turn_id,
+      ]);
+    }
+    db.run(`UPDATE calendar_instances SET status = 'cancelled', skipped_reason = ? WHERE id = ?`, [
+      mode === "cancel" ? "series_cancelled" : null,
+      inst.id,
+    ]);
+  }
+}
+
+export function rematerializeScheduledInstances(
+  db: OpenbotDb,
+  series: { id: string; dtstart_utc: number; timezone: string; rrule: string | null },
+  nowMs = now(),
+): void {
+  const queued = db.all<{ id: string; turn_id: string | null }>(
+    `SELECT id, turn_id FROM calendar_instances WHERE series_id = ? AND status = 'queued'`,
+    [series.id],
+  );
+  for (const inst of queued) {
+    if (inst.turn_id) {
+      db.run(`UPDATE turns SET status = 'cancelled', finished_at = ? WHERE id = ? AND status = 'queued'`, [
+        nowMs,
+        inst.turn_id,
+      ]);
+    }
+    db.run(`UPDATE calendar_instances SET status = 'cancelled' WHERE id = ?`, [inst.id]);
+  }
+  db.run(
+    `DELETE FROM calendar_instances
+      WHERE series_id = ? AND (
+        status IN ('scheduled', 'due', 'skipped_paused')
+        OR (status = 'cancelled' AND skipped_reason = 'series_cancelled')
+      )`,
+    [series.id],
+  );
+  let times: number[] = [];
+  try {
+    const horizon = materializeHorizon({
+      dtstartUtc: series.dtstart_utc,
+      timezone: series.timezone,
+      rrule: series.rrule,
+      nowMs,
+    });
+    times = [...(horizon.catchup != null ? [horizon.catchup] : []), ...horizon.future];
+  } catch {
+    if (series.dtstart_utc >= nowMs) times = [series.dtstart_utc];
+  }
+  const seen = new Set<number>();
+  for (const scheduledAt of times) {
+    if (seen.has(scheduledAt)) continue;
+    seen.add(scheduledAt);
+    const exists = db.get("SELECT id FROM calendar_instances WHERE series_id = ? AND scheduled_at = ?", [
+      series.id,
+      scheduledAt,
+    ]);
+    if (exists) continue;
+    db.run(
+      `INSERT INTO calendar_instances (id, series_id, scheduled_at, status, created_at)
+       VALUES (?, ?, ?, 'scheduled', ?)`,
+      [id(), series.id, scheduledAt, nowMs],
+    );
+  }
+  const next = db.get<{ scheduled_at: number }>(
+    `SELECT scheduled_at FROM calendar_instances
+      WHERE series_id = ? AND status IN ('scheduled', 'due')
+      ORDER BY scheduled_at LIMIT 1`,
+    [series.id],
+  );
+  db.run(`UPDATE calendar_series SET next_due_at = ?, updated_at = ? WHERE id = ?`, [
+    next?.scheduled_at ?? null,
+    nowMs,
+    series.id,
+  ]);
 }
 
 export function purgeExpiredOrgInbox(db: OpenbotDb): number {

@@ -15,10 +15,14 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 
 ## Honesty (read this)
 
-- **Closing this browser tab does not stop your teammate.**
-- **Stopping `openbot server` / `openbot demo` does.** Stopping the **VM** that runs it makes that org **unreachable** until it boots again. Peers see timeouts, not a hosted retry. sqlite, `org.ed25519`, and inbox rows stay on disk.
+- **Closing this browser tab does not stop your teammate.** A turn the calendar already queued keeps running.
+- **Stopping `openbot server` / `openbot demo` does.** Stopping the **VM** that runs it makes that org **unreachable** until it boots again. Peers see timeouts, not a hosted retry. sqlite, `org.ed25519`, and inbox rows stay on disk. Stopping the process stops the **clock and the turn**.
 - If you want work to continue while a laptop is closed, run the server on a machine that stays up (VPS, home server, systemd) — not on the laptop you are about to shut.
-- `$OPENBOT_HOME/desk` is a **shared computer**. It is **not** a security boundary **inside** an org. Every bot on the account can read and write the desk the way you can. There is **one Chromium** for the whole team. Cross-org is messages only (hop=1).
+- **The calendar runs only while `openbot server` / `openbot demo` runs.** Closed laptop / stopped unit / stopped VM: the 9am did not happen. At most one catch-up if down less than a day. OpenBot will not replay a weekend of missed summaries. “9am” is the org IANA timezone in Settings (default `UTC`; not browser detect).
+- **Watch-me-do-it v1 is not a recording.** **Learn this** drafts a proposed calendar event from a thread. You edit it. No click replay.
+- **This is not Google Calendar.** No sync. No invites. Org-local sqlite.
+- **Schedules and learned routines are two products** on the same grid.
+- `$OPENBOT_HOME/desk` is a **shared computer**. It is **not** a security boundary **inside** an org. Every bot on the account can read and write the desk the way you can. There is **one Chromium** for the whole team (**a tab per desk bot**; cookies shared). Cross-org is messages only (hop=1).
 - Vault files (`master.key`, `org.ed25519`, credentials) live **outside** `desk/`. Do not copy secrets into the workspace Grok can see.
 - Restarting the server starts a new Grok ACP process. Chat history is in SQLite; OpenBot injects a thread digest on the next turn so the bot continues instead of announcing amnesia.
 - **Federation is off until you turn it on** on **both** sides. OpenBot does not provision Fly Machines.
@@ -38,8 +42,9 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 | Warm Grok process | Each bot keeps an ACP child across turns. Model / reasoning changes respawn it on the **next** turn. |
 | Model & reasoning | Per-bot Grok model (e.g. grok-4.6) and effort (low / medium / high / extra high). Composer + Settings. |
 | Live work | Collapsible thinking and tool calls in a resizable sidebar. Activity board for the whole team. |
-| Takeover | You grab the shared Chromium (screencast + input). Esc / Close ends it. |
+| Takeover | You grab the human tab of the shared Chromium (screencast + input). Esc / Close ends it. Desk bots keep their own tabs. |
 | Archive | Soft-delete folder. Restore, or type `DELETE` to purge. Expired archives (30 days) are removed automatically. |
+| Calendar / schedules / Learn this | Org-local sqlite (not Google Calendar: no sync, no invites). Schedules and learned routines are two products on the same grid. **Learn this** drafts a proposed event from a thread — not a recording. The clock is the process. |
 | OpenAI-compatible API | Open WebUI (and similar) can use a bot as `openbot/<Name>` with a `sk-ob_…` key. Two connections = two orgs (mint the key on that VM). |
 | Org / Gateway | One process is one org. Auto-provisioned **Gateway** diplomat (not a seventh desk slot). Federation **off** until `openbot gateway on` on both peers. |
 | Auth | Local demo login on loopback, or GitHub OAuth + allowlist. Optional vaulted `XAI_API_KEY`; `grok login` is enough. |
@@ -84,7 +89,7 @@ cd openbot
 bun install
 ```
 
-The CLI is `bun run openbot -- <command>` (or `bun run apps/server/src/cli.ts`). Current version is **0.3.0**. `openbot version` prints `{ openbot, grokPin, grok }`. OpenBot pins **Grok CLI 1.0.5** (warns if missing or older; does not refuse to start).
+The CLI is `bun run openbot -- <command>` (or `bun run apps/server/src/cli.ts`). Current version is **0.4.0**. `openbot version` prints `{ openbot, grokPin, grok }`. OpenBot pins **Grok CLI 1.0.5** (warns if missing or older; does not refuse to start).
 
 Merging to `main` with a **new** `package.json` version creates tag `vX.Y.Z` and publishes GitHub Release binaries. Pull requests run tests. Other branches do not. A version that already has a tag is not re-released.
 
@@ -214,6 +219,10 @@ bun run openbot server --origin https://desk.example.com
 - Live work (thinking, tools) is the right sidebar; drag the handle to resize. **Activity** is a folder in the rail for every teammate at once.
 - **Handoff** threads are the A2A log (read-only from the human UI). Message a bot from their human DM.
 
+### Calendar
+
+**Calendar** is a Library folder (agenda + month). **New event** is a schedule. **Learn this** on a human DM or group drafts a proposed routine you confirm. Org timezone is Settings (IANA; default `UTC`, not from the browser).
+
 ### Takeover
 
 **Takeover** shows the shared Chromium. `about:blank` means no page is open yet. Esc or **Close** ends takeover. One browser, mutexed with bot browser tools.
@@ -243,7 +252,7 @@ Control dir is `~/.openbot`. Each org profile is its own data root (`$OPENBOT_HO
 | `~/.openbot/profiles.json` | Slug → data dir map and current profile |
 | `~/.openbot/orgs/<slug>/` | Default data root for a named org |
 | `~/.openbot/openbot.sqlite` | Legacy single-home layout (still valid; first `org init <slug>` adopts it) |
-| `$OPENBOT_HOME/openbot.sqlite` | Bots, threads, turns, messages, live-work, sessions, `org_meta`, `org_peers`, `org_inbox` |
+| `$OPENBOT_HOME/openbot.sqlite` | Bots, threads, turns, messages, live-work, sessions, `org_meta` (incl. timezone), `org_peers`, `org_inbox`, `calendar_series`, `calendar_instances` |
 | `org.json` | Optional org slug/name/origin. DB wins once written; `org init` rewrites this file. |
 | `org.ed25519` | Sealed Ed25519 org key (mode 0600). Not under `desk/`. Not a `credentials` row. |
 | `master.key` | Vault master (mode 0600). Not under `desk/` |
@@ -299,7 +308,7 @@ Cookie session (`openbot_session`) or `Authorization: Bearer` (session token or 
 | `GET` | `/v1/healthz` `/v1/readyz` | Liveness / SQLite + desk writable |
 | `GET` | `/v1/me` | Current user |
 | `GET` | `/fed/v1/info` | Public-ish org identity + pubkey. Rate-limited. No cookies. |
-| `GET`/`PATCH` | `/v1/org` | Member snapshot; `{ federationEnabled }` (cookie, not `sk-ob_`) |
+| `GET`/`PATCH` | `/v1/org` | Member snapshot; `{ federationEnabled, timezone }` (cookie, not `sk-ob_`). Timezone is IANA; default `UTC` |
 | `GET`/`POST`/`DELETE` | `/v1/org/peers` | Allowlist. `POST /v1/org/peers/from-info` is preview only |
 | `GET` | `/v1/org/inbox` | Trusted mail only (`pending` / `held`). Untrusted solicits are Gateway-DM `origin=system` + `fed.solicit` |
 | `POST` | `/fed/v1/messages` | Signed inbound mail (JWS). 403 when federation is off (trusted → `held`) |
@@ -313,6 +322,7 @@ Cookie session (`openbot_session`) or `Authorization: Bearer` (session token or 
 | `POST` | `/v1/threads/:id/messages` | Queue a turn (`202`) |
 | `GET` | `/v1/turns/:id/live-work` | Tool / thought events |
 | `GET` | `/v1/activity` | Team presence |
+| `GET`/`POST`/`PATCH`/`DELETE` | `/v1/calendar…` | Cookie, not `sk-ob_`. Window `GET /v1/calendar?from=&to=`; series CRUD, confirm, pause; instance cancel; `POST /learn` |
 | `POST` | `/v1/compute/takeover` | Mint takeover ticket |
 | `POST` | `/v1/compute/wipe` | Body `{ confirm: "DELETE" }` |
 | `POST` | `/v1/api-keys` | Mint OpenAI-compatible key (shown once) |
@@ -363,6 +373,7 @@ Bun workspaces.
 ```
 apps/server/          Hono app, SPA, CLI, turn engine, OpenAI shim
 packages/acp-grok/    grok agent stdio client, isolated GROK_HOME, model catalog
+packages/calendar/    RRULE subset, civil expansion, calendar constants
 packages/runner/      localhost compute: desk, Chromium CDP, per-bot ACP
 packages/db/          SQLite schema + purge / archive
 packages/live-work/   messages, promote(), live-work events, thread digest
@@ -371,7 +382,7 @@ packages/federation/  Ed25519 JWS for /fed/v1
 packages/vault/       credential encryption
 packages/auth/        GitHub / local session, allowlist
 packages/compute-protocol/  five-method host contract
-docs/design/          Phase 1 / Phase 2 / Phase 3 design notes
+docs/design/          Phase 1–4 design notes
 tests/                bun:test; fake ACP, no live xAI required
 ```
 
@@ -404,7 +415,7 @@ CI (`.github/workflows/ci.yml`) is `bun install --frozen-lockfile` then `bun tes
 - Remote runner (orchestrator on A, grok on B).
 - Mobile / desktop apps, Postgres control plane, per-bot filesystem isolation.
 
-Design background: [docs/design/phase-1-always-on-teammate-loop.md](docs/design/phase-1-always-on-teammate-loop.md), [docs/design/phase-2-team-on-one-desk.md](docs/design/phase-2-team-on-one-desk.md), [docs/design/phase-3-orgs-vms-gateway.md](docs/design/phase-3-orgs-vms-gateway.md).
+Design background: [docs/design/phase-1-always-on-teammate-loop.md](docs/design/phase-1-always-on-teammate-loop.md), [docs/design/phase-2-team-on-one-desk.md](docs/design/phase-2-team-on-one-desk.md), [docs/design/phase-3-orgs-vms-gateway.md](docs/design/phase-3-orgs-vms-gateway.md), [docs/design/phase-4-calendar-automations.md](docs/design/phase-4-calendar-automations.md).
 
 ---
 

@@ -21,7 +21,11 @@ export function promote(db: OpenbotDb, turnId: string, cause: PromoteCause): Mes
       "SELECT COUNT(*) as n FROM messages WHERE turn_id = ? AND origin = 'send_message'",
       [turnId],
     );
-    const hasSend = turn.sent_message_count > 0 || (sendRows?.n ?? 0) > 0;
+    const pendingRows = db.get<{ n: number }>(
+      "SELECT COUNT(*) as n FROM messages WHERE turn_id = ? AND origin = 'pending_approval'",
+      [turnId],
+    );
+    const hasSend = turn.sent_message_count > 0 || (sendRows?.n ?? 0) > 0 || (pendingRows?.n ?? 0) > 0;
 
     let inserted: MessageRow | null = null;
 
@@ -141,6 +145,7 @@ export function buildThreadDigest(
     `SELECT origin, body, from_bot_id FROM messages
      WHERE thread_id = ?
        AND origin IN ('user', 'send_message', 'fallback', 'agent', 'system', 'thread', 'federation')
+       AND origin NOT IN ('prompt', 'calendar')
        AND (turn_id IS NULL OR turn_id != ?)
      ORDER BY created_at DESC
      LIMIT ?`,

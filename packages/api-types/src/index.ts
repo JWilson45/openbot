@@ -64,6 +64,121 @@ export const postMessageInput = z.object({
   body: z.string().min(1).max(32_000),
 });
 
+export const createCalendarSeriesInput = z.object({
+  title: z.string().trim().min(1).max(200),
+  prompt: z.string().min(1).max(32_000),
+  botId: z.string().min(1),
+  dtstart: z.union([z.number().int(), z.string().min(1)]),
+  timezone: z.string().min(1).max(80).optional(),
+  rrule: z.string().max(512).nullable().optional(),
+  threadId: z.string().min(1).optional(),
+  requireHumanApproval: z.boolean().optional(),
+});
+
+export type CreateCalendarSeriesInput = z.infer<typeof createCalendarSeriesInput>;
+
+export const patchCalendarSeriesInput = z.object({
+  title: z.string().trim().min(1).max(200).optional(),
+  prompt: z.string().min(1).max(32_000).optional(),
+  botId: z.string().min(1).optional(),
+  dtstart: z.union([z.number().int(), z.string().min(1)]).optional(),
+  timezone: z.string().min(1).max(80).optional(),
+  rrule: z.string().max(512).nullable().optional(),
+  threadId: z.string().min(1).nullable().optional(),
+  requireHumanApproval: z.boolean().optional(),
+  status: z.enum(["active", "paused", "cancelled"]).optional(),
+});
+
+export type PatchCalendarSeriesInput = z.infer<typeof patchCalendarSeriesInput>;
+
+export const learnRoutineInput = z.object({
+  threadId: z.string().min(1),
+  botId: z.string().min(1).optional(),
+});
+
+export type LearnRoutineInput = z.infer<typeof learnRoutineInput>;
+
+export const listCalendarInput = z.object({
+  status: z.enum(["proposed", "active", "paused", "cancelled"]).optional(),
+  kind: z.enum(["schedule", "routine"]).optional(),
+});
+
+export type ListCalendarInput = z.infer<typeof listCalendarInput>;
+
+export const createEventInput = z.object({
+  title: z.string().trim().min(1).max(200),
+  prompt: z.string().min(1).max(32_000),
+  botId: z.string().min(1).optional(),
+  name: z.string().min(1).max(80).optional(),
+  dtstart: z.union([z.number().int(), z.string().min(1)]).optional(),
+  timezone: z.string().min(1).max(80).optional(),
+  rrule: z.string().max(512).nullable().optional(),
+  threadId: z.string().min(1).optional(),
+  requireHumanApproval: z.boolean().optional(),
+});
+
+export type CreateEventInput = z.infer<typeof createEventInput>;
+
+export const proposeRoutineInput = z.object({
+  title: z.string().trim().min(1).max(200),
+  prompt: z.string().min(1).max(32_000),
+  botId: z.string().min(1).optional(),
+  name: z.string().min(1).max(80).optional(),
+  rrule: z.string().max(512).nullable().optional(),
+  dtstart: z.union([z.number().int(), z.string().min(1)]).optional(),
+  timezone: z.string().min(1).max(80).optional(),
+  threadId: z.string().min(1).optional(),
+});
+
+export type ProposeRoutineInput = z.infer<typeof proposeRoutineInput>;
+
+export const pauseSeriesInput = z.object({
+  seriesId: z.string().min(1),
+  paused: z.boolean(),
+});
+
+export type PauseSeriesInput = z.infer<typeof pauseSeriesInput>;
+
+export const confirmSeriesInput = z.object({
+  seriesId: z.string().min(1),
+});
+
+export type ConfirmSeriesInput = z.infer<typeof confirmSeriesInput>;
+
+export const navigateBrowserInput = z.object({
+  url: z.string().trim().min(1).max(2048),
+});
+
+export type NavigateBrowserInput = z.infer<typeof navigateBrowserInput>;
+
+export const browserSnapshotInput = z.object({});
+
+export type BrowserSnapshotInput = z.infer<typeof browserSnapshotInput>;
+
+export const clickBrowserInput = z
+  .object({
+    text: z.string().trim().min(1).max(200).optional(),
+    selector: z.string().trim().min(1).max(500).optional(),
+    nth: z.number().int().min(0).max(20).optional(),
+  })
+  .refine((v) => Boolean(v.text || v.selector), { message: "text or selector required" });
+
+export type ClickBrowserInput = z.infer<typeof clickBrowserInput>;
+
+export const typeBrowserInput = z.object({
+  text: z.string().min(1).max(8000),
+  clear: z.boolean().optional(),
+  submit: z.boolean().optional(),
+});
+
+export type TypeBrowserInput = z.infer<typeof typeBrowserInput>;
+
+export const waitBrowserInput = z.object({
+  ms: z.number().int().min(0).max(15_000).optional(),
+});
+
+export type WaitBrowserInput = z.infer<typeof waitBrowserInput>;
+
 export const createGroupThreadInput = z.object({
   kind: z.literal("group"),
   title: z.string().max(200).optional(),

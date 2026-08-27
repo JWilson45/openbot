@@ -217,15 +217,28 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     expect(gw).toContain("Inbox");
     expect(gw).toContain("Do not forward inbound mail to a third org");
     const desk = deskIdentityRules("Ada", "research");
-    expect(desk).not.toContain("SendToOrg");
+    expect(desk).not.toMatch(/To talk to another org, call SendToOrg/);
+    expect(desk).toContain("Do not schedule SendToOrg");
     expect(desk).toContain("SendToAgent Gateway");
     expect(desk).toContain("CreateBot");
     expect(desk).toContain("/auth/local");
+    expect(desk).toContain("Time:");
+    expect(desk).toContain("ListCalendar");
+    expect(desk).toContain("ConfirmSeries");
+    expect(desk).toContain("Navigate");
+    expect(desk).toContain("BrowserSnapshot");
+    expect(desk).toContain("Click");
+    expect(desk).toContain("Type");
+    expect(desk).toContain("Wait");
+    expect(desk).toContain("own tab");
+    expect(gw).not.toContain("ListCalendar");
+    expect(gw).not.toContain("CreateEvent");
+    expect(gw).not.toContain("BrowserSnapshot");
     expect(gw).toContain("You do not hire desk bots");
     expect(gw).not.toMatch(/Hire a new teammate: CreateBot/);
   });
 
-  test("tools/list is role-aware; serverInfo is 0.3.0", async () => {
+  test("tools/list is role-aware; serverInfo is 0.4.0", async () => {
     const db = OpenbotDb.open(join(tempHome(), "openbot.sqlite"));
     const w = seedWorld(db);
     const inflight = new McpInflight();
@@ -237,13 +250,39 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     const deskNames = (
       (deskList.json as { result: { tools: Array<{ name: string }> } }).result.tools ?? []
     ).map((t) => t.name);
-    expect(deskNames).toEqual(["SendMessage", "SendToAgent", "SendToThread", "ListBots", "CreateBot"]);
+    expect(deskNames).toEqual([
+      "SendMessage",
+      "SendToAgent",
+      "SendToThread",
+      "ListBots",
+      "CreateBot",
+      "ListCalendar",
+      "CreateEvent",
+      "ProposeRoutine",
+      "ConfirmSeries",
+      "PauseSeries",
+      "Navigate",
+      "BrowserSnapshot",
+      "Click",
+      "Type",
+      "Wait",
+    ]);
     expect(mcpToolsForRole("desk").map((t) => (t as { name: string }).name)).toEqual([
       "SendMessage",
       "SendToAgent",
       "SendToThread",
       "ListBots",
       "CreateBot",
+      "ListCalendar",
+      "CreateEvent",
+      "ProposeRoutine",
+      "ConfirmSeries",
+      "PauseSeries",
+      "Navigate",
+      "BrowserSnapshot",
+      "Click",
+      "Type",
+      "Wait",
     ]);
 
     db.run("UPDATE bots SET role = 'gateway' WHERE id = ?", [w.botId]);
@@ -265,7 +304,7 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     });
     expect(
       (init.json as { result: { serverInfo: { version: string } } }).result.serverInfo.version,
-    ).toBe("0.3.0");
+    ).toBe("0.4.0");
     db.close();
   });
 

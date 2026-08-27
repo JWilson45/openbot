@@ -28,6 +28,8 @@ test("schema applies on a fresh sqlite file", () => {
     "org_inbox",
     "org_solicit",
     "thread_bridges",
+    "calendar_series",
+    "calendar_instances",
   ]) {
     expect(names).toContain(required);
   }
@@ -66,6 +68,7 @@ test("schema applies on a fresh sqlite file", () => {
     "public_origin",
     "pubkey",
     "federation_enabled",
+    "timezone",
     "created_at",
   ]) {
     expect(orgNames).toContain(col);
@@ -73,6 +76,9 @@ test("schema applies on a fresh sqlite file", () => {
   const fed = orgCols.find((c) => c.name === "federation_enabled");
   expect(fed?.notnull).toBe(1);
   expect(String(fed?.dflt_value)).toBe("0");
+  const tz = orgCols.find((c) => c.name === "timezone");
+  expect(tz?.notnull).toBe(1);
+  expect(String(tz?.dflt_value)).toContain("UTC");
   const memberCols = db.all<{ name: string }>("PRAGMA table_info(org_members)").map((c) => c.name);
   for (const col of ["id", "org_id", "user_id", "account_id", "role", "created_at"]) {
     expect(memberCols).toContain(col);
@@ -129,6 +135,54 @@ test("schema applies on a fresh sqlite file", () => {
   const msgCols = db.all<{ name: string }>("PRAGMA table_info(messages)").map((c) => c.name);
   expect(msgCols).toContain("remote_org_id");
   expect(msgCols).toContain("remote_actor_name");
+  const seriesCols = db.all<{ name: string }>("PRAGMA table_info(calendar_series)").map((c) => c.name);
+  for (const col of [
+    "id",
+    "account_id",
+    "title",
+    "prompt",
+    "assignee_bot_id",
+    "thread_id",
+    "kind",
+    "status",
+    "rrule",
+    "dtstart_utc",
+    "timezone",
+    "require_human_approval",
+    "created_by",
+    "created_by_bot_id",
+    "source_turn_id",
+    "source_thread_id",
+    "capture_summary",
+    "min_interval_ms",
+    "last_fired_at",
+    "next_due_at",
+    "created_at",
+    "updated_at",
+  ]) {
+    expect(seriesCols).toContain(col);
+  }
+  expect(seriesCols).not.toContain("until_utc");
+  expect(seriesCols).not.toContain("count");
+  const instanceCols = db.all<{ name: string }>("PRAGMA table_info(calendar_instances)").map((c) => c.name);
+  for (const col of [
+    "id",
+    "series_id",
+    "scheduled_at",
+    "status",
+    "turn_id",
+    "skipped_reason",
+    "created_at",
+    "started_at",
+    "finished_at",
+  ]) {
+    expect(instanceCols).toContain(col);
+  }
+  expect(moreIndexes).toContain("calendar_series_account_status");
+  expect(moreIndexes).toContain("calendar_series_next");
+  expect(moreIndexes).toContain("calendar_instances_series_when");
+  expect(moreIndexes).toContain("calendar_instances_status_when");
+  expect(moreIndexes).toContain("calendar_instances_turn");
 });
 
 test("migrate adds bots.role on a pre-gateway sqlite", () => {
@@ -153,5 +207,42 @@ test("migrate adds bots.role on a pre-gateway sqlite", () => {
   expect(cols).toContain("role");
   const indexes = db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index'").map((i) => i.name);
   expect(indexes).toContain("bots_one_active_gateway");
+  db.close();
+});
+
+test("migrate adds org_meta.timezone and calendar tables on a pre-calendar sqlite", () => {
+  const path = join(tempHome(), "openbot.sqlite");
+  const raw = new Database(path);
+  raw.exec(`CREATE TABLE org_meta (
+    id text PRIMARY KEY,
+    account_id text,
+    org_id text NOT NULL UNIQUE,
+    slug text NOT NULL,
+    name text NOT NULL,
+    public_origin text,
+    pubkey text NOT NULL DEFAULT '',
+    federation_enabled integer NOT NULL DEFAULT 0,
+    created_at integer NOT NULL
+  );`);
+  raw.exec(
+    `INSERT INTO org_meta (id, org_id, slug, name, created_at) VALUES ('current', 'o', 'local', 'local', 0)`,
+  );
+  raw.close();
+  const db = OpenbotDb.open(path);
+  const tz = db.all<{ name: string; dflt_value: unknown; notnull: number }>("PRAGMA table_info(org_meta)").find(
+    (c) => c.name === "timezone",
+  );
+  expect(tz?.notnull).toBe(1);
+  expect(String(tz?.dflt_value)).toContain("UTC");
+  expect(db.get<{ timezone: string }>("SELECT timezone FROM org_meta WHERE id = 'current'")?.timezone).toBe("UTC");
+  const tables = db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type='table'").map((t) => t.name);
+  expect(tables).toContain("calendar_series");
+  expect(tables).toContain("calendar_instances");
+  const indexes = db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index'").map((i) => i.name);
+  expect(indexes).toContain("calendar_series_account_status");
+  expect(indexes).toContain("calendar_series_next");
+  expect(indexes).toContain("calendar_instances_series_when");
+  expect(indexes).toContain("calendar_instances_status_when");
+  expect(indexes).toContain("calendar_instances_turn");
   db.close();
 });

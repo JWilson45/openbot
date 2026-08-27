@@ -534,6 +534,7 @@ if (cmd === "version" || cmd === "-v" || cmd === "--version") {
   const reachable = `http://${advertiseHost(host)}:${server.port}`;
   created.ctx.publicOrigin = reachable;
   created.ctx.engine.reapOrphans();
+  created.ctx.engine.tickCalendar();
   created.ctx.engine.kick();
   const url = `${reachable}/auth/local?login=demo`;
   const expose = bindNote(host);
@@ -573,6 +574,7 @@ if (cmd === "version" || cmd === "-v" || cmd === "--version") {
   });
   created.ctx.port = server.port;
   created.ctx.engine.reapOrphans();
+  created.ctx.engine.tickCalendar();
   created.ctx.engine.kick();
   const expose = bindNote(host);
   console.log(

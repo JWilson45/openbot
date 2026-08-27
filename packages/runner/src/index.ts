@@ -13,6 +13,83 @@ import { botProjectDir, deleteBotProject, ensureBotProject, ensureGatewayWorkspa
 
 export const DEFAULT_ACP_IDLE_MS = 10 * 60 * 1000;
 export const DEFAULT_GATEWAY_ACP_IDLE_MS = 30 * 60 * 1000;
+export const BROWSER_SNAPSHOT_MAX_CHARS = 12_000;
+export const BROWSER_VIEWPORT_MIN = { width: 640, height: 400 };
+export const BROWSER_VIEWPORT_MAX = { width: 2560, height: 1440 };
+export const BROWSER_VIEWPORT_DEFAULT = { width: 1280, height: 720 };
+export const BROWSER_WAIT_MAX_MS = 15_000;
+export const BROWSER_WAIT_DEFAULT_MS = 800;
+export const TAKEOVER_TAB = "takeover";
+
+export type BrowserTab = {
+  owner: string;
+  id: string;
+  wsUrl: string;
+};
+
+function clampViewport(width: number, height: number): { width: number; height: number } {
+  return {
+    width: Math.max(BROWSER_VIEWPORT_MIN.width, Math.min(BROWSER_VIEWPORT_MAX.width, Math.round(width))),
+    height: Math.max(BROWSER_VIEWPORT_MIN.height, Math.min(BROWSER_VIEWPORT_MAX.height, Math.round(height))),
+  };
+}
+
+const NAMED_VK: Record<string, number> = {
+  Backspace: 8,
+  Tab: 9,
+  Enter: 13,
+  Shift: 16,
+  Control: 17,
+  Alt: 18,
+  CapsLock: 20,
+  Escape: 27,
+  Space: 32,
+  PageUp: 33,
+  PageDown: 34,
+  End: 35,
+  Home: 36,
+  ArrowLeft: 37,
+  ArrowUp: 38,
+  ArrowRight: 39,
+  ArrowDown: 40,
+  Insert: 45,
+  Delete: 46,
+  Meta: 91,
+  ContextMenu: 93,
+};
+
+for (let f = 1; f <= 12; f++) NAMED_VK[`F${f}`] = 111 + f;
+
+function modifierBits(event: Record<string, unknown>): number {
+  return (
+    (event.altKey ? 1 : 0) + (event.ctrlKey ? 2 : 0) + (event.metaKey ? 4 : 0) + (event.shiftKey ? 8 : 0)
+  );
+}
+
+export function cdpKeyEvent(event: Record<string, unknown>): Record<string, unknown> {
+  const action = String(event.action ?? "rawKeyDown");
+  const key = String(event.key ?? "");
+  const code = String(event.code ?? "");
+  let vk = NAMED_VK[key] ?? NAMED_VK[code] ?? 0;
+  if (!vk && /^Digit[0-9]$/.test(code)) vk = code.charCodeAt(5);
+  else if (!vk && /^Key[A-Z]$/.test(code)) vk = code.charCodeAt(3);
+  else if (!vk && key.length === 1) vk = key.toUpperCase().charCodeAt(0);
+  const params: Record<string, unknown> = {
+    type: action,
+    key,
+    code,
+    windowsVirtualKeyCode: vk,
+    nativeVirtualKeyCode: vk,
+    modifiers: modifierBits(event),
+    autoRepeat: Boolean(event.repeat),
+  };
+  const text = event.text != null ? String(event.text) : action === "char" && key.length === 1 ? key : "";
+  if (text) {
+    params.text = text;
+    params.unmodifiedText = text;
+  }
+  return params;
+}
 
 function envTtlMs(raw: string | undefined, fallback: number): number {
   if (raw == null || raw === "") return fallback;
@@ -51,6 +128,8 @@ export type BrowserHandle = {
   screencastNonce?: string;
   screencast?: CdpConn;
   viewport: { width: number; height: number };
+  /** Last screencast frame's CSS viewport; mouse/wheel map through this, not the requested stage. */
+  inputViewport?: { width: number; height: number };
   pid?: number;
 };
 
@@ -68,6 +147,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   harness: "down" | "starting" | "idle" | "in_turn" | "crashed" = "down";
   acp: AcpClient | null = null;
   readonly acps = new Map<string, AcpSlot>();
+  readonly tabs = new Map<string, BrowserTab>();
   browser: BrowserHandle | null = null;
   harnessSessionId?: string;
   acpSessionId?: string;
@@ -76,6 +156,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   permissionMode: "ask" | "auto" | "always-approve" = "auto";
   lastDispatchedInput: Record<string, unknown> | null = null;
   screencastFrames = 0;
+  viewportTimer: ReturnType<typeof setTimeout> | null = null;
   browserLock: Promise<void> = Promise.resolve();
   onScreencastFrame?: (jpeg: Uint8Array, meta: { pageUrl?: string; pageOrigin?: string }) => void;
   onLiveWork?: (ev: LiveWorkEvent, botId?: string) => void;
@@ -195,7 +276,10 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     let pageOrigin: string | undefined;
     if (this.browser?.cdpUrl) {
       try {
-        const info = await cdpPageInfo(this.browser.cdpUrl);
+        const tab = this.tabs.get(TAKEOVER_TAB);
+        const info = tab
+          ? await cdpTargetInfo(this.browser.cdpUrl, tab.id)
+          : await cdpPageInfo(this.browser.cdpUrl);
         pageUrl = info.url;
         pageOrigin = info.origin;
       } catch {
@@ -258,6 +342,11 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   ): Promise<void> {
     await this.ensureBrowser();
     this.browser!.takeoverActive = true;
+    const tab = await this.ensureTab(TAKEOVER_TAB);
+    const existing = await cdpTargetInfo(this.browser!.cdpUrl, tab.id).catch(() => ({} as { url?: string }));
+    if (!existing.url || existing.url === "about:blank") {
+      await cdpNavigate(this.browser!.cdpUrl, TAKEOVER_HOME, tab.wsUrl).catch(() => undefined);
+    }
     this.onScreencastFrame = onFrame;
     this.screencastFrames = 0;
     if (this.browser!.screencast) {
@@ -282,24 +371,63 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
       const jpeg = Buffer.from(p.data, "base64");
       this.screencastFrames += 1;
       if (p.metadata?.deviceWidth && p.metadata?.deviceHeight) {
-        this.browser!.viewport = { width: p.metadata.deviceWidth, height: p.metadata.deviceHeight };
+        this.browser!.inputViewport = {
+          width: p.metadata.deviceWidth,
+          height: p.metadata.deviceHeight,
+        };
       }
-      const info = await cdpPageInfo(this.browser!.cdpUrl).catch(() => ({}));
+      const info = await cdpTargetInfo(this.browser!.cdpUrl, tab.id).catch(() => ({}));
       this.onScreencastFrame?.(jpeg, info);
-    });
+    }, tab.wsUrl);
     this.browser!.screencast = conn;
     await conn.send("Page.enable");
+    await conn.send("Runtime.enable");
+    await conn.send("Page.bringToFront").catch(() => undefined);
+    const vp = this.browser!.viewport ?? BROWSER_VIEWPORT_DEFAULT;
+    await this.applyViewportToCdp(conn, vp.width, vp.height);
     await conn.send("Page.startScreencast", {
       format: "jpeg",
-      quality: 60,
-      maxWidth: 1280,
-      maxHeight: 720,
+      quality: 70,
+      maxWidth: BROWSER_VIEWPORT_MAX.width,
+      maxHeight: BROWSER_VIEWPORT_MAX.height,
       everyNthFrame: 1,
+    });
+  }
+
+  async setScreencastViewport(width: number, height: number): Promise<void> {
+    const vp = clampViewport(width, height);
+    if (!this.browser) return;
+    const same =
+      this.browser.viewport.width === vp.width && this.browser.viewport.height === vp.height;
+    this.browser.viewport = vp;
+    const conn = this.browser.screencast;
+    if (!conn) return;
+    if (same) return;
+    if (this.viewportTimer) clearTimeout(this.viewportTimer);
+    this.viewportTimer = setTimeout(() => {
+      this.viewportTimer = null;
+      if (this.browser?.screencast !== conn) return;
+      void this.applyViewportToCdp(conn, vp.width, vp.height);
+    }, 80);
+  }
+
+  private async applyViewportToCdp(conn: CdpConn, width: number, height: number): Promise<void> {
+    await conn.send("Emulation.setDeviceMetricsOverride", {
+      width,
+      height,
+      screenWidth: width,
+      screenHeight: height,
+      deviceScaleFactor: 1,
+      mobile: false,
     });
   }
 
   stopTakeover(): void {
     this.onScreencastFrame = undefined;
+    if (this.viewportTimer) {
+      clearTimeout(this.viewportTimer);
+      this.viewportTimer = null;
+    }
     if (this.browser) {
       this.browser.takeoverActive = false;
       const conn = this.browser.screencast;
@@ -327,9 +455,36 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
       cdpUrl: `http://127.0.0.1:${port}`,
       userDataDir,
       takeoverActive: false,
-      viewport: { width: 1280, height: 720 },
+      viewport: { ...BROWSER_VIEWPORT_DEFAULT },
     };
+    this.tabs.clear();
     return this.browser;
+  }
+
+  async ensureTab(owner: string): Promise<BrowserTab> {
+    await this.ensureBrowser();
+    const key = owner.trim() || TAKEOVER_TAB;
+    const existing = this.tabs.get(key);
+    const list = await cdpList(this.browser!.cdpUrl);
+    if (existing) {
+      const still = list.find((p) => p.id === existing.id && p.webSocketDebuggerUrl);
+      if (still?.webSocketDebuggerUrl) {
+        existing.wsUrl = still.webSocketDebuggerUrl;
+        return existing;
+      }
+      this.tabs.delete(key);
+    }
+    const owned = new Set([...this.tabs.values()].map((t) => t.id));
+    const free = list.find((p) => p.type === "page" && p.id && p.webSocketDebuggerUrl && !owned.has(p.id));
+    if (free?.id && free.webSocketDebuggerUrl) {
+      const tab: BrowserTab = { owner: key, id: free.id, wsUrl: free.webSocketDebuggerUrl };
+      this.tabs.set(key, tab);
+      return tab;
+    }
+    const created = await cdpNewPage(this.browser!.cdpUrl);
+    const tab: BrowserTab = { owner: key, id: created.id, wsUrl: created.webSocketDebuggerUrl };
+    this.tabs.set(key, tab);
+    return tab;
   }
 
   stopBrowser(): void {
@@ -338,6 +493,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     } catch {
       /* ignore */
     }
+    this.tabs.clear();
     this.browser = null;
   }
 
@@ -485,27 +641,222 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     }
   }
 
-  async navigate(url: string): Promise<{ ok: boolean; title?: string; error?: string }> {
-    if (this.browser?.takeoverActive) {
+  private tabOwner(owner?: string): string {
+    return (owner ?? TAKEOVER_TAB).trim() || TAKEOVER_TAB;
+  }
+
+  private blocksHumanTab(owner: string, duringTakeover?: boolean): boolean {
+    return Boolean(this.browser?.takeoverActive && owner === TAKEOVER_TAB && !duringTakeover);
+  }
+
+  async navigate(
+    url: string,
+    opts?: { duringTakeover?: boolean; owner?: string },
+  ): Promise<{ ok: boolean; title?: string; error?: string }> {
+    const owner = this.tabOwner(opts?.owner);
+    if (this.blocksHumanTab(owner, opts?.duringTakeover)) {
       return { ok: false, error: "takeover_active" };
     }
-    await this.ensureBrowser();
+    const trimmed = url.trim();
+    if (!/^https?:\/\//i.test(trimmed) && !trimmed.startsWith("data:text/html")) {
+      return { ok: false, error: "invalid_url" };
+    }
     try {
-      const page = await cdpNavigate(this.browser!.cdpUrl, url);
+      const tab = await this.ensureTab(owner);
+      const page = await cdpNavigate(this.browser!.cdpUrl, trimmed, tab.wsUrl);
       return { ok: true, title: page.title };
     } catch (err) {
       return { ok: false, error: String(err) };
     }
   }
 
-  async snapshot(): Promise<{ ok: boolean; html?: string; error?: string }> {
-    if (!this.browser?.cdpUrl) return { ok: false, error: "browser down" };
+  async snapshot(owner?: string): Promise<{ ok: boolean; html?: string; error?: string }> {
     try {
-      const html = await cdpEvaluate<string>(this.browser.cdpUrl, "document.documentElement.outerHTML");
+      const tab = await this.ensureTab(this.tabOwner(owner));
+      const html = await this.runtimeEval<string>("document.documentElement.outerHTML", tab);
       return { ok: true, html };
     } catch (err) {
       return { ok: false, error: String(err) };
     }
+  }
+
+  async pageText(owner?: string): Promise<{ ok: boolean; url?: string; title?: string; text?: string; error?: string }> {
+    try {
+      const tab = await this.ensureTab(this.tabOwner(owner));
+      const page = await this.runtimeEval<{ url?: string; title?: string; text?: string }>(
+        `(() => {
+          const text = document.body ? String(document.body.innerText || document.body.textContent || "") : "";
+          return {
+            url: location.href,
+            title: String(document.title || ""),
+            text: text.slice(0, ${BROWSER_SNAPSHOT_MAX_CHARS}),
+          };
+        })()`,
+        tab,
+      );
+      return {
+        ok: true,
+        url: page?.url,
+        title: page?.title,
+        text: String(page?.text ?? "").slice(0, BROWSER_SNAPSHOT_MAX_CHARS),
+      };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  }
+
+  async click(
+    input: {
+      text?: string;
+      selector?: string;
+      nth?: number;
+    },
+    owner?: string,
+  ): Promise<{ ok: boolean; text?: string; tag?: string; count?: number; error?: string }> {
+    const tabOwner = this.tabOwner(owner);
+    if (this.blocksHumanTab(tabOwner)) return { ok: false, error: "takeover_active" };
+    return this.withBrowser(async () => {
+      let tab: BrowserTab;
+      try {
+        tab = await this.ensureTab(tabOwner);
+      } catch (err) {
+        return { ok: false, error: String(err) };
+      }
+      const spec = {
+        text: input.text?.trim() || "",
+        selector: input.selector?.trim() || "",
+        nth: input.nth ?? 0,
+      };
+      if (!spec.text && !spec.selector) return { ok: false, error: "text or selector required" };
+      try {
+        const found = await this.runtimeEval<{
+          ok: boolean;
+          error?: string;
+          x?: number;
+          y?: number;
+          w?: number;
+          h?: number;
+          tag?: string;
+          text?: string;
+          count?: number;
+          method?: string;
+        }>(clickFindExpr(spec), tab);
+        if (!found?.ok) {
+          return { ok: false, error: found?.error ?? "not_found", count: found?.count };
+        }
+        if ((found.w ?? 0) >= 1 && (found.h ?? 0) >= 1 && found.x != null && found.y != null) {
+          await this.dispatchCssClick(found.x, found.y, tab);
+        } else {
+          await this.runtimeEval(
+            "document.activeElement && document.activeElement.click && document.activeElement.click()",
+            tab,
+          );
+        }
+        return { ok: true, text: found.text, tag: found.tag, count: found.count };
+      } catch (err) {
+        return { ok: false, error: String(err) };
+      }
+    });
+  }
+
+  async typeText(
+    input: {
+      text: string;
+      clear?: boolean;
+      submit?: boolean;
+    },
+    owner?: string,
+  ): Promise<{ ok: boolean; error?: string }> {
+    const tabOwner = this.tabOwner(owner);
+    if (this.blocksHumanTab(tabOwner)) return { ok: false, error: "takeover_active" };
+    return this.withBrowser(async () => {
+      let tab: BrowserTab;
+      try {
+        tab = await this.ensureTab(tabOwner);
+      } catch (err) {
+        return { ok: false, error: String(err) };
+      }
+      try {
+        const focus = await this.runtimeEval<{ ok: boolean; error?: string; tag?: string }>(
+          `(() => {
+            const el = document.activeElement;
+            if (!el || el === document.body || el === document.documentElement) {
+              return { ok: false, error: "no_focus" };
+            }
+            return { ok: true, tag: el.tagName };
+          })()`,
+          tab,
+        );
+        if (!focus?.ok) return { ok: false, error: focus?.error ?? "no_focus" };
+        if (input.clear) {
+          await this.runtimeEval(
+            `(() => {
+            const el = document.activeElement;
+            if (!el) return false;
+            if ("value" in el) {
+              el.value = "";
+              el.dispatchEvent(new Event("input", { bubbles: true }));
+              el.dispatchEvent(new Event("change", { bubbles: true }));
+            } else if (el.isContentEditable) el.textContent = "";
+            return true;
+          })()`,
+            tab,
+          );
+        }
+        await this.cdpCall("Input.insertText", { text: input.text }, tab);
+        if (input.submit) {
+          await this.cdpCall("Input.dispatchKeyEvent", cdpKeyEvent({ action: "rawKeyDown", key: "Enter", code: "Enter" }), tab);
+          await this.cdpCall("Input.dispatchKeyEvent", cdpKeyEvent({ action: "char", key: "Enter", code: "Enter", text: "\r" }), tab);
+          await this.cdpCall("Input.dispatchKeyEvent", cdpKeyEvent({ action: "keyUp", key: "Enter", code: "Enter" }), tab);
+        }
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: String(err) };
+      }
+    });
+  }
+
+  async waitFor(ms = BROWSER_WAIT_DEFAULT_MS): Promise<{ ok: boolean; ms: number }> {
+    const n = Math.max(0, Math.min(BROWSER_WAIT_MAX_MS, Math.round(ms)));
+    await Bun.sleep(n);
+    return { ok: true, ms: n };
+  }
+
+  private async dispatchCssClick(x: number, y: number, tab: BrowserTab): Promise<void> {
+    const at = { x, y, button: "left" };
+    await this.cdpCall("Input.dispatchMouseEvent", { type: "mouseMoved", ...at, buttons: 0, clickCount: 0 }, tab);
+    await this.cdpCall("Input.dispatchMouseEvent", { type: "mousePressed", ...at, buttons: 1, clickCount: 1 }, tab);
+    await this.cdpCall("Input.dispatchMouseEvent", { type: "mouseReleased", ...at, buttons: 0, clickCount: 1 }, tab);
+  }
+
+  private async cdpCall(method: string, params?: unknown, tab?: BrowserTab): Promise<unknown> {
+    if (!this.browser?.cdpUrl) throw new Error("browser down");
+    if (!tab && this.browser.screencast) return this.browser.screencast.send(method, params);
+    const { ws, send } = await cdpConnect(this.browser.cdpUrl, undefined, tab?.wsUrl);
+    try {
+      return await send(method, params);
+    } finally {
+      ws.close();
+    }
+  }
+
+  private async runtimeEval<T>(expression: string, tab?: BrowserTab): Promise<T> {
+    if (!this.browser?.cdpUrl) throw new Error("browser down");
+    if (tab) return cdpEvaluate<T>(this.browser.cdpUrl, expression, tab.wsUrl);
+    const conn = this.browser.screencast;
+    if (conn) {
+      await conn.send("Runtime.enable").catch(() => undefined);
+      const result = (await conn.send("Runtime.evaluate", {
+        expression,
+        returnByValue: true,
+      })) as { result?: { value?: T } };
+      return result.result?.value as T;
+    }
+    return cdpEvaluate<T>(this.browser.cdpUrl, expression);
+  }
+
+  private inputSize(): { width: number; height: number } {
+    return this.browser?.inputViewport ?? this.browser?.viewport ?? BROWSER_VIEWPORT_DEFAULT;
   }
 
   async dispatchInput(event: Record<string, unknown>): Promise<void> {
@@ -513,32 +864,41 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     this.lastDispatchedInput = event;
     const conn = this.browser.screencast;
     const type = String(event.type ?? "mouse");
-    const vp = this.browser.viewport;
+    const vp = this.inputSize();
+    const fracX = Math.min(1, Math.max(0, Number(event.x ?? 0)));
+    const fracY = Math.min(1, Math.max(0, Number(event.y ?? 0)));
+    const cssX = fracX * vp.width;
+    const cssY = fracY * vp.height;
     if (type === "mouse") {
-      const fracX = Number(event.x ?? 0);
-      const fracY = Number(event.y ?? 0);
       const action = String(event.action ?? "pressed");
       const cdpType =
         action === "released" ? "mouseReleased" : action === "moved" ? "mouseMoved" : "mousePressed";
       const params = {
         type: cdpType,
-        x: fracX * vp.width,
-        y: fracY * vp.height,
+        x: cssX,
+        y: cssY,
         button: String(event.button ?? "left"),
+        buttons: action === "released" ? 0 : 1,
         clickCount: action === "moved" ? 0 : 1,
       };
       if (conn) await conn.send("Input.dispatchMouseEvent", params);
       else await cdpInput(this.browser.cdpUrl, { type: "mouse", params });
       return;
     }
-    if (type === "key") {
-      const action = String(event.action ?? "rawKeyDown");
+    if (type === "wheel") {
       const params = {
-        type: action,
-        key: String(event.key ?? ""),
-        code: String(event.code ?? ""),
-        text: event.text ? String(event.text) : undefined,
+        type: "mouseWheel",
+        x: cssX,
+        y: cssY,
+        deltaX: Number(event.deltaX ?? 0),
+        deltaY: Number(event.deltaY ?? 0),
       };
+      if (conn) await conn.send("Input.dispatchMouseEvent", params);
+      else await cdpInput(this.browser.cdpUrl, { type: "mouse", params });
+      return;
+    }
+    if (type === "key") {
+      const params = cdpKeyEvent(event);
       if (conn) await conn.send("Input.dispatchKeyEvent", params);
       else await cdpInput(this.browser.cdpUrl, { type: "key", params });
     }
@@ -587,6 +947,12 @@ export async function freePort(): Promise<number> {
   return port;
 }
 
+const TAKEOVER_HOME =
+  "data:text/html;charset=utf-8," +
+  encodeURIComponent(
+    `<!doctype html><html><head><meta charset="utf-8"><title>Desk browser</title></head><body style="margin:0;background:#eef3fa;color:#081018;font:20px/1.5 system-ui,sans-serif;padding:48px"><h1 style="margin:0 0 12px">Desk browser</h1><p>This is the shared Chromium. Type a URL in the bar above.</p></body></html>`,
+  );
+
 async function launchChromium(
   port: number,
   userDataDir: string,
@@ -605,6 +971,7 @@ async function launchChromium(
       "--disable-gpu",
       "--no-first-run",
       "--disable-extensions",
+      `--window-size=${BROWSER_VIEWPORT_MAX.width},${BROWSER_VIEWPORT_MAX.height}`,
       "about:blank",
     ],
     stdout: "pipe",
@@ -651,23 +1018,49 @@ async function findChrome(): Promise<string | null> {
   return null;
 }
 
-async function cdpPageWsUrl(cdpHttp: string): Promise<string> {
+type CdpTarget = {
+  id?: string;
+  type?: string;
+  url?: string;
+  webSocketDebuggerUrl?: string;
+  title?: string;
+};
+
+async function cdpList(cdpHttp: string): Promise<CdpTarget[]> {
   const res = await fetch(`${cdpHttp}/json/list`);
-  const list = (await res.json()) as Array<{ type?: string; webSocketDebuggerUrl?: string }>;
+  return (await res.json()) as CdpTarget[];
+}
+
+async function cdpNewPage(cdpHttp: string): Promise<{ id: string; webSocketDebuggerUrl: string }> {
+  for (const method of ["PUT", "GET"] as const) {
+    try {
+      const res = await fetch(`${cdpHttp}/json/new?about:blank`, { method });
+      if (!res.ok) continue;
+      const created = (await res.json()) as CdpTarget;
+      if (created.webSocketDebuggerUrl && created.id) {
+        return { id: created.id, webSocketDebuggerUrl: created.webSocketDebuggerUrl };
+      }
+    } catch {
+      /* try next */
+    }
+  }
+  throw new Error("no cdp page websocket");
+}
+
+async function cdpPageWsUrl(cdpHttp: string): Promise<string> {
+  const list = await cdpList(cdpHttp);
   const page = list.find((p) => p.type === "page" && p.webSocketDebuggerUrl);
   if (page?.webSocketDebuggerUrl) return page.webSocketDebuggerUrl;
-  const created = (await fetch(`${cdpHttp}/json/new?about:blank`).then((r) => r.json())) as {
-    webSocketDebuggerUrl?: string;
-  };
-  if (!created.webSocketDebuggerUrl) throw new Error("no cdp page websocket");
+  const created = await cdpNewPage(cdpHttp);
   return created.webSocketDebuggerUrl;
 }
 
 async function cdpConnect(
   cdpHttp: string,
   onEvent?: (method: string, params: unknown) => void,
+  pageWsUrl?: string,
 ): Promise<CdpConn> {
-  const url = await cdpPageWsUrl(cdpHttp);
+  const url = pageWsUrl ?? (await cdpPageWsUrl(cdpHttp));
   const ws = new WebSocket(url);
   await new Promise<void>((resolve, reject) => {
     ws.onopen = () => resolve();
@@ -701,22 +1094,29 @@ async function cdpConnect(
   return { ws, send };
 }
 
-async function cdpPageInfo(cdpHttp: string): Promise<{ url?: string; origin?: string }> {
-  const res = await fetch(`${cdpHttp}/json/list`);
-  const list = (await res.json()) as Array<{ url?: string; type?: string }>;
-  const page = list.find((p) => p.type === "page") ?? list[0];
-  const url = page?.url;
-  let origin: string | undefined;
+function originOf(url?: string): string | undefined {
   try {
-    if (url) origin = new URL(url).origin;
+    if (url) return new URL(url).origin;
   } catch {
     /* ignore */
   }
-  return { url, origin };
+  return undefined;
 }
 
-async function cdpNavigate(cdpHttp: string, url: string): Promise<{ title?: string }> {
-  const { ws, send } = await cdpConnect(cdpHttp);
+async function cdpPageInfo(cdpHttp: string): Promise<{ url?: string; origin?: string }> {
+  const list = await cdpList(cdpHttp);
+  const page = list.find((p) => p.type === "page") ?? list[0];
+  return { url: page?.url, origin: originOf(page?.url) };
+}
+
+async function cdpTargetInfo(cdpHttp: string, targetId: string): Promise<{ url?: string; origin?: string }> {
+  const list = await cdpList(cdpHttp);
+  const page = list.find((p) => p.id === targetId) ?? list.find((p) => p.type === "page") ?? list[0];
+  return { url: page?.url, origin: originOf(page?.url) };
+}
+
+async function cdpNavigate(cdpHttp: string, url: string, pageWsUrl?: string): Promise<{ title?: string }> {
+  const { ws, send } = await cdpConnect(cdpHttp, undefined, pageWsUrl);
   try {
     await send("Page.enable");
     await send("Runtime.enable");
@@ -732,8 +1132,52 @@ async function cdpNavigate(cdpHttp: string, url: string): Promise<{ title?: stri
   }
 }
 
-async function cdpEvaluate<T>(cdpHttp: string, expression: string): Promise<T> {
-  const { ws, send } = await cdpConnect(cdpHttp);
+function clickFindExpr(spec: { text: string; selector: string; nth: number }): string {
+  return `(() => {
+    const spec = ${JSON.stringify(spec)};
+    const nth = spec.nth || 0;
+    let nodes = [];
+    if (spec.selector) {
+      try { nodes = Array.from(document.querySelectorAll(spec.selector)); }
+      catch (e) { return { ok: false, error: "bad_selector" }; }
+    } else {
+      const needle = String(spec.text || "").trim().toLowerCase();
+      const cand = Array.from(document.querySelectorAll('a, button, input, select, textarea, option, [role="button"], [role="link"], [role="menuitem"], label, summary'));
+      const scored = [];
+      for (const el of cand) {
+        const label = String(el.innerText || el.value || el.getAttribute("aria-label") || el.getAttribute("title") || el.getAttribute("alt") || "").replace(/\\s+/g, " ").trim();
+        const n = label.toLowerCase();
+        if (!n) continue;
+        let score = -1;
+        if (n === needle) score = 0;
+        else if (n.startsWith(needle)) score = 1;
+        else if (n.includes(needle)) score = 2;
+        if (score >= 0) scored.push({ el: el, score: score, len: label.length });
+      }
+      scored.sort((a, b) => a.score - b.score || a.len - b.len);
+      nodes = scored.map((s) => s.el);
+    }
+    if (!nodes.length) return { ok: false, error: "not_found", count: 0 };
+    if (nth >= nodes.length) return { ok: false, error: "not_found", count: nodes.length };
+    const el = nodes[nth];
+    el.scrollIntoView({ block: "center", inline: "nearest" });
+    if (typeof el.focus === "function") el.focus();
+    const r = el.getBoundingClientRect();
+    return {
+      ok: true,
+      x: r.left + r.width / 2,
+      y: r.top + r.height / 2,
+      w: r.width,
+      h: r.height,
+      tag: el.tagName,
+      text: String(el.innerText || el.value || "").replace(/\\s+/g, " ").trim().slice(0, 80),
+      count: nodes.length,
+    };
+  })()`;
+}
+
+async function cdpEvaluate<T>(cdpHttp: string, expression: string, pageWsUrl?: string): Promise<T> {
+  const { ws, send } = await cdpConnect(cdpHttp, undefined, pageWsUrl);
   try {
     const result = (await send("Runtime.evaluate", { expression, returnByValue: true })) as {
       result?: { value?: T };
