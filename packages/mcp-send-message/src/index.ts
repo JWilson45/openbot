@@ -841,7 +841,7 @@ export const PAUSE_SERIES_TOOL = {
 export const NAVIGATE_TOOL = {
   name: "Navigate",
   description:
-    "Open a URL in the shared desk Chromium (same browser as Takeover). http(s) only. Fails with takeover_active while the human is in Takeover. Then call BrowserSnapshot to read the page.",
+    "Open a URL in YOUR tab of the shared desk Chromium (cookies shared, one tab per desk bot). http(s) only. Then call BrowserSnapshot. Takeover is a separate human tab and does not block you.",
   inputSchema: {
     type: "object",
     properties: { url: { type: "string", description: "http(s) URL" } },
@@ -852,14 +852,14 @@ export const NAVIGATE_TOOL = {
 export const BROWSER_SNAPSHOT_TOOL = {
   name: "BrowserSnapshot",
   description:
-    "Read the current shared desk Chromium page (URL, title, visible text, max 12k). Same browser as Takeover — this is how you see the page. Read-only. Prefer this plus Click/Type over raw CDP.",
+    "Read YOUR tab of the shared desk Chromium (URL, title, visible text, max 12k). Not the human Takeover tab. Prefer this plus Click/Type over raw CDP.",
   inputSchema: { type: "object", properties: {} },
 };
 
 export const CLICK_TOOL = {
   name: "Click",
   description:
-    "Click a control in the shared desk Chromium. Pass visible text (preferred) or a CSS selector. nth picks among matches (0-based). Fails with takeover_active while the human is in Takeover. Then BrowserSnapshot.",
+    "Click a control in YOUR tab of the shared desk Chromium. Pass visible text (preferred) or a CSS selector. nth picks among matches (0-based). Then BrowserSnapshot.",
   inputSchema: {
     type: "object",
     properties: {
@@ -873,7 +873,7 @@ export const CLICK_TOOL = {
 export const TYPE_TOOL = {
   name: "Type",
   description:
-    "Type into the focused field in the shared desk Chromium. Click the field first. clear=true empties it first. submit=true presses Enter. Fails with takeover_active while the human is driving.",
+    "Type into the focused field in YOUR tab of the shared desk Chromium. Click the field first. clear=true empties it first. submit=true presses Enter.",
   inputSchema: {
     type: "object",
     properties: {
@@ -947,9 +947,10 @@ export type McpHooks = {
   onCalendarDue?: () => void;
   browserNavigate?: (
     accountId: string,
+    botId: string,
     url: string,
   ) => Promise<{ ok: boolean; title?: string; error?: string }>;
-  browserSnapshot?: (accountId: string) => Promise<{
+  browserSnapshot?: (accountId: string, botId: string) => Promise<{
     ok: boolean;
     url?: string;
     title?: string;
@@ -958,13 +959,15 @@ export type McpHooks = {
   }>;
   browserClick?: (
     accountId: string,
+    botId: string,
     input: { text?: string; selector?: string; nth?: number },
   ) => Promise<{ ok: boolean; text?: string; tag?: string; count?: number; error?: string }>;
   browserType?: (
     accountId: string,
+    botId: string,
     input: { text: string; clear?: boolean; submit?: boolean },
   ) => Promise<{ ok: boolean; error?: string }>;
-  browserWait?: (accountId: string, ms: number) => Promise<{ ok: boolean; ms?: number; error?: string }>;
+  browserWait?: (accountId: string, botId: string, ms: number) => Promise<{ ok: boolean; ms?: number; error?: string }>;
 };
 
 const INBOX_PREVIEW = 240;
@@ -1581,7 +1584,7 @@ export async function navigateBrowser(
     const url = httpUrlOrInvalid(input.url.trim());
     if (!url) return { ok: false, error: "invalid_url" };
     if (!hooks?.browserNavigate) return { ok: false, error: "browser_unavailable" };
-    return await hooks.browserNavigate(claims.accountId, url);
+    return await hooks.browserNavigate(claims.accountId, claims.botId, url);
   } finally {
     inflight.remove(claims.harnessSessionId);
   }
@@ -1602,7 +1605,7 @@ export async function browserSnapshot(
     const turn = lockRunningTurn(db, claims);
     if (!turn) throw new McpError("no_active_turn", "no running turn for this harness session", 409);
     if (!hooks?.browserSnapshot) return { ok: false, error: "browser_unavailable" };
-    return await hooks.browserSnapshot(claims.accountId);
+    return await hooks.browserSnapshot(claims.accountId, claims.botId);
   } finally {
     inflight.remove(claims.harnessSessionId);
   }
@@ -1623,7 +1626,7 @@ export async function clickBrowser(
     const turn = lockRunningTurn(db, claims);
     if (!turn) throw new McpError("no_active_turn", "no running turn for this harness session", 409);
     if (!hooks?.browserClick) return { ok: false, error: "browser_unavailable" };
-    return await hooks.browserClick(claims.accountId, {
+    return await hooks.browserClick(claims.accountId, claims.botId, {
       text: input.text,
       selector: input.selector,
       nth: input.nth,
@@ -1648,7 +1651,7 @@ export async function typeBrowser(
     const turn = lockRunningTurn(db, claims);
     if (!turn) throw new McpError("no_active_turn", "no running turn for this harness session", 409);
     if (!hooks?.browserType) return { ok: false, error: "browser_unavailable" };
-    return await hooks.browserType(claims.accountId, {
+    return await hooks.browserType(claims.accountId, claims.botId, {
       text: input.text,
       clear: input.clear,
       submit: input.submit,
@@ -1677,7 +1680,7 @@ export async function waitBrowser(
       await Bun.sleep(ms);
       return { ok: true, ms };
     }
-    return await hooks.browserWait(claims.accountId, ms);
+    return await hooks.browserWait(claims.accountId, claims.botId, ms);
   } finally {
     inflight.remove(claims.harnessSessionId);
   }

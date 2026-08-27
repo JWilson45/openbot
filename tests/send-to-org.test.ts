@@ -230,6 +230,7 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     expect(desk).toContain("Click");
     expect(desk).toContain("Type");
     expect(desk).toContain("Wait");
+    expect(desk).toContain("own tab");
     expect(gw).not.toContain("ListCalendar");
     expect(gw).not.toContain("CreateEvent");
     expect(gw).not.toContain("BrowserSnapshot");

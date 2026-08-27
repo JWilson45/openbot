@@ -1774,11 +1774,12 @@ export function createApp(cfg: HomeConfig): {
           ctx.engine.tickCalendar();
           ctx.engine.kick();
         },
-        browserNavigate: (accountId, url) => ctx.engine.runnerFor(accountId).navigate(url),
-        browserSnapshot: (accountId) => ctx.engine.runnerFor(accountId).pageText(),
-        browserClick: (accountId, input) => ctx.engine.runnerFor(accountId).click(input),
-        browserType: (accountId, input) => ctx.engine.runnerFor(accountId).typeText(input),
-        browserWait: (_accountId, ms) => ctx.engine.runnerFor(_accountId).waitFor(ms),
+        browserNavigate: (accountId, botId, url) =>
+          ctx.engine.runnerFor(accountId).navigate(url, { owner: botId }),
+        browserSnapshot: (accountId, botId) => ctx.engine.runnerFor(accountId).pageText(botId),
+        browserClick: (accountId, botId, input) => ctx.engine.runnerFor(accountId).click(input, botId),
+        browserType: (accountId, botId, input) => ctx.engine.runnerFor(accountId).typeText(input, botId),
+        browserWait: (_accountId, _botId, ms) => ctx.engine.runnerFor(_accountId).waitFor(ms),
       });
       const json = result.json as { result?: { content?: unknown[] } };
       if (result.status === 200 && json?.result?.content) {
@@ -1902,7 +1903,7 @@ export function createApp(cfg: HomeConfig): {
               const msg = JSON.parse(data) as Record<string, unknown>;
               const runner = ctx.engine.runnerFor(accountId);
               if (msg.type === "navigate") {
-                void runner.navigate(String(msg.url ?? ""), { duringTakeover: true });
+                void runner.navigate(String(msg.url ?? ""), { duringTakeover: true, owner: "takeover" });
                 return;
               }
               if (msg.type === "viewport") {

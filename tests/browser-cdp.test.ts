@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { sha256Hex } from "@openbot/db";
-import { cdpKeyEvent } from "@openbot/runner";
+import { cdpKeyEvent, TAKEOVER_TAB } from "@openbot/runner";
 import { fakeAgentCommand, tempHome } from "./helpers.ts";
 import { loginCookie, startTestServer } from "../apps/server/src/test-helpers.ts";
 
@@ -54,13 +54,20 @@ describe("CDP + takeover", () => {
       expect(text.url ?? "").toContain(origin);
       expect((text.text ?? "") + (text.title ?? "")).toMatch(/OpenBot/i);
       runner.browser!.takeoverActive = true;
-      const blocked = await runner.navigate(`${origin}/`);
+      const blocked = await runner.navigate(`${origin}/`, { owner: TAKEOVER_TAB });
       expect(blocked.ok).toBe(false);
       expect(blocked.error).toBe("takeover_active");
-      const during = await runner.pageText();
+      const during = await runner.pageText(TAKEOVER_TAB);
       expect(during.ok).toBe(true);
-      expect((await runner.click({ text: "OpenBot" })).error).toBe("takeover_active");
-      expect((await runner.typeText({ text: "x" })).error).toBe("takeover_active");
+      expect((await runner.click({ text: "OpenBot" }, TAKEOVER_TAB)).error).toBe("takeover_active");
+      expect((await runner.typeText({ text: "x" }, TAKEOVER_TAB)).error).toBe("takeover_active");
+      const botPage =
+        "data:text/html," + encodeURIComponent(`<!doctype html><title>BotTab</title><p>bot-only-page</p>`);
+      expect((await runner.navigate(botPage, { owner: "bot-a" })).ok).toBe(true);
+      const botSnap = await runner.pageText("bot-a");
+      expect(botSnap.text ?? "").toContain("bot-only-page");
+      const humanSnap = await runner.pageText(TAKEOVER_TAB);
+      expect(humanSnap.text ?? "").not.toContain("bot-only-page");
       runner.browser!.takeoverActive = false;
       const demo =
         "data:text/html," +

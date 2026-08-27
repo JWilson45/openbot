@@ -26,8 +26,12 @@ async function call(
   name: string,
   args: Record<string, unknown> = {},
   hooks?: {
-    browserNavigate?: (accountId: string, url: string) => Promise<{ ok: boolean; title?: string; error?: string }>;
-    browserSnapshot?: (accountId: string) => Promise<{
+    browserNavigate?: (
+      accountId: string,
+      botId: string,
+      url: string,
+    ) => Promise<{ ok: boolean; title?: string; error?: string }>;
+    browserSnapshot?: (accountId: string, botId: string) => Promise<{
       ok: boolean;
       url?: string;
       title?: string;
@@ -36,13 +40,15 @@ async function call(
     }>;
     browserClick?: (
       accountId: string,
+      botId: string,
       input: { text?: string; selector?: string; nth?: number },
     ) => Promise<{ ok: boolean; text?: string; error?: string }>;
     browserType?: (
       accountId: string,
+      botId: string,
       input: { text: string; clear?: boolean; submit?: boolean },
     ) => Promise<{ ok: boolean; error?: string }>;
-    browserWait?: (accountId: string, ms: number) => Promise<{ ok: boolean; ms?: number }>;
+    browserWait?: (accountId: string, botId: string, ms: number) => Promise<{ ok: boolean; ms?: number }>;
   },
 ) {
   const inflight = new McpInflight();
@@ -82,7 +88,7 @@ describe("desk browser MCP", () => {
       "Navigate",
       { url: "https://example.com/desk" },
       {
-        browserNavigate: async (accountId, url) => {
+        browserNavigate: async (accountId, _botId, url) => {
           seen.push(`${accountId}:${url}`);
           return { ok: true, title: "Example" };
         },
@@ -97,7 +103,7 @@ describe("desk browser MCP", () => {
       "BrowserSnapshot",
       {},
       {
-        browserSnapshot: async (accountId) => ({
+        browserSnapshot: async (accountId, _botId) => ({
           ok: true,
           url: "https://example.com/desk",
           title: "Example",
@@ -120,7 +126,7 @@ describe("desk browser MCP", () => {
       w.token,
       "Click",
       { text: "Add to Cart" },
-      { browserClick: async (accountId, input) => ({ ok: true, text: `${accountId}:${input.text}` }) },
+      { browserClick: async (accountId, _botId, input) => ({ ok: true, text: `${accountId}:${input.text}` }) },
     );
     expect(payload(clicked.json)).toEqual({ ok: true, text: `${w.accountId}:Add to Cart` });
 
@@ -133,7 +139,13 @@ describe("desk browser MCP", () => {
     );
     expect(payload(typed.json)).toEqual({ ok: true });
 
-    const waited = await call(db, w.token, "Wait", { ms: 0 }, { browserWait: async (_id, ms) => ({ ok: true, ms }) });
+    const waited = await call(
+      db,
+      w.token,
+      "Wait",
+      { ms: 0 },
+      { browserWait: async (_id, _botId, ms) => ({ ok: true, ms }) },
+    );
     expect(payload(waited.json)).toEqual({ ok: true, ms: 0 });
 
     db.run("UPDATE bots SET role = 'gateway' WHERE id = ?", [w.botId]);

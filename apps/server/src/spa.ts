@@ -902,7 +902,7 @@ export const SPA_HTML = `<!DOCTYPE html>
         <h2>Groups</h2>
         \${railGroups}
         <button type="button" id="new-group">New group</button>
-        <p class="muted desk-note">Shared desk · one browser · SendToAgent is how bots talk.</p>
+        <p class="muted desk-note">Shared desk · one Chromium, a tab per bot · SendToAgent is how bots talk.</p>
       </nav>
       <main class="thread" aria-label="\${inArchive ? 'Archive' : inActivity ? 'Activity' : inCalendar ? 'Calendar' : inGroup ? 'Group' : 'Conversation'}">
         \${mainInner}

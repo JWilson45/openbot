@@ -19,6 +19,13 @@ export const BROWSER_VIEWPORT_MAX = { width: 2560, height: 1440 };
 export const BROWSER_VIEWPORT_DEFAULT = { width: 1280, height: 720 };
 export const BROWSER_WAIT_MAX_MS = 15_000;
 export const BROWSER_WAIT_DEFAULT_MS = 800;
+export const TAKEOVER_TAB = "takeover";
+
+export type BrowserTab = {
+  owner: string;
+  id: string;
+  wsUrl: string;
+};
 
 function clampViewport(width: number, height: number): { width: number; height: number } {
   return {
@@ -140,6 +147,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   harness: "down" | "starting" | "idle" | "in_turn" | "crashed" = "down";
   acp: AcpClient | null = null;
   readonly acps = new Map<string, AcpSlot>();
+  readonly tabs = new Map<string, BrowserTab>();
   browser: BrowserHandle | null = null;
   harnessSessionId?: string;
   acpSessionId?: string;
@@ -268,7 +276,10 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     let pageOrigin: string | undefined;
     if (this.browser?.cdpUrl) {
       try {
-        const info = await cdpPageInfo(this.browser.cdpUrl);
+        const tab = this.tabs.get(TAKEOVER_TAB);
+        const info = tab
+          ? await cdpTargetInfo(this.browser.cdpUrl, tab.id)
+          : await cdpPageInfo(this.browser.cdpUrl);
         pageUrl = info.url;
         pageOrigin = info.origin;
       } catch {
@@ -331,9 +342,10 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   ): Promise<void> {
     await this.ensureBrowser();
     this.browser!.takeoverActive = true;
-    const existing = await cdpPageInfo(this.browser!.cdpUrl).catch(() => ({} as { url?: string }));
+    const tab = await this.ensureTab(TAKEOVER_TAB);
+    const existing = await cdpTargetInfo(this.browser!.cdpUrl, tab.id).catch(() => ({} as { url?: string }));
     if (!existing.url || existing.url === "about:blank") {
-      await cdpNavigate(this.browser!.cdpUrl, TAKEOVER_HOME).catch(() => undefined);
+      await cdpNavigate(this.browser!.cdpUrl, TAKEOVER_HOME, tab.wsUrl).catch(() => undefined);
     }
     this.onScreencastFrame = onFrame;
     this.screencastFrames = 0;
@@ -364,12 +376,13 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
           height: p.metadata.deviceHeight,
         };
       }
-      const info = await cdpPageInfo(this.browser!.cdpUrl).catch(() => ({}));
+      const info = await cdpTargetInfo(this.browser!.cdpUrl, tab.id).catch(() => ({}));
       this.onScreencastFrame?.(jpeg, info);
-    });
+    }, tab.wsUrl);
     this.browser!.screencast = conn;
     await conn.send("Page.enable");
     await conn.send("Runtime.enable");
+    await conn.send("Page.bringToFront").catch(() => undefined);
     const vp = this.browser!.viewport ?? BROWSER_VIEWPORT_DEFAULT;
     await this.applyViewportToCdp(conn, vp.width, vp.height);
     await conn.send("Page.startScreencast", {
@@ -444,7 +457,34 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
       takeoverActive: false,
       viewport: { ...BROWSER_VIEWPORT_DEFAULT },
     };
+    this.tabs.clear();
     return this.browser;
+  }
+
+  async ensureTab(owner: string): Promise<BrowserTab> {
+    await this.ensureBrowser();
+    const key = owner.trim() || TAKEOVER_TAB;
+    const existing = this.tabs.get(key);
+    const list = await cdpList(this.browser!.cdpUrl);
+    if (existing) {
+      const still = list.find((p) => p.id === existing.id && p.webSocketDebuggerUrl);
+      if (still?.webSocketDebuggerUrl) {
+        existing.wsUrl = still.webSocketDebuggerUrl;
+        return existing;
+      }
+      this.tabs.delete(key);
+    }
+    const owned = new Set([...this.tabs.values()].map((t) => t.id));
+    const free = list.find((p) => p.type === "page" && p.id && p.webSocketDebuggerUrl && !owned.has(p.id));
+    if (free?.id && free.webSocketDebuggerUrl) {
+      const tab: BrowserTab = { owner: key, id: free.id, wsUrl: free.webSocketDebuggerUrl };
+      this.tabs.set(key, tab);
+      return tab;
+    }
+    const created = await cdpNewPage(this.browser!.cdpUrl);
+    const tab: BrowserTab = { owner: key, id: created.id, wsUrl: created.webSocketDebuggerUrl };
+    this.tabs.set(key, tab);
+    return tab;
   }
 
   stopBrowser(): void {
@@ -453,6 +493,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     } catch {
       /* ignore */
     }
+    this.tabs.clear();
     this.browser = null;
   }
 
@@ -600,43 +641,48 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     }
   }
 
+  private tabOwner(owner?: string): string {
+    return (owner ?? TAKEOVER_TAB).trim() || TAKEOVER_TAB;
+  }
+
+  private blocksHumanTab(owner: string, duringTakeover?: boolean): boolean {
+    return Boolean(this.browser?.takeoverActive && owner === TAKEOVER_TAB && !duringTakeover);
+  }
+
   async navigate(
     url: string,
-    opts?: { duringTakeover?: boolean },
+    opts?: { duringTakeover?: boolean; owner?: string },
   ): Promise<{ ok: boolean; title?: string; error?: string }> {
-    if (this.browser?.takeoverActive && !opts?.duringTakeover) {
+    const owner = this.tabOwner(opts?.owner);
+    if (this.blocksHumanTab(owner, opts?.duringTakeover)) {
       return { ok: false, error: "takeover_active" };
     }
     const trimmed = url.trim();
     if (!/^https?:\/\//i.test(trimmed) && !trimmed.startsWith("data:text/html")) {
       return { ok: false, error: "invalid_url" };
     }
-    await this.ensureBrowser();
     try {
-      const page = await cdpNavigate(this.browser!.cdpUrl, trimmed);
+      const tab = await this.ensureTab(owner);
+      const page = await cdpNavigate(this.browser!.cdpUrl, trimmed, tab.wsUrl);
       return { ok: true, title: page.title };
     } catch (err) {
       return { ok: false, error: String(err) };
     }
   }
 
-  async snapshot(): Promise<{ ok: boolean; html?: string; error?: string }> {
-    if (!this.browser?.cdpUrl) return { ok: false, error: "browser down" };
+  async snapshot(owner?: string): Promise<{ ok: boolean; html?: string; error?: string }> {
     try {
-      const html = await this.runtimeEval<string>("document.documentElement.outerHTML");
+      const tab = await this.ensureTab(this.tabOwner(owner));
+      const html = await this.runtimeEval<string>("document.documentElement.outerHTML", tab);
       return { ok: true, html };
     } catch (err) {
       return { ok: false, error: String(err) };
     }
   }
 
-  async pageText(): Promise<{ ok: boolean; url?: string; title?: string; text?: string; error?: string }> {
+  async pageText(owner?: string): Promise<{ ok: boolean; url?: string; title?: string; text?: string; error?: string }> {
     try {
-      await this.ensureBrowser();
-    } catch (err) {
-      return { ok: false, error: String(err) };
-    }
-    try {
+      const tab = await this.ensureTab(this.tabOwner(owner));
       const page = await this.runtimeEval<{ url?: string; title?: string; text?: string }>(
         `(() => {
           const text = document.body ? String(document.body.innerText || document.body.textContent || "") : "";
@@ -646,6 +692,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
             text: text.slice(0, ${BROWSER_SNAPSHOT_MAX_CHARS}),
           };
         })()`,
+        tab,
       );
       return {
         ok: true,
@@ -658,15 +705,20 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     }
   }
 
-  async click(input: {
-    text?: string;
-    selector?: string;
-    nth?: number;
-  }): Promise<{ ok: boolean; text?: string; tag?: string; count?: number; error?: string }> {
-    if (this.browser?.takeoverActive) return { ok: false, error: "takeover_active" };
+  async click(
+    input: {
+      text?: string;
+      selector?: string;
+      nth?: number;
+    },
+    owner?: string,
+  ): Promise<{ ok: boolean; text?: string; tag?: string; count?: number; error?: string }> {
+    const tabOwner = this.tabOwner(owner);
+    if (this.blocksHumanTab(tabOwner)) return { ok: false, error: "takeover_active" };
     return this.withBrowser(async () => {
+      let tab: BrowserTab;
       try {
-        await this.ensureBrowser();
+        tab = await this.ensureTab(tabOwner);
       } catch (err) {
         return { ok: false, error: String(err) };
       }
@@ -688,14 +740,17 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
           text?: string;
           count?: number;
           method?: string;
-        }>(clickFindExpr(spec));
+        }>(clickFindExpr(spec), tab);
         if (!found?.ok) {
           return { ok: false, error: found?.error ?? "not_found", count: found?.count };
         }
         if ((found.w ?? 0) >= 1 && (found.h ?? 0) >= 1 && found.x != null && found.y != null) {
-          await this.dispatchCssClick(found.x, found.y);
+          await this.dispatchCssClick(found.x, found.y, tab);
         } else {
-          await this.runtimeEval("document.activeElement && document.activeElement.click && document.activeElement.click()");
+          await this.runtimeEval(
+            "document.activeElement && document.activeElement.click && document.activeElement.click()",
+            tab,
+          );
         }
         return { ok: true, text: found.text, tag: found.tag, count: found.count };
       } catch (err) {
@@ -704,15 +759,20 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     });
   }
 
-  async typeText(input: {
-    text: string;
-    clear?: boolean;
-    submit?: boolean;
-  }): Promise<{ ok: boolean; error?: string }> {
-    if (this.browser?.takeoverActive) return { ok: false, error: "takeover_active" };
+  async typeText(
+    input: {
+      text: string;
+      clear?: boolean;
+      submit?: boolean;
+    },
+    owner?: string,
+  ): Promise<{ ok: boolean; error?: string }> {
+    const tabOwner = this.tabOwner(owner);
+    if (this.blocksHumanTab(tabOwner)) return { ok: false, error: "takeover_active" };
     return this.withBrowser(async () => {
+      let tab: BrowserTab;
       try {
-        await this.ensureBrowser();
+        tab = await this.ensureTab(tabOwner);
       } catch (err) {
         return { ok: false, error: String(err) };
       }
@@ -725,10 +785,12 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
             }
             return { ok: true, tag: el.tagName };
           })()`,
+          tab,
         );
         if (!focus?.ok) return { ok: false, error: focus?.error ?? "no_focus" };
         if (input.clear) {
-          await this.runtimeEval(`(() => {
+          await this.runtimeEval(
+            `(() => {
             const el = document.activeElement;
             if (!el) return false;
             if ("value" in el) {
@@ -737,13 +799,15 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
               el.dispatchEvent(new Event("change", { bubbles: true }));
             } else if (el.isContentEditable) el.textContent = "";
             return true;
-          })()`);
+          })()`,
+            tab,
+          );
         }
-        await this.cdpCall("Input.insertText", { text: input.text });
+        await this.cdpCall("Input.insertText", { text: input.text }, tab);
         if (input.submit) {
-          await this.cdpCall("Input.dispatchKeyEvent", cdpKeyEvent({ action: "rawKeyDown", key: "Enter", code: "Enter" }));
-          await this.cdpCall("Input.dispatchKeyEvent", cdpKeyEvent({ action: "char", key: "Enter", code: "Enter", text: "\r" }));
-          await this.cdpCall("Input.dispatchKeyEvent", cdpKeyEvent({ action: "keyUp", key: "Enter", code: "Enter" }));
+          await this.cdpCall("Input.dispatchKeyEvent", cdpKeyEvent({ action: "rawKeyDown", key: "Enter", code: "Enter" }), tab);
+          await this.cdpCall("Input.dispatchKeyEvent", cdpKeyEvent({ action: "char", key: "Enter", code: "Enter", text: "\r" }), tab);
+          await this.cdpCall("Input.dispatchKeyEvent", cdpKeyEvent({ action: "keyUp", key: "Enter", code: "Enter" }), tab);
         }
         return { ok: true };
       } catch (err) {
@@ -758,18 +822,17 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     return { ok: true, ms: n };
   }
 
-  private async dispatchCssClick(x: number, y: number): Promise<void> {
+  private async dispatchCssClick(x: number, y: number, tab: BrowserTab): Promise<void> {
     const at = { x, y, button: "left" };
-    await this.cdpCall("Input.dispatchMouseEvent", { type: "mouseMoved", ...at, buttons: 0, clickCount: 0 });
-    await this.cdpCall("Input.dispatchMouseEvent", { type: "mousePressed", ...at, buttons: 1, clickCount: 1 });
-    await this.cdpCall("Input.dispatchMouseEvent", { type: "mouseReleased", ...at, buttons: 0, clickCount: 1 });
+    await this.cdpCall("Input.dispatchMouseEvent", { type: "mouseMoved", ...at, buttons: 0, clickCount: 0 }, tab);
+    await this.cdpCall("Input.dispatchMouseEvent", { type: "mousePressed", ...at, buttons: 1, clickCount: 1 }, tab);
+    await this.cdpCall("Input.dispatchMouseEvent", { type: "mouseReleased", ...at, buttons: 0, clickCount: 1 }, tab);
   }
 
-  private async cdpCall(method: string, params?: unknown): Promise<unknown> {
+  private async cdpCall(method: string, params?: unknown, tab?: BrowserTab): Promise<unknown> {
     if (!this.browser?.cdpUrl) throw new Error("browser down");
-    const conn = this.browser.screencast;
-    if (conn) return conn.send(method, params);
-    const { ws, send } = await cdpConnect(this.browser.cdpUrl);
+    if (!tab && this.browser.screencast) return this.browser.screencast.send(method, params);
+    const { ws, send } = await cdpConnect(this.browser.cdpUrl, undefined, tab?.wsUrl);
     try {
       return await send(method, params);
     } finally {
@@ -777,8 +840,9 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     }
   }
 
-  private async runtimeEval<T>(expression: string): Promise<T> {
+  private async runtimeEval<T>(expression: string, tab?: BrowserTab): Promise<T> {
     if (!this.browser?.cdpUrl) throw new Error("browser down");
+    if (tab) return cdpEvaluate<T>(this.browser.cdpUrl, expression, tab.wsUrl);
     const conn = this.browser.screencast;
     if (conn) {
       await conn.send("Runtime.enable").catch(() => undefined);
@@ -954,23 +1018,49 @@ async function findChrome(): Promise<string | null> {
   return null;
 }
 
-async function cdpPageWsUrl(cdpHttp: string): Promise<string> {
+type CdpTarget = {
+  id?: string;
+  type?: string;
+  url?: string;
+  webSocketDebuggerUrl?: string;
+  title?: string;
+};
+
+async function cdpList(cdpHttp: string): Promise<CdpTarget[]> {
   const res = await fetch(`${cdpHttp}/json/list`);
-  const list = (await res.json()) as Array<{ type?: string; webSocketDebuggerUrl?: string }>;
+  return (await res.json()) as CdpTarget[];
+}
+
+async function cdpNewPage(cdpHttp: string): Promise<{ id: string; webSocketDebuggerUrl: string }> {
+  for (const method of ["PUT", "GET"] as const) {
+    try {
+      const res = await fetch(`${cdpHttp}/json/new?about:blank`, { method });
+      if (!res.ok) continue;
+      const created = (await res.json()) as CdpTarget;
+      if (created.webSocketDebuggerUrl && created.id) {
+        return { id: created.id, webSocketDebuggerUrl: created.webSocketDebuggerUrl };
+      }
+    } catch {
+      /* try next */
+    }
+  }
+  throw new Error("no cdp page websocket");
+}
+
+async function cdpPageWsUrl(cdpHttp: string): Promise<string> {
+  const list = await cdpList(cdpHttp);
   const page = list.find((p) => p.type === "page" && p.webSocketDebuggerUrl);
   if (page?.webSocketDebuggerUrl) return page.webSocketDebuggerUrl;
-  const created = (await fetch(`${cdpHttp}/json/new?about:blank`).then((r) => r.json())) as {
-    webSocketDebuggerUrl?: string;
-  };
-  if (!created.webSocketDebuggerUrl) throw new Error("no cdp page websocket");
+  const created = await cdpNewPage(cdpHttp);
   return created.webSocketDebuggerUrl;
 }
 
 async function cdpConnect(
   cdpHttp: string,
   onEvent?: (method: string, params: unknown) => void,
+  pageWsUrl?: string,
 ): Promise<CdpConn> {
-  const url = await cdpPageWsUrl(cdpHttp);
+  const url = pageWsUrl ?? (await cdpPageWsUrl(cdpHttp));
   const ws = new WebSocket(url);
   await new Promise<void>((resolve, reject) => {
     ws.onopen = () => resolve();
@@ -1004,22 +1094,29 @@ async function cdpConnect(
   return { ws, send };
 }
 
-async function cdpPageInfo(cdpHttp: string): Promise<{ url?: string; origin?: string }> {
-  const res = await fetch(`${cdpHttp}/json/list`);
-  const list = (await res.json()) as Array<{ url?: string; type?: string }>;
-  const page = list.find((p) => p.type === "page") ?? list[0];
-  const url = page?.url;
-  let origin: string | undefined;
+function originOf(url?: string): string | undefined {
   try {
-    if (url) origin = new URL(url).origin;
+    if (url) return new URL(url).origin;
   } catch {
     /* ignore */
   }
-  return { url, origin };
+  return undefined;
 }
 
-async function cdpNavigate(cdpHttp: string, url: string): Promise<{ title?: string }> {
-  const { ws, send } = await cdpConnect(cdpHttp);
+async function cdpPageInfo(cdpHttp: string): Promise<{ url?: string; origin?: string }> {
+  const list = await cdpList(cdpHttp);
+  const page = list.find((p) => p.type === "page") ?? list[0];
+  return { url: page?.url, origin: originOf(page?.url) };
+}
+
+async function cdpTargetInfo(cdpHttp: string, targetId: string): Promise<{ url?: string; origin?: string }> {
+  const list = await cdpList(cdpHttp);
+  const page = list.find((p) => p.id === targetId) ?? list.find((p) => p.type === "page") ?? list[0];
+  return { url: page?.url, origin: originOf(page?.url) };
+}
+
+async function cdpNavigate(cdpHttp: string, url: string, pageWsUrl?: string): Promise<{ title?: string }> {
+  const { ws, send } = await cdpConnect(cdpHttp, undefined, pageWsUrl);
   try {
     await send("Page.enable");
     await send("Runtime.enable");
@@ -1079,8 +1176,8 @@ function clickFindExpr(spec: { text: string; selector: string; nth: number }): s
   })()`;
 }
 
-async function cdpEvaluate<T>(cdpHttp: string, expression: string): Promise<T> {
-  const { ws, send } = await cdpConnect(cdpHttp);
+async function cdpEvaluate<T>(cdpHttp: string, expression: string, pageWsUrl?: string): Promise<T> {
+  const { ws, send } = await cdpConnect(cdpHttp, undefined, pageWsUrl);
   try {
     const result = (await send("Runtime.evaluate", { expression, returnByValue: true })) as {
       result?: { value?: T };
