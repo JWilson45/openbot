@@ -267,11 +267,12 @@ export const SPA_HTML = `<!DOCTYPE html>
     #tk-nav button { flex: 0 0 auto; }
     .tk-stage {
       min-height: 0; background: #11161e; position: relative; overflow: hidden;
+      overscroll-behavior: none;
     }
     .modal-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; flex: 0 0 auto; }
     #takeover-frame {
       display: block; width: 100%; height: 100%;
-      background: #11161e; border: 0; border-radius: 0;
+      background: #11161e; border: 0; border-radius: 0; touch-action: none;
     }
     .empty { margin: auto; text-align: center; color: var(--muted); padding: 24px; }
     .side-toggle { display: none; }
@@ -2873,6 +2874,7 @@ export const SPA_HTML = `<!DOCTYPE html>
     let ws = null;
     let viewportTimer = 0;
     let frameUrl = '';
+    let lastFit = { dx: 0, dy: 0, dw: 1280, dh: 720 };
     function sendViewport() {
       if (!ws || ws.readyState !== 1 || !stage) return;
       const r = stage.getBoundingClientRect();
@@ -2931,8 +2933,15 @@ export const SPA_HTML = `<!DOCTYPE html>
         const blob = new Blob([ev.data], { type: 'image/jpeg' });
         const img = new Image();
         img.onload = () => {
+          const cw = canvas.width, ch = canvas.height;
+          const scale = Math.min(cw / img.width, ch / img.height);
+          const dw = Math.max(1, Math.round(img.width * scale));
+          const dh = Math.max(1, Math.round(img.height * scale));
+          lastFit = { dx: Math.round((cw - dw) / 2), dy: Math.round((ch - dh) / 2), dw: dw, dh: dh };
           const ctx = canvas.getContext('2d');
-          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          ctx.fillStyle = '#11161e';
+          ctx.fillRect(0, 0, cw, ch);
+          ctx.drawImage(img, lastFit.dx, lastFit.dy, lastFit.dw, lastFit.dh);
           if (frameUrl) URL.revokeObjectURL(frameUrl);
         };
         frameUrl = URL.createObjectURL(blob);
@@ -2941,22 +2950,45 @@ export const SPA_HTML = `<!DOCTYPE html>
     };
     function frac(e) {
       const r = canvas.getBoundingClientRect();
-      return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
+      if (!r.width || !r.height) return { x: 0, y: 0 };
+      const sx = r.width / canvas.width;
+      const sy = r.height / canvas.height;
+      const imgLeft = lastFit.dx * sx;
+      const imgTop = lastFit.dy * sy;
+      const imgW = lastFit.dw * sx;
+      const imgH = lastFit.dh * sy;
+      if (!imgW || !imgH) return { x: 0, y: 0 };
+      return {
+        x: Math.min(1, Math.max(0, (e.clientX - r.left - imgLeft) / imgW)),
+        y: Math.min(1, Math.max(0, (e.clientY - r.top - imgTop) / imgH)),
+      };
+    }
+    function sendPointer(type, extra) {
+      if (!ws || ws.readyState !== 1) return;
+      ws.send(JSON.stringify(Object.assign({ type: type }, extra)));
     }
     canvas.addEventListener('mousedown', (e) => {
       e.preventDefault(); canvas.focus();
       const p = frac(e);
-      ws.send(JSON.stringify({ type:'mouse', action:'pressed', x:p.x, y:p.y, button:'left' }));
+      sendPointer('mouse', { action:'pressed', x:p.x, y:p.y, button:'left' });
     });
     canvas.addEventListener('mouseup', (e) => {
       const p = frac(e);
-      ws.send(JSON.stringify({ type:'mouse', action:'released', x:p.x, y:p.y, button:'left' }));
+      sendPointer('mouse', { action:'released', x:p.x, y:p.y, button:'left' });
     });
     canvas.addEventListener('mousemove', (e) => {
       if (!e.buttons) return;
       const p = frac(e);
-      ws.send(JSON.stringify({ type:'mouse', action:'moved', x:p.x, y:p.y, button:'left' }));
+      sendPointer('mouse', { action:'moved', x:p.x, y:p.y, button:'left' });
     });
+    canvas.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const p = frac(e);
+      let dx = e.deltaX, dy = e.deltaY;
+      if (e.deltaMode === 1) { dx *= 16; dy *= 16; }
+      if (e.deltaMode === 2) { dx *= canvas.height; dy *= canvas.height; }
+      sendPointer('wheel', { x:p.x, y:p.y, deltaX: dx, deltaY: dy });
+    }, { passive: false });
     canvas.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') { e.preventDefault(); endTakeover(); return; }
       e.preventDefault();

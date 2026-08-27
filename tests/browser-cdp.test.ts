@@ -79,6 +79,12 @@ describe("CDP + takeover", () => {
       expect(runner.lastDispatchedInput).toBeTruthy();
       expect(runner.lastDispatchedInput?.type).toBe("mouse");
       expect(runner.screencastFrames).toBeGreaterThan(0);
+      expect(runner.browser?.inputViewport?.width).toBeGreaterThan(0);
+      session.ws.send(JSON.stringify({ type: "wheel", x: 0.5, y: 0.5, deltaX: 0, deltaY: 120 }));
+      const wheelStart = Date.now();
+      while (Date.now() - wheelStart < 3000 && runner.lastDispatchedInput?.type !== "wheel") await Bun.sleep(50);
+      expect(runner.lastDispatchedInput?.type).toBe("wheel");
+      expect(runner.lastDispatchedInput?.deltaY).toBe(120);
       session.ws.send(JSON.stringify({ type: "viewport", width: 1600, height: 900 }));
       const vpStart = Date.now();
       while (Date.now() - vpStart < 2000 && runner.browser?.viewport?.width !== 1600) await Bun.sleep(40);

@@ -42,6 +42,9 @@ describe("desk SPA markup", () => {
     expect(html).toContain("overlay.tk");
     expect(html).toContain("type:'navigate'");
     expect(html).toContain("type:'viewport'");
+    expect(html).toContain("sendPointer('wheel'");
+    expect(html).toContain("touch-action: none");
+    expect(html).toContain("lastFit");
     expect(html).toContain("ResizeObserver");
     expect(html).toContain("requestAnimationFrame");
     expect(html).toContain("width: 100%; height: 100%");

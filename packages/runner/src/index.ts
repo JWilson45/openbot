@@ -62,6 +62,8 @@ export type BrowserHandle = {
   screencastNonce?: string;
   screencast?: CdpConn;
   viewport: { width: number; height: number };
+  /** Last screencast frame's CSS viewport; mouse/wheel map through this, not the requested stage. */
+  inputViewport?: { width: number; height: number };
   pid?: number;
 };
 
@@ -297,6 +299,12 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
       if (!p.data) return;
       const jpeg = Buffer.from(p.data, "base64");
       this.screencastFrames += 1;
+      if (p.metadata?.deviceWidth && p.metadata?.deviceHeight) {
+        this.browser!.inputViewport = {
+          width: p.metadata.deviceWidth,
+          height: p.metadata.deviceHeight,
+        };
+      }
       const info = await cdpPageInfo(this.browser!.cdpUrl).catch(() => ({}));
       this.onScreencastFrame?.(jpeg, info);
     });
@@ -335,20 +343,11 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     await conn.send("Emulation.setDeviceMetricsOverride", {
       width,
       height,
+      screenWidth: width,
+      screenHeight: height,
       deviceScaleFactor: 1,
       mobile: false,
     });
-    try {
-      const win = (await conn.send("Browser.getWindowForTarget")) as { windowId?: number };
-      if (win?.windowId != null) {
-        await conn.send("Browser.setWindowBounds", {
-          windowId: win.windowId,
-          bounds: { width, height, windowState: "normal" },
-        });
-      }
-    } catch {
-      /* headless may not expose a window */
-    }
   }
 
   stopTakeover(): void {
@@ -614,24 +613,43 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     return cdpEvaluate<T>(this.browser.cdpUrl, expression);
   }
 
+  private inputSize(): { width: number; height: number } {
+    return this.browser?.inputViewport ?? this.browser?.viewport ?? BROWSER_VIEWPORT_DEFAULT;
+  }
+
   async dispatchInput(event: Record<string, unknown>): Promise<void> {
     if (!this.browser?.cdpUrl) return;
     this.lastDispatchedInput = event;
     const conn = this.browser.screencast;
     const type = String(event.type ?? "mouse");
-    const vp = this.browser.viewport;
+    const vp = this.inputSize();
+    const fracX = Math.min(1, Math.max(0, Number(event.x ?? 0)));
+    const fracY = Math.min(1, Math.max(0, Number(event.y ?? 0)));
+    const cssX = fracX * vp.width;
+    const cssY = fracY * vp.height;
     if (type === "mouse") {
-      const fracX = Number(event.x ?? 0);
-      const fracY = Number(event.y ?? 0);
       const action = String(event.action ?? "pressed");
       const cdpType =
         action === "released" ? "mouseReleased" : action === "moved" ? "mouseMoved" : "mousePressed";
       const params = {
         type: cdpType,
-        x: fracX * vp.width,
-        y: fracY * vp.height,
+        x: cssX,
+        y: cssY,
         button: String(event.button ?? "left"),
+        buttons: action === "released" ? 0 : 1,
         clickCount: action === "moved" ? 0 : 1,
+      };
+      if (conn) await conn.send("Input.dispatchMouseEvent", params);
+      else await cdpInput(this.browser.cdpUrl, { type: "mouse", params });
+      return;
+    }
+    if (type === "wheel") {
+      const params = {
+        type: "mouseWheel",
+        x: cssX,
+        y: cssY,
+        deltaX: Number(event.deltaX ?? 0),
+        deltaY: Number(event.deltaY ?? 0),
       };
       if (conn) await conn.send("Input.dispatchMouseEvent", params);
       else await cdpInput(this.browser.cdpUrl, { type: "mouse", params });
