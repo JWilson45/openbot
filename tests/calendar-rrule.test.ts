@@ -29,6 +29,11 @@ describe("parseRrule", () => {
     expectCode(() => parseRrule("not-a-rule"), "invalid_rrule");
     expectCode(() => parseRrule("FREQ=YEARLY"), "unsupported_rrule");
     expectCode(() => parseRrule("FREQ=DAILY;WKST=SU"), "unsupported_rrule");
+    expectCode(() => parseRrule("FREQ=HOURLY;BYDAY=MO"), "unsupported_rrule");
+    expectCode(() => parseRrule("FREQ=MINUTELY;INTERVAL=5;BYDAY=MO"), "unsupported_rrule");
+    expectCode(() => parseRrule("FREQ=MONTHLY;BYDAY=MO"), "unsupported_rrule");
+    expectCode(() => parseRrule("FREQ=DAILY;BYMONTHDAY=1"), "unsupported_rrule");
+    expectCode(() => parseRrule("FREQ=WEEKLY;BYMONTHDAY=1"), "unsupported_rrule");
   });
 
   test("HOURLY INTERVAL=1 and MINUTELY INTERVAL=5 parse", () => {
@@ -39,6 +44,8 @@ describe("parseRrule", () => {
     expect(five.interval).toBe(5);
     expect(five.interval * 60_000).toBe(CAL_MIN_INTERVAL_MS);
     expect(parseRrule("FREQ=DAILY;INTERVAL=1;BYHOUR=9;BYMINUTE=0").byHour).toEqual([9]);
+    expect(parseRrule("FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0").byDay).toEqual([1, 2, 3, 4, 5]);
+    expect(parseRrule("FREQ=MONTHLY;BYMONTHDAY=31").byMonthDay).toEqual([31]);
   });
 });
 
@@ -174,6 +181,43 @@ describe("expandRrule timezone", () => {
     ]);
   });
 
+  test("WEEKLY BYDAY=SA,SU emits Saturday then Sunday", () => {
+    const dtstart = Date.UTC(2026, 0, 2, 12, 0, 0);
+    const occs = expandRrule({
+      dtstartUtc: dtstart,
+      timezone: "UTC",
+      rrule: "FREQ=WEEKLY;BYDAY=SA,SU;BYHOUR=12;BYMINUTE=0",
+      limit: 8,
+    });
+    expect(occs).toEqual([
+      Date.UTC(2026, 0, 2, 12, 0, 0),
+      Date.UTC(2026, 0, 3, 12, 0, 0),
+      Date.UTC(2026, 0, 4, 12, 0, 0),
+      Date.UTC(2026, 0, 10, 12, 0, 0),
+      Date.UTC(2026, 0, 11, 12, 0, 0),
+      Date.UTC(2026, 0, 17, 12, 0, 0),
+      Date.UTC(2026, 0, 18, 12, 0, 0),
+      Date.UTC(2026, 0, 24, 12, 0, 0),
+    ]);
+  });
+
+  test("WEEKLY BYDAY=SU,MO emits Sunday then Monday", () => {
+    const dtstart = Date.UTC(2026, 0, 2, 12, 0, 0);
+    const occs = expandRrule({
+      dtstartUtc: dtstart,
+      timezone: "UTC",
+      rrule: "FREQ=WEEKLY;BYDAY=SU,MO;BYHOUR=12;BYMINUTE=0",
+      limit: 5,
+    });
+    expect(occs).toEqual([
+      Date.UTC(2026, 0, 2, 12, 0, 0),
+      Date.UTC(2026, 0, 4, 12, 0, 0),
+      Date.UTC(2026, 0, 5, 12, 0, 0),
+      Date.UTC(2026, 0, 11, 12, 0, 0),
+      Date.UTC(2026, 0, 12, 12, 0, 0),
+    ]);
+  });
+
   test("one-shot rrule null is dtstart only", () => {
     const dtstart = Date.UTC(2026, 5, 1, 15, 0, 0);
     expect(
@@ -198,6 +242,34 @@ describe("materializeHorizon", () => {
     expect(future.every((t) => t > nowMs)).toBe(true);
     expect(future.at(-1)!).toBeLessThanOrEqual(nowMs + CAL_HORIZON_MS);
     expect(future.at(-1)!).toBe(nowMs + CAL_MAX_INSTANCES_HORIZON * 5 * 60 * 1000);
+  });
+
+  test("WEEKLY BYDAY=SA,SU catch-up is Sunday and future starts Saturday", () => {
+    const dtstart = Date.UTC(2026, 0, 2, 12, 0, 0);
+    const nowMs = Date.UTC(2026, 0, 12, 0, 0, 0);
+    const { catchup, future } = materializeHorizon({
+      dtstartUtc: dtstart,
+      timezone: "UTC",
+      rrule: "FREQ=WEEKLY;BYDAY=SA,SU;BYHOUR=12;BYMINUTE=0",
+      nowMs,
+    });
+    expect(catchup).toBe(Date.UTC(2026, 0, 11, 12, 0, 0));
+    expect(future[0]).toBe(Date.UTC(2026, 0, 17, 12, 0, 0));
+    expect(future[1]).toBe(Date.UTC(2026, 0, 18, 12, 0, 0));
+  });
+
+  test("WEEKLY BYDAY=SU,MO catch-up is Sunday and future starts Monday", () => {
+    const dtstart = Date.UTC(2026, 0, 2, 12, 0, 0);
+    const nowMs = Date.UTC(2026, 0, 12, 0, 0, 0);
+    const { catchup, future } = materializeHorizon({
+      dtstartUtc: dtstart,
+      timezone: "UTC",
+      rrule: "FREQ=WEEKLY;BYDAY=SU,MO;BYHOUR=12;BYMINUTE=0",
+      nowMs,
+    });
+    expect(catchup).toBe(Date.UTC(2026, 0, 11, 12, 0, 0));
+    expect(future[0]).toBe(Date.UTC(2026, 0, 12, 12, 0, 0));
+    expect(future[1]).toBe(Date.UTC(2026, 0, 18, 12, 0, 0));
   });
 
   test("past one-shot is catchup only", () => {

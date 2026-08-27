@@ -179,6 +179,10 @@ function weekday(year: number, month: number, day: number): number {
   return new Date(Date.UTC(year, month - 1, day)).getUTCDay();
 }
 
+function fromMonday(dow: number): number {
+  return (dow + 6) % 7;
+}
+
 function daysInMonth(year: number, month: number): number {
   return new Date(Date.UTC(year, month, 0)).getUTCDate();
 }
@@ -213,9 +217,7 @@ function addMonths(year: number, month: number, n: number): { year: number; mont
 }
 
 function mondayOnOrBefore(year: number, month: number, day: number): { year: number; month: number; day: number } {
-  const dow = weekday(year, month, day);
-  const fromMonday = (dow + 6) % 7;
-  return addDays(year, month, day, -fromMonday);
+  return addDays(year, month, day, -fromMonday(weekday(year, month, day)));
 }
 
 function parsePositiveInt(raw: string): number {
@@ -289,6 +291,12 @@ export function parseRrule(input: string): ParsedRrule {
   const count = map.has("COUNT") ? parsePositiveInt(map.get("COUNT")!) : null;
   const untilRaw = map.get("UNTIL") ?? null;
   if (untilRaw && !/^\d{8}(T\d{6}Z?)?$/i.test(untilRaw)) throw new RruleError("invalid_rrule");
+  if (map.has("BYDAY") && freqRaw !== "DAILY" && freqRaw !== "WEEKLY") {
+    throw new RruleError("unsupported_rrule");
+  }
+  if (map.has("BYMONTHDAY") && freqRaw !== "MONTHLY") {
+    throw new RruleError("unsupported_rrule");
+  }
   return {
     freq: freqRaw,
     interval,
@@ -434,7 +442,7 @@ function* civilCandidates(seed: CivilDt, from: CivilDt, rule: ParsedRrule): Gene
   }
   if (rule.freq === "WEEKLY") {
     const days = rule.byDay ?? [weekday(seed.year, seed.month, seed.day)];
-    const ordered = [...days].sort((a, b) => a - b);
+    const ordered = [...days].sort((a, b) => fromMonday(a) - fromMonday(b));
     let week = mondayOnOrBefore(from.year, from.month, from.day);
     const seedWeek = mondayOnOrBefore(seed.year, seed.month, seed.day);
     if (rule.interval > 1) {
@@ -450,8 +458,7 @@ function* civilCandidates(seed: CivilDt, from: CivilDt, rule: ParsedRrule): Gene
     }
     while (true) {
       for (const dow of ordered) {
-        const fromMonday = (dow + 6) % 7;
-        const date = addDays(week.year, week.month, week.day, fromMonday);
+        const date = addDays(week.year, week.month, week.day, fromMonday(dow));
         for (const cand of timesOnDate(date.year, date.month, date.day, hours, minutes)) {
           if (compareCivil(cand, from) < 0) continue;
           yield cand;
@@ -474,8 +481,6 @@ function* civilCandidates(seed: CivilDt, from: CivilDt, rule: ParsedRrule): Gene
     while (true) {
       for (const md of monthDays) {
         if (md > daysInMonth(ym.year, ym.month)) continue;
-        const dow = weekday(ym.year, ym.month, md);
-        if (rule.byDay && !rule.byDay.includes(dow)) continue;
         for (const cand of timesOnDate(ym.year, ym.month, md, hours, minutes)) {
           if (compareCivil(cand, from) < 0) continue;
           yield cand;
