@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { CAL_MAX_SERIES, CAL_MIN_INTERVAL_MS } from "@openbot/calendar";
+import { CAL_CREATE_PER_HOUR, CAL_MAX_SERIES, CAL_MIN_INTERVAL_MS } from "@openbot/calendar";
 import { id, now, OpenbotDb } from "@openbot/db";
 import { handleMcpJsonRpc, McpInflight } from "@openbot/mcp-send-message";
 import { insertTurn, seedWorld, tempHome } from "./helpers.ts";
@@ -54,7 +54,13 @@ function insertBot(db: OpenbotDb, accountId: string, name: string, role = "desk"
 function insertSeries(
   db: OpenbotDb,
   accountId: string,
-  opts?: { status?: string; kind?: string; assigneeBotId?: string | null; threadId?: string | null },
+  opts?: {
+    status?: string;
+    kind?: string;
+    assigneeBotId?: string | null;
+    threadId?: string | null;
+    dtstartUtc?: number;
+  },
 ): string {
   const seriesId = id();
   const t = now();
@@ -71,7 +77,7 @@ function insertSeries(
       opts?.threadId ?? null,
       opts?.kind ?? "schedule",
       opts?.status ?? "active",
-      t + 24 * 60 * 60 * 1000,
+      opts?.dtstartUtc ?? t + 24 * 60 * 60 * 1000,
       CAL_MIN_INTERVAL_MS,
       t,
       t,
@@ -232,6 +238,17 @@ describe("calendar MCP", () => {
     const unpause = await call(db, w.token, "PauseSeries", { seriesId: extraPaused, paused: false });
     expect(unpause.status).toBe(409);
     expect(rpc(unpause.json).error?.data?.code).toBe("cap");
+
+    const proposedId = insertSeries(db, w.accountId, { status: "proposed", assigneeBotId: w.botId });
+    const pauseProposed = await call(db, w.token, "PauseSeries", { seriesId: proposedId, paused: true });
+    expect(pauseProposed.status).toBe(409);
+    expect(rpc(pauseProposed.json).error?.data?.code).toBe("not_active");
+    expect(db.get<{ status: string }>("SELECT status FROM calendar_series WHERE id = ?", [proposedId])?.status).toBe(
+      "proposed",
+    );
+    const unpauseProposed = await call(db, w.token, "PauseSeries", { seriesId: proposedId, paused: false });
+    expect(unpauseProposed.status).toBe(409);
+    expect(rpc(unpauseProposed.json).error?.data?.code).toBe("not_paused");
     db.close();
   });
 
@@ -276,6 +293,78 @@ describe("calendar MCP", () => {
     const fourth = await call(db, w.token, "CreateEvent", { title: "r3", prompt: "p" });
     expect(fourth.status).toBe(429);
     expect(rpc(fourth.json).error?.data?.code).toBe("rate_limited");
+    db.close();
+  });
+
+  test("PauseSeries rematerializes a paused active series and calls onCalendarDue", async () => {
+    const db = OpenbotDb.open(join(tempHome(), "openbot.sqlite"));
+    const w = seedWorld(db);
+    insertTurn(db, w, "running");
+    const dtstart = now() + 24 * 60 * 60 * 1000;
+    const seriesId = insertSeries(db, w.accountId, {
+      assigneeBotId: w.botId,
+      threadId: w.threadId,
+      dtstartUtc: dtstart,
+    });
+    const instId = id();
+    db.run(
+      `INSERT INTO calendar_instances (id, series_id, scheduled_at, status, created_at) VALUES (?, ?, ?, 'scheduled', ?)`,
+      [instId, seriesId, dtstart, now()],
+    );
+    let ticks = 0;
+    const paused = await call(db, w.token, "PauseSeries", { seriesId, paused: true }, { onCalendarDue: () => ticks++ });
+    expect(paused.status).toBe(200);
+    expect(payload(paused.json).status).toBe("paused");
+    expect(ticks).toBe(0);
+    expect(db.get<{ status: string }>("SELECT status FROM calendar_instances WHERE id = ?", [instId])?.status).toBe(
+      "skipped_paused",
+    );
+
+    const unpaused = await call(
+      db,
+      w.token,
+      "PauseSeries",
+      { seriesId, paused: false },
+      { onCalendarDue: () => ticks++ },
+    );
+    expect(unpaused.status).toBe(200);
+    expect(payload(unpaused.json).status).toBe("active");
+    expect(ticks).toBe(1);
+    const after = db.all<{ scheduled_at: number; status: string }>(
+      "SELECT scheduled_at, status FROM calendar_instances WHERE series_id = ?",
+      [seriesId],
+    );
+    expect(after.filter((i) => i.status === "skipped_paused")).toEqual([]);
+    expect(after.some((i) => i.scheduled_at === dtstart && i.status === "scheduled")).toBe(true);
+    expect(db.get<{ status: string }>("SELECT status FROM calendar_series WHERE id = ?", [seriesId])?.status).toBe(
+      "active",
+    );
+    db.close();
+  });
+
+  test("CreateEvent is rate limited 20 per account per hour", async () => {
+    const db = OpenbotDb.open(join(tempHome(), "openbot.sqlite"));
+    const w = seedWorld(db);
+    insertTurn(db, w, "running");
+    const t = now();
+    for (let i = 0; i < CAL_CREATE_PER_HOUR; i++) {
+      db.run(
+        `INSERT INTO audit_events (id, account_id, actor, type, payload, created_at)
+         VALUES (?, ?, 'harness', 'calendar.create', ?, ?)`,
+        [id(), w.accountId, JSON.stringify({ title: `seed-${i}` }), t],
+      );
+    }
+    const blocked = await call(db, w.token, "CreateEvent", { title: "hourly", prompt: "p" });
+    expect(blocked.status).toBe(429);
+    expect(rpc(blocked.json).error?.data?.code).toBe("rate_limited");
+
+    db.run(`UPDATE audit_events SET created_at = ? WHERE type = 'calendar.create' AND account_id = ?`, [
+      t - 61 * 60 * 1000,
+      w.accountId,
+    ]);
+    const ok = await call(db, w.token, "CreateEvent", { title: "after-window", prompt: "p" });
+    expect(ok.status).toBe(200);
+    expect(payload(ok.json).status).toBe("proposed");
     db.close();
   });
 

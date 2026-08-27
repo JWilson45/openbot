@@ -4,7 +4,7 @@ import {
   CAL_MAX_FIRES_PER_TICK,
   materializeHorizon,
 } from "@openbot/calendar";
-import { humanThread, id, isGatewayRole, type OpenbotDb } from "@openbot/db";
+import { humanThread, id, isGatewayRole, suppressOpenCalendarInstances, type OpenbotDb } from "@openbot/db";
 import { insertMessage } from "@openbot/live-work";
 
 export type TickCalendarResult = {
@@ -194,39 +194,8 @@ function suppressInactiveSeries(db: OpenbotDb, nowMs: number): void {
         AND i.status IN ('scheduled', 'due', 'queued')`,
   );
   for (const row of series) {
-    suppressOpenInstances(db, row.id, row.status === "paused" ? "pause" : "cancel", nowMs);
+    suppressOpenCalendarInstances(db, row.id, row.status === "paused" ? "pause" : "cancel", nowMs);
     refreshNextDue(db, row.id, nowMs);
-  }
-}
-
-function suppressOpenInstances(db: OpenbotDb, seriesId: string, mode: "pause" | "cancel", nowMs: number): void {
-  if (mode === "pause") {
-    db.run(
-      `UPDATE calendar_instances SET status = 'skipped_paused' WHERE series_id = ? AND status IN ('scheduled', 'due')`,
-      [seriesId],
-    );
-  } else {
-    db.run(
-      `UPDATE calendar_instances SET status = 'cancelled', skipped_reason = 'series_cancelled'
-        WHERE series_id = ? AND status IN ('scheduled', 'due')`,
-      [seriesId],
-    );
-  }
-  const queued = db.all<{ id: string; turn_id: string | null }>(
-    `SELECT id, turn_id FROM calendar_instances WHERE series_id = ? AND status = 'queued'`,
-    [seriesId],
-  );
-  for (const inst of queued) {
-    if (inst.turn_id) {
-      db.run(`UPDATE turns SET status = 'cancelled', finished_at = ? WHERE id = ? AND status = 'queued'`, [
-        nowMs,
-        inst.turn_id,
-      ]);
-    }
-    db.run(`UPDATE calendar_instances SET status = 'cancelled', skipped_reason = ? WHERE id = ?`, [
-      mode === "cancel" ? "series_cancelled" : null,
-      inst.id,
-    ]);
   }
 }
 

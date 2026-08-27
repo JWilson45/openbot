@@ -615,3 +615,43 @@ export function materializeHorizon(opts: MaterializeHorizonOpts): MaterializeHor
   });
   return { catchup, future };
 }
+
+export function parseCalendarDtstart(raw: string | number, timeZone: string): number {
+  if (typeof raw === "number") {
+    if (!Number.isFinite(raw)) throw new RruleError("invalid_dtstart");
+    return Math.trunc(raw);
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) throw new RruleError("invalid_dtstart");
+  if (/^-?\d+$/.test(trimmed)) {
+    const n = Number(trimmed);
+    if (!Number.isFinite(n)) throw new RruleError("invalid_dtstart");
+    return n;
+  }
+  if (/Z$|[+-]\d{2}:?\d{2}$/i.test(trimmed)) {
+    const ms = Date.parse(trimmed);
+    if (!Number.isFinite(ms)) throw new RruleError("invalid_dtstart");
+    return ms;
+  }
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(trimmed);
+  if (!m) throw new RruleError("invalid_dtstart");
+  const utc = civilToUtc(
+    Number(m[1]),
+    Number(m[2]),
+    Number(m[3]),
+    m[4] != null ? Number(m[4]) : 0,
+    m[5] != null ? Number(m[5]) : 0,
+    timeZone,
+  );
+  if (utc == null) throw new RruleError("invalid_dtstart");
+  return utc;
+}
+
+export function localNineTomorrow(timeZone: string, nowMs: number): number {
+  const later = utcToCivil(nowMs + 24 * 60 * 60 * 1000, timeZone);
+  for (const hour of [9, 10, 11, 8, 12]) {
+    const utc = civilToUtc(later.year, later.month, later.day, hour, 0, timeZone);
+    if (utc != null) return utc;
+  }
+  return nowMs + 24 * 60 * 60 * 1000;
+}

@@ -12,7 +12,10 @@ import {
   id,
   isGatewayRole,
   now,
+  nonCancelledSeriesCount,
   pauseCalendarSeriesForAssignee,
+  rematerializeScheduledInstances,
+  suppressOpenCalendarInstances,
   type TurnRow,
 } from "@openbot/db";
 import {
@@ -51,11 +54,11 @@ import {
   CAL_MAX_SERIES,
   CAL_MIN_INTERVAL_MS,
   RruleError,
-  civilToUtc,
   isValidTimeZone,
+  localNineTomorrow,
   materializeHorizon,
+  parseCalendarDtstart,
   parseRrule,
-  utcToCivil,
 } from "@openbot/calendar";
 import { SPA_HTML } from "./spa.ts";
 import { TurnEngine } from "./engine.ts";
@@ -2108,67 +2111,12 @@ function validateCalendarRrule(rrule: string | null): string | null {
   }
 }
 
-function parseCalendarDtstart(raw: string | number, timeZone: string): number {
-  if (typeof raw === "number") {
-    if (!Number.isFinite(raw)) throw new RruleError("invalid_dtstart");
-    return Math.trunc(raw);
-  }
-  const trimmed = raw.trim();
-  if (!trimmed) throw new RruleError("invalid_dtstart");
-  if (/^-?\d+$/.test(trimmed)) {
-    const n = Number(trimmed);
-    if (!Number.isFinite(n)) throw new RruleError("invalid_dtstart");
-    return n;
-  }
-  if (/Z$|[+-]\d{2}:?\d{2}$/i.test(trimmed)) {
-    const ms = Date.parse(trimmed);
-    if (!Number.isFinite(ms)) throw new RruleError("invalid_dtstart");
-    return ms;
-  }
-  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(trimmed);
-  if (!m) throw new RruleError("invalid_dtstart");
-  const utc = civilToUtc(
-    Number(m[1]),
-    Number(m[2]),
-    Number(m[3]),
-    m[4] != null ? Number(m[4]) : 0,
-    m[5] != null ? Number(m[5]) : 0,
-    timeZone,
-  );
-  if (utc == null) throw new RruleError("invalid_dtstart");
-  return utc;
-}
-
-function localNineTomorrow(timeZone: string, nowMs: number): number {
-  const later = utcToCivil(nowMs + 24 * 60 * 60 * 1000, timeZone);
-  for (const hour of [9, 10, 11, 8, 12]) {
-    const utc = civilToUtc(later.year, later.month, later.day, hour, 0, timeZone);
-    if (utc != null) return utc;
-  }
-  return nowMs + 24 * 60 * 60 * 1000;
-}
-
 function calendarRequireHumanApproval(
   requested: boolean | undefined,
   threadKind: string,
   botFlag: number,
 ): boolean {
   return Boolean(requested) || threadKind === "group" || Boolean(botFlag);
-}
-
-function nonCancelledSeriesCount(db: OpenbotDb, accountId: string, excludeId?: string): number {
-  const row = excludeId
-    ? db.get<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM calendar_series
-          WHERE account_id = ? AND status IN ('active', 'paused', 'proposed') AND id != ?`,
-        [accountId, excludeId],
-      )
-    : db.get<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM calendar_series
-          WHERE account_id = ? AND status IN ('active', 'paused', 'proposed')`,
-        [accountId],
-      );
-  return row?.n ?? 0;
 }
 
 function loadCalendarSeries(db: OpenbotDb, accountId: string, seriesId: string): CalendarSeriesRow | undefined {
@@ -2221,101 +2169,6 @@ function resolveCalendarThread(
   const dm = humanThread(db, botId);
   if (!dm || dm.account_id !== accountId) return { error: "not_found", status: 404 };
   return { id: dm.id, kind: "human" };
-}
-
-function suppressOpenCalendarInstances(db: OpenbotDb, seriesId: string, mode: "pause" | "cancel"): void {
-  const t = now();
-  if (mode === "pause") {
-    db.run(
-      `UPDATE calendar_instances SET status = 'skipped_paused' WHERE series_id = ? AND status IN ('scheduled', 'due')`,
-      [seriesId],
-    );
-  } else {
-    db.run(
-      `UPDATE calendar_instances SET status = 'cancelled', skipped_reason = 'series_cancelled'
-        WHERE series_id = ? AND status IN ('scheduled', 'due')`,
-      [seriesId],
-    );
-  }
-  const queued = db.all<{ id: string; turn_id: string | null }>(
-    `SELECT id, turn_id FROM calendar_instances WHERE series_id = ? AND status = 'queued'`,
-    [seriesId],
-  );
-  for (const inst of queued) {
-    if (inst.turn_id) {
-      db.run(`UPDATE turns SET status = 'cancelled', finished_at = ? WHERE id = ? AND status = 'queued'`, [
-        t,
-        inst.turn_id,
-      ]);
-    }
-    db.run(
-      `UPDATE calendar_instances SET status = 'cancelled', skipped_reason = ? WHERE id = ?`,
-      [mode === "cancel" ? "series_cancelled" : null, inst.id],
-    );
-  }
-}
-
-function rematerializeScheduledInstances(db: OpenbotDb, series: CalendarSeriesRow): void {
-  const t = now();
-  const queued = db.all<{ id: string; turn_id: string | null }>(
-    `SELECT id, turn_id FROM calendar_instances WHERE series_id = ? AND status = 'queued'`,
-    [series.id],
-  );
-  for (const inst of queued) {
-    if (inst.turn_id) {
-      db.run(`UPDATE turns SET status = 'cancelled', finished_at = ? WHERE id = ? AND status = 'queued'`, [
-        t,
-        inst.turn_id,
-      ]);
-    }
-    db.run(`UPDATE calendar_instances SET status = 'cancelled' WHERE id = ?`, [inst.id]);
-  }
-  db.run(
-    `DELETE FROM calendar_instances
-      WHERE series_id = ? AND (
-        status IN ('scheduled', 'due', 'skipped_paused')
-        OR (status = 'cancelled' AND skipped_reason = 'series_cancelled')
-      )`,
-    [series.id],
-  );
-  let times: number[] = [];
-  try {
-    const horizon = materializeHorizon({
-      dtstartUtc: series.dtstart_utc,
-      timezone: series.timezone,
-      rrule: series.rrule,
-      nowMs: t,
-    });
-    times = [...(horizon.catchup != null ? [horizon.catchup] : []), ...horizon.future];
-  } catch {
-    if (series.dtstart_utc >= t) times = [series.dtstart_utc];
-  }
-  const seen = new Set<number>();
-  for (const scheduledAt of times) {
-    if (seen.has(scheduledAt)) continue;
-    seen.add(scheduledAt);
-    const exists = db.get("SELECT id FROM calendar_instances WHERE series_id = ? AND scheduled_at = ?", [
-      series.id,
-      scheduledAt,
-    ]);
-    if (exists) continue;
-    db.run(
-      `INSERT INTO calendar_instances (id, series_id, scheduled_at, status, created_at)
-       VALUES (?, ?, ?, 'scheduled', ?)`,
-      [id(), series.id, scheduledAt, t],
-    );
-  }
-  const next = db.get<{ scheduled_at: number }>(
-    `SELECT scheduled_at FROM calendar_instances
-      WHERE series_id = ? AND status IN ('scheduled', 'due')
-      ORDER BY scheduled_at LIMIT 1`,
-    [series.id],
-  );
-  db.run(`UPDATE calendar_series SET next_due_at = ?, updated_at = ? WHERE id = ?`, [
-    next?.scheduled_at ?? null,
-    t,
-    series.id,
-  ]);
 }
 
 function nextCalendarFireUtc(db: OpenbotDb, series: CalendarSeriesRow): number | null {
