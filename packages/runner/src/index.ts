@@ -258,6 +258,10 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   ): Promise<void> {
     await this.ensureBrowser();
     this.browser!.takeoverActive = true;
+    const existing = await cdpPageInfo(this.browser!.cdpUrl).catch(() => ({} as { url?: string }));
+    if (!existing.url || existing.url === "about:blank") {
+      await cdpNavigate(this.browser!.cdpUrl, TAKEOVER_HOME).catch(() => undefined);
+    }
     this.onScreencastFrame = onFrame;
     this.screencastFrames = 0;
     if (this.browser!.screencast) {
@@ -485,13 +489,20 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     }
   }
 
-  async navigate(url: string): Promise<{ ok: boolean; title?: string; error?: string }> {
-    if (this.browser?.takeoverActive) {
+  async navigate(
+    url: string,
+    opts?: { duringTakeover?: boolean },
+  ): Promise<{ ok: boolean; title?: string; error?: string }> {
+    if (this.browser?.takeoverActive && !opts?.duringTakeover) {
       return { ok: false, error: "takeover_active" };
+    }
+    const trimmed = url.trim();
+    if (!/^https?:\/\//i.test(trimmed) && !trimmed.startsWith("data:text/html")) {
+      return { ok: false, error: "invalid_url" };
     }
     await this.ensureBrowser();
     try {
-      const page = await cdpNavigate(this.browser!.cdpUrl, url);
+      const page = await cdpNavigate(this.browser!.cdpUrl, trimmed);
       return { ok: true, title: page.title };
     } catch (err) {
       return { ok: false, error: String(err) };
@@ -586,6 +597,12 @@ export async function freePort(): Promise<number> {
   server.stop(true);
   return port;
 }
+
+const TAKEOVER_HOME =
+  "data:text/html;charset=utf-8," +
+  encodeURIComponent(
+    `<!doctype html><html><head><meta charset="utf-8"><title>Desk browser</title></head><body style="margin:0;background:#eef3fa;color:#081018;font:20px/1.5 system-ui,sans-serif;padding:48px"><h1 style="margin:0 0 12px">Desk browser</h1><p>This is the shared Chromium. Type a URL in the bar above.</p></body></html>`,
+  );
 
 async function launchChromium(
   port: number,

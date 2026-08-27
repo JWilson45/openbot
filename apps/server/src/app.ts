@@ -1895,7 +1895,12 @@ export function createApp(cfg: HomeConfig): {
           if (accountId) {
             try {
               const msg = JSON.parse(data) as Record<string, unknown>;
-              void ctx.engine.runnerFor(accountId).dispatchInput(msg);
+              const runner = ctx.engine.runnerFor(accountId);
+              if (msg.type === "navigate") {
+                void runner.navigate(String(msg.url ?? ""), { duringTakeover: true });
+                return;
+              }
+              void runner.dispatchInput(msg);
             } catch {
               /* ignore */
             }

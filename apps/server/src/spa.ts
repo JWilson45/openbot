@@ -2840,8 +2840,12 @@ export const SPA_HTML = `<!DOCTYPE html>
         <h2 id="tk-title">Takeover</h2>
         <button type="button" id="done" class="primary">Close</button>
       </div>
+      <form id="tk-nav" style="display:flex;gap:8px;margin:0 0 10px">
+        <input id="tk-url" name="url" placeholder="https://example.com" autocomplete="off" />
+        <button type="submit" class="primary">Go</button>
+      </form>
       <p class="muted" id="urlbar">Connecting…</p>
-      <p class="muted">This is the shared desk browser. about:blank means no page is open yet. Esc or Close ends takeover.</p>
+      <p class="muted">Shared desk Chromium. Type a URL and Go. Esc or Close ends takeover.</p>
       <canvas id="takeover-frame" width="1280" height="720" role="img" aria-label="Shared desk browser"></canvas>
       <div class="modal-actions"><button type="button" id="done-foot">Close takeover</button></div>
     </div></div>\`);
@@ -2855,11 +2859,25 @@ export const SPA_HTML = `<!DOCTYPE html>
     overlay.querySelector('#done-foot').onclick = endTakeover;
     const canvas = overlay.querySelector('#takeover-frame');
     canvas.tabIndex = 0;
+    overlay.querySelector('#tk-nav').onsubmit = (e) => {
+      e.preventDefault();
+      let url = String(overlay.querySelector('#tk-url').value || '').trim();
+      if (!url) return;
+      if (!/^https?:\\/\\//i.test(url)) url = 'https://' + url;
+      overlay.querySelector('#tk-url').value = url;
+      ws.send(JSON.stringify({ type:'navigate', url }));
+    };
     ws.onopen = () => ws.send(JSON.stringify({ type:'auth', ticket: t.ticket }));
+    let frameUrl = '';
     ws.onmessage = (ev) => {
       if (typeof ev.data === 'string') {
         const msg = JSON.parse(ev.data);
-        if (msg.type === 'meta') overlay.querySelector('#urlbar').textContent = (msg.pageUrl || 'about:blank') + (msg.pageOrigin ? ' — ' + msg.pageOrigin : '');
+        if (msg.type === 'meta') {
+          const page = msg.pageUrl && msg.pageUrl !== 'about:blank' ? msg.pageUrl : 'Desk browser';
+          const origin = msg.pageOrigin && msg.pageOrigin !== 'null' ? ' — ' + msg.pageOrigin : '';
+          overlay.querySelector('#urlbar').textContent = page + origin;
+          if (msg.pageUrl && msg.pageUrl.indexOf('http') === 0) overlay.querySelector('#tk-url').value = msg.pageUrl;
+        }
         if (msg.error) overlay.querySelector('#urlbar').textContent = msg.error;
       } else {
         const blob = new Blob([ev.data], { type: 'image/jpeg' });
@@ -2867,8 +2885,10 @@ export const SPA_HTML = `<!DOCTYPE html>
         img.onload = () => {
           const ctx = canvas.getContext('2d');
           ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          if (frameUrl) URL.revokeObjectURL(frameUrl);
         };
-        img.src = URL.createObjectURL(blob);
+        frameUrl = URL.createObjectURL(blob);
+        img.src = frameUrl;
       }
     };
     function frac(e) {
