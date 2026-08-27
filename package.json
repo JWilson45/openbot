@@ -24,6 +24,7 @@
     "@openbot/acp-grok": "workspace:*",
     "@openbot/api-types": "workspace:*",
     "@openbot/auth": "workspace:*",
+    "@openbot/calendar": "workspace:*",
     "@openbot/compute-protocol": "workspace:*",
     "@openbot/db": "workspace:*",
     "@openbot/federation": "workspace:*",

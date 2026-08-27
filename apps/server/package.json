@@ -6,6 +6,7 @@
     "@openbot/acp-grok": "workspace:*",
     "@openbot/api-types": "workspace:*",
     "@openbot/auth": "workspace:*",
+    "@openbot/calendar": "workspace:*",
     "@openbot/db": "workspace:*",
     "@openbot/federation": "workspace:*",
     "@openbot/live-work": "workspace:*",

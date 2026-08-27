@@ -37,6 +37,7 @@ import { insertMessage, parseLivePayload, promote, summarizeLiveEvent } from "@o
 import { sha256Hex } from "@openbot/db";
 import { detectCliLogins, listGrokModels, resolveBotInference } from "@openbot/acp-grok";
 import { FED_MAX_REQUEST_BYTES } from "@openbot/federation";
+import { isValidTimeZone } from "@openbot/calendar";
 import { SPA_HTML } from "./spa.ts";
 import { TurnEngine } from "./engine.ts";
 import { mountOpenAiCompat } from "./openai.ts";
@@ -61,6 +62,7 @@ import {
   orgPeerPublic,
   parsePeerBaseUrl,
   setFederationEnabled,
+  setOrgTimezone,
   SlidingWindowRateLimiter,
 } from "./org.ts";
 import { findActiveGateway, provisionOrgGateway } from "./gateway.ts";
@@ -380,7 +382,12 @@ export function createApp(cfg: HomeConfig): {
 
   app.patch("/v1/org", async (c) => {
     requireSession(c);
-    const body = (await c.req.json()) as { federationEnabled?: unknown };
+    const body = (await c.req.json()) as { federationEnabled?: unknown; timezone?: unknown };
+    if ("timezone" in body) {
+      if (typeof body.timezone !== "string" || !isValidTimeZone(body.timezone.trim())) {
+        return c.json({ error: "invalid_timezone" }, 400);
+      }
+    }
     if ("federationEnabled" in body) {
       if (typeof body.federationEnabled !== "boolean") {
         return c.json({ error: "invalid_federation" }, 400);
@@ -392,6 +399,9 @@ export function createApp(cfg: HomeConfig): {
         const gw = findActiveGateway(db, after.account_id);
         if (gw) ctx.engine.maybeKickGatewayDrain(gw.id);
       }
+    }
+    if ("timezone" in body && typeof body.timezone === "string") {
+      setOrgTimezone(db, body.timezone.trim());
     }
     const row = currentOrgMeta(db);
     if (!row) return c.json({ error: "no_org" }, 500);

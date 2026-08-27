@@ -8,6 +8,7 @@
         "@openbot/acp-grok": "workspace:*",
         "@openbot/api-types": "workspace:*",
         "@openbot/auth": "workspace:*",
+        "@openbot/calendar": "workspace:*",
         "@openbot/compute-protocol": "workspace:*",
         "@openbot/db": "workspace:*",
         "@openbot/federation": "workspace:*",
@@ -34,6 +35,7 @@
         "@openbot/acp-grok": "workspace:*",
         "@openbot/api-types": "workspace:*",
         "@openbot/auth": "workspace:*",
+        "@openbot/calendar": "workspace:*",
         "@openbot/db": "workspace:*",
         "@openbot/federation": "workspace:*",
         "@openbot/live-work": "workspace:*",
@@ -63,6 +65,10 @@
       "dependencies": {
         "@openbot/db": "workspace:*",
       },
+    },
+    "packages/calendar": {
+      "name": "@openbot/calendar",
+      "version": "0.1.0",
     },
     "packages/compute-protocol": {
       "name": "@openbot/compute-protocol",
@@ -113,6 +119,8 @@
     "@openbot/api-types": ["@openbot/api-types@workspace:packages/api-types"],
 
     "@openbot/auth": ["@openbot/auth@workspace:packages/auth"],
+
+    "@openbot/calendar": ["@openbot/calendar@workspace:packages/calendar"],
 
     "@openbot/compute-protocol": ["@openbot/compute-protocol@workspace:packages/compute-protocol"],
 

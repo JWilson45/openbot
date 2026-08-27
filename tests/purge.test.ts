@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { OpenbotDb, deleteBotPermanently, id, now, orderedBotPair, sha256Hex } from "@openbot/db";
+import {
+  OpenbotDb,
+  deleteBotPermanently,
+  id,
+  now,
+  orderedBotPair,
+  pauseCalendarSeriesForAssignee,
+  sha256Hex,
+} from "@openbot/db";
 import { persistMcpToken } from "@openbot/mcp-send-message";
 import { seedWorld, tempHome } from "./helpers.ts";
 
@@ -182,5 +190,135 @@ describe("deleteBotPermanently", () => {
     expect(db.get("SELECT id FROM bots WHERE id = ?", [other])).toBeNull();
     expect(db.get("SELECT id FROM threads WHERE id = ?", [a2aId])).toBeNull();
     expect(db.all("PRAGMA foreign_key_check")).toEqual([]);
+  });
+
+  test("purges series+instance+turn without SQLITE_CONSTRAINT and cancels owned series", () => {
+    const db = openDb();
+    const w = seedWorld(db);
+    const t = now();
+    const seriesId = id();
+    const instanceId = id();
+    const turnId = insertTurnOn(db, {
+      threadId: w.threadId,
+      botId: w.botId,
+      harnessSessionId: w.harnessSessionId,
+    });
+    db.run(
+      `INSERT INTO calendar_series (
+         id, account_id, title, prompt, assignee_bot_id, thread_id, kind, status,
+         rrule, dtstart_utc, timezone, created_by, created_by_bot_id, created_at, updated_at
+       ) VALUES (?, ?, 'standup', 'summarize', ?, ?, 'schedule', 'active',
+         NULL, ?, 'UTC', 'bot', ?, ?, ?)`,
+      [seriesId, w.accountId, w.botId, w.threadId, t, w.botId, t, t],
+    );
+    db.run(
+      `INSERT INTO calendar_instances (id, series_id, scheduled_at, status, turn_id, created_at)
+       VALUES (?, ?, ?, 'queued', ?, ?)`,
+      [instanceId, seriesId, t, turnId, t],
+    );
+
+    deleteBotPermanently(db, w.botId);
+
+    expect(db.get("SELECT id FROM bots WHERE id = ?", [w.botId])).toBeNull();
+    const series = db.get<{
+      status: string;
+      assignee_bot_id: string | null;
+      created_by_bot_id: string | null;
+    }>("SELECT status, assignee_bot_id, created_by_bot_id FROM calendar_series WHERE id = ?", [seriesId]);
+    expect(series?.status).toBe("cancelled");
+    expect(series?.assignee_bot_id).toBeNull();
+    expect(series?.created_by_bot_id).toBeNull();
+    const inst = db.get<{ turn_id: string | null; series_id: string }>(
+      "SELECT turn_id, series_id FROM calendar_instances WHERE id = ?",
+      [instanceId],
+    );
+    expect(inst?.series_id).toBe(seriesId);
+    expect(inst?.turn_id).toBeNull();
+    expect(db.all("PRAGMA foreign_key_check")).toEqual([]);
+  });
+
+  test("purging Bob does not cancel Ada's series on Bob's group thread", () => {
+    const db = openDb();
+    const w = seedWorld(db);
+    const bob = seedPeer(db, w.accountId, w.computeId, "Bob");
+    const t = now();
+    const groupId = id();
+    db.run(
+      `INSERT INTO threads (id, account_id, bot_id, title, kind, created_at) VALUES (?, ?, ?, 'g', 'group', ?)`,
+      [groupId, w.accountId, bob.botId, t],
+    );
+    db.run(
+      `INSERT INTO thread_participants (id, thread_id, kind, user_id, bot_id, created_at) VALUES (?, ?, 'human', ?, NULL, ?)`,
+      [id(), groupId, w.userId, t],
+    );
+    db.run(
+      `INSERT INTO thread_participants (id, thread_id, kind, user_id, bot_id, created_at) VALUES (?, ?, 'bot', NULL, ?, ?)`,
+      [id(), groupId, w.botId, t],
+    );
+    db.run(
+      `INSERT INTO thread_participants (id, thread_id, kind, user_id, bot_id, created_at) VALUES (?, ?, 'bot', NULL, ?, ?)`,
+      [id(), groupId, bob.botId, t],
+    );
+    const seriesId = id();
+    db.run(
+      `INSERT INTO calendar_series (
+         id, account_id, title, prompt, assignee_bot_id, thread_id, kind, status,
+         rrule, dtstart_utc, timezone, created_by, created_by_bot_id, created_at, updated_at
+       ) VALUES (?, ?, 'standup', 'summarize', ?, ?, 'schedule', 'active',
+         NULL, ?, 'UTC', 'human', NULL, ?, ?)`,
+      [seriesId, w.accountId, w.botId, groupId, t, t, t],
+    );
+    db.run(
+      `INSERT INTO calendar_instances (id, series_id, scheduled_at, status, turn_id, created_at)
+       VALUES (?, ?, ?, 'scheduled', NULL, ?)`,
+      [id(), seriesId, t, t],
+    );
+
+    deleteBotPermanently(db, bob.botId);
+
+    expect(db.get("SELECT id FROM bots WHERE id = ?", [bob.botId])).toBeNull();
+    const group = db.get<{ id: string; bot_id: string }>("SELECT id, bot_id FROM threads WHERE id = ?", [groupId]);
+    expect(group?.id).toBe(groupId);
+    expect(group?.bot_id).toBe(w.botId);
+    const series = db.get<{ status: string; assignee_bot_id: string | null; thread_id: string | null }>(
+      "SELECT status, assignee_bot_id, thread_id FROM calendar_series WHERE id = ?",
+      [seriesId],
+    );
+    expect(series?.status).toBe("active");
+    expect(series?.assignee_bot_id).toBe(w.botId);
+    expect(series?.thread_id).toBe(groupId);
+    expect(db.all("PRAGMA foreign_key_check")).toEqual([]);
+  });
+
+  test("pauseCalendarSeriesForAssignee pauses active and proposed only", () => {
+    const db = openDb();
+    const w = seedWorld(db);
+    const t = now();
+    const activeId = id();
+    const proposedId = id();
+    const pausedId = id();
+    for (const [sid, status] of [
+      [activeId, "active"],
+      [proposedId, "proposed"],
+      [pausedId, "paused"],
+    ] as const) {
+      db.run(
+        `INSERT INTO calendar_series (
+           id, account_id, title, prompt, assignee_bot_id, thread_id, kind, status,
+           rrule, dtstart_utc, timezone, created_by, created_at, updated_at
+         ) VALUES (?, ?, 's', 'p', ?, ?, 'schedule', ?, NULL, ?, 'UTC', 'human', ?, ?)`,
+        [sid, w.accountId, w.botId, w.threadId, status, t, t, t],
+      );
+    }
+    pauseCalendarSeriesForAssignee(db, w.botId);
+    expect(db.get<{ status: string }>("SELECT status FROM calendar_series WHERE id = ?", [activeId])?.status).toBe(
+      "paused",
+    );
+    expect(db.get<{ status: string }>("SELECT status FROM calendar_series WHERE id = ?", [proposedId])?.status).toBe(
+      "paused",
+    );
+    expect(db.get<{ status: string }>("SELECT status FROM calendar_series WHERE id = ?", [pausedId])?.status).toBe(
+      "paused",
+    );
   });
 });

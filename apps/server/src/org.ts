@@ -33,6 +33,7 @@ export type OrgMetaRow = {
   public_origin: string | null;
   pubkey: string;
   federation_enabled: number;
+  timezone: string;
   created_at: number;
 };
 
@@ -251,8 +252,8 @@ export function ensureOrgMeta(db: OpenbotDb, opts: EnsureOrgMetaOpts = {}): OrgM
     ]);
   } else {
     db.run(
-      `INSERT INTO org_meta (id, account_id, org_id, slug, name, public_origin, pubkey, federation_enabled, created_at)
-       VALUES ('current', NULL, ?, ?, ?, ?, '', 0, ?)`,
+      `INSERT INTO org_meta (id, account_id, org_id, slug, name, public_origin, pubkey, federation_enabled, timezone, created_at)
+       VALUES ('current', NULL, ?, ?, ?, ?, '', 0, 'UTC', ?)`,
       [orgId, slug, name, publicOrigin, now()],
     );
   }
@@ -268,6 +269,7 @@ export function orgMemberSnapshot(row: OrgMetaRow): {
   name: string;
   publicOrigin: string | null;
   federationEnabled: boolean;
+  timezone: string;
 } {
   return {
     orgId: row.org_id,
@@ -275,6 +277,7 @@ export function orgMemberSnapshot(row: OrgMetaRow): {
     name: row.name,
     publicOrigin: row.public_origin,
     federationEnabled: federationEffective(row),
+    timezone: row.timezone || "UTC",
   };
 }
 
@@ -288,6 +291,7 @@ export function orgCliSnapshot(
   publicOrigin: string | null;
   pubkey: string;
   federationEnabled: boolean;
+  timezone: string;
   gateway: { id: string; name: string } | null;
 } {
   return {
@@ -296,6 +300,15 @@ export function orgCliSnapshot(
     pubkey: row.pubkey || "",
     gateway,
   };
+}
+
+export function setOrgTimezone(db: OpenbotDb, timezone: string): OrgMetaRow {
+  const stored = currentOrgMeta(db);
+  if (!stored) throw new Error("org_meta missing");
+  db.run("UPDATE org_meta SET timezone = ? WHERE id = 'current'", [timezone]);
+  const row = currentOrgMeta(db);
+  if (!row) throw new Error("org_meta write failed");
+  return row;
 }
 
 export function fedInfoPayload(
