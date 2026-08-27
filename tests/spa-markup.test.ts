@@ -47,7 +47,12 @@ describe("desk SPA markup", () => {
     expect(html).toContain("calendar.proposed");
     expect(html).toContain("Learn this");
     expect(html).toContain('id="learn-this"');
+    expect(html).toContain("((state.view === 'human' && !gwSelected) || inGroup) && state.thread");
+    expect(html).toContain("state.view !== 'human' && state.view !== 'group'");
     expect(html).toContain("This saves a prompt you can edit, not a recording of clicks. OpenBot will not replay the browser session.");
+    expect(html).toContain("kind === 'routine'");
+    expect(html).toContain("Proposed event");
+    expect(html).toContain("Fires on");
     expect(html).not.toContain("Schedule vs Routine");
     expect(html).toContain("Readable");
     expect(html).toContain("live-human");

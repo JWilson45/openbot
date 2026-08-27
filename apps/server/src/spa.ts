@@ -1441,6 +1441,12 @@ export const SPA_HTML = `<!DOCTYPE html>
     if (s.kind === 'routine') return 'Routine';
     return 'Schedule';
   }
+  function firingThreadLabel(series) {
+    if (!series || !series.thread_id) return 'Assignee DM';
+    const g = (state.groups || []).find(t => t.id === series.thread_id);
+    if (g) return g.title || 'Group';
+    return 'DM · ' + botName(series.assignee_bot_id);
+  }
   function calHorizon() {
     const tz = orgTimezone();
     const now = Date.now();
@@ -1648,6 +1654,7 @@ export const SPA_HTML = `<!DOCTYPE html>
       '<p class="muted">' + escapeHtml(kindBadge(series)) + (series.status && series.status !== 'proposed' && series.status !== 'active' ? ' · ' + escapeHtml(series.status) : '') + '</p>' +
       '<p>' + escapeHtml(rruleProse(series.rrule)) + '</p>' +
       '<p class="muted">Assignee · ' + escapeHtml(botName(series.assignee_bot_id)) + '</p>' +
+      '<p class="muted">Fires on · ' + escapeHtml(firingThreadLabel(series)) + '</p>' +
       (lastRun && lastRun.turn_id ? '<p><button type="button" class="linkish" id="cal-last-run">Last run ' + escapeHtml(whenBoth(lastRun.finished_at || lastRun.started_at || lastRun.scheduled_at)) + '</button></p>' : '') +
       (nextFire ? '<p class="muted">Next fire · ' + escapeHtml(whenBoth(nextFire)) + '</p>' : '') +
       (running ? '<p class="muted">In-flight — this run will finish.</p>' : '') +
@@ -1664,17 +1671,7 @@ export const SPA_HTML = `<!DOCTYPE html>
     const close = openOverlay(overlay);
     overlay.querySelector('#cal-d-close').onclick = close;
     const confirmBtn = overlay.querySelector('#cal-confirm');
-    if (confirmBtn) confirmBtn.onclick = async () => {
-      try {
-        await api('/v1/calendar/series/' + encodeURIComponent(series.id) + '/confirm', { method:'POST', body: '{}' });
-        close();
-        await paintCalendar();
-      } catch (e) {
-        const err = overlay.querySelector('#cal-d-err');
-        err.hidden = false;
-        err.textContent = e.message || 'Could not confirm';
-      }
-    };
+    if (confirmBtn) confirmBtn.onclick = () => { close(); openEventForm(series); };
     const lastBtn = overlay.querySelector('#cal-last-run');
     if (lastBtn) lastBtn.onclick = () => {
       close();
@@ -1745,11 +1742,13 @@ export const SPA_HTML = `<!DOCTYPE html>
     const repeatDef = repeatFromRrule(series && series.rrule);
     const bot = state.bots.find(b => b.id === botDefault);
     const approveDef = series ? Boolean(Number(series.require_human_approval)) : Boolean(bot && Number(bot.require_human_approval));
+    const learned = series && series.kind === 'routine';
     const overlay = h('<div class="overlay"><div class="modal">' +
-      '<h2 id="cal-e-title">' + (series ? (series.status === 'proposed' ? 'Proposed routine' : 'Edit event') : 'New event') + '</h2>' +
-      (series && series.status === 'proposed' ? '<p class="muted">This saves a prompt you can edit, not a recording of clicks. OpenBot will not replay the browser session.</p>' : '') +
+      '<h2 id="cal-e-title">' + (series ? (series.status === 'proposed' ? (learned ? 'Proposed routine' : 'Proposed event') : 'Edit event') : 'New event') + '</h2>' +
+      (learned ? '<p class="muted">This saves a prompt you can edit, not a recording of clicks. OpenBot will not replay the browser session.</p>' : '') +
       '<label for="cal-title">Title</label><input id="cal-title" maxlength="200" value="' + escapeHtml((series && series.title) || '') + '" />' +
       '<label for="cal-bot">Assignee</label><select id="cal-bot">' + deskBotOptions(botDefault) + '</select>' +
+      (series ? '<p class="muted">Fires on · ' + escapeHtml(firingThreadLabel(series)) + '</p>' : '') +
       '<label for="cal-when">When</label><input id="cal-when" type="datetime-local" value="' + escapeHtml(localDefault) + '" />' +
       '<label for="cal-tz">Timezone</label>' + zoneSelectHtml('cal-tz', tzDefault) +
       '<label for="cal-repeat">Repeat</label><select id="cal-repeat">' +
