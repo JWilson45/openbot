@@ -37,8 +37,9 @@ describe("desk SPA markup", () => {
     expect(html).toContain("Shift");
     expect(html).toContain("prefers-reduced-motion");
     expect(html).toContain('name="viewport"');
-    expect(html).toContain("Close takeover");
     expect(html).toContain("tk-url");
+    expect(html).toContain("tk-stage");
+    expect(html).toContain("overlay.tk");
     expect(html).toContain("type:'navigate'");
     expect(html).toContain("Type DELETE to confirm wipe");
     expect(html).toContain("open-archive");

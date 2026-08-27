@@ -246,15 +246,32 @@ export const SPA_HTML = `<!DOCTYPE html>
     .err { color: var(--err); }
     .live { font-family: ui-monospace, monospace; font-size: .78rem; color: #c5d0dc; white-space: pre-wrap; overflow-wrap: anywhere; }
     .overlay { position: fixed; inset: 0; background: #000a; display: flex; align-items: center; justify-content: center; z-index: 30; padding: 16px; }
+    .overlay.tk { padding: 0; background: #05070a; }
     .modal { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; width: min(32rem, 100%); max-height: 90dvh; overflow: auto; }
     .modal.wide { width: min(72rem, 96vw); display: flex; flex-direction: column; max-height: 92dvh; overflow: hidden; }
+    .modal.tk {
+      width: 100%; height: 100dvh; max-height: 100dvh; max-width: none;
+      border: 0; border-radius: 0; padding: 0; background: #0b0e13;
+      display: grid; grid-template-rows: auto 1fr;
+    }
     .modal h2 { margin: 0 0 10px; font-size: 1.1rem; }
     .modal-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 8px; }
     .modal-head h2 { margin: 0; }
+    .tk-chrome {
+      display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+      border-bottom: 1px solid var(--line); background: var(--panel); min-height: 56px;
+    }
+    .tk-chrome h2 { margin: 0; font-size: 1rem; flex: 0 0 auto; }
+    #tk-nav { display: flex; gap: 8px; flex: 1 1 auto; min-width: 0; margin: 0; }
+    #tk-nav input { width: auto; flex: 1 1 auto; min-width: 0; }
+    #tk-nav button { flex: 0 0 auto; }
+    .tk-stage {
+      min-height: 0; background: #11161e; display: flex; align-items: center; justify-content: center;
+    }
     .modal-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; flex: 0 0 auto; }
     #takeover-frame {
-      width: 100%; max-width: 100%; height: auto; max-height: min(60dvh, 24rem);
-      border: 1px solid var(--line); border-radius: 8px; background: #0b0e13; flex: 1 1 auto;
+      width: 100%; height: 100%; max-width: 100%; max-height: 100%;
+      object-fit: contain; background: #11161e; display: block; border: 0; border-radius: 0;
     }
     .empty { margin: auto; text-align: center; color: var(--muted); padding: 24px; }
     .side-toggle { display: none; }
@@ -2835,19 +2852,19 @@ export const SPA_HTML = `<!DOCTYPE html>
 
   async function startTakeover() {
     const t = await api('/v1/compute/takeover', { method:'POST', body: '{}' });
-    const overlay = h(\`<div class="overlay"><div class="modal wide">
-      <div class="modal-head">
-        <h2 id="tk-title">Takeover</h2>
-        <button type="button" id="done" class="primary">Close</button>
+    const overlay = h(\`<div class="overlay tk"><div class="modal tk">
+      <div class="tk-chrome">
+        <h2 id="tk-title">Desk browser</h2>
+        <form id="tk-nav">
+          <input id="tk-url" name="url" placeholder="https://example.com" autocomplete="off" />
+          <button type="submit" class="primary">Go</button>
+        </form>
+        <span class="muted" id="urlbar">Connecting…</span>
+        <button type="button" id="done">Close</button>
       </div>
-      <form id="tk-nav" style="display:flex;gap:8px;margin:0 0 10px">
-        <input id="tk-url" name="url" placeholder="https://example.com" autocomplete="off" />
-        <button type="submit" class="primary">Go</button>
-      </form>
-      <p class="muted" id="urlbar">Connecting…</p>
-      <p class="muted">Shared desk Chromium. Type a URL and Go. Esc or Close ends takeover.</p>
-      <canvas id="takeover-frame" width="1280" height="720" role="img" aria-label="Shared desk browser"></canvas>
-      <div class="modal-actions"><button type="button" id="done-foot">Close takeover</button></div>
+      <div class="tk-stage">
+        <canvas id="takeover-frame" width="1280" height="720" role="img" aria-label="Shared desk browser"></canvas>
+      </div>
     </div></div>\`);
     overlay.querySelector('.modal').setAttribute('aria-labelledby', 'tk-title');
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -2856,7 +2873,6 @@ export const SPA_HTML = `<!DOCTYPE html>
     const close = openOverlay(overlay, () => { try { ws.close(); } catch {} });
     function endTakeover() { try { ws.close(); } catch {} close(); }
     overlay.querySelector('#done').onclick = endTakeover;
-    overlay.querySelector('#done-foot').onclick = endTakeover;
     const canvas = overlay.querySelector('#takeover-frame');
     canvas.tabIndex = 0;
     overlay.querySelector('#tk-nav').onsubmit = (e) => {
@@ -2883,6 +2899,10 @@ export const SPA_HTML = `<!DOCTYPE html>
         const blob = new Blob([ev.data], { type: 'image/jpeg' });
         const img = new Image();
         img.onload = () => {
+          if (img.width && img.height && (canvas.width !== img.width || canvas.height !== img.height)) {
+            canvas.width = img.width;
+            canvas.height = img.height;
+          }
           const ctx = canvas.getContext('2d');
           ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
           if (frameUrl) URL.revokeObjectURL(frameUrl);
