@@ -21,10 +21,13 @@ import {
   McpError,
   createBotInput,
   browserSnapshotInput,
+  clickBrowserInput,
   confirmSeriesInput,
   createEventInput,
   inboxInput,
   navigateBrowserInput,
+  typeBrowserInput,
+  waitBrowserInput,
   listCalendarInput,
   pauseSeriesInput,
   proposeRoutineInput,
@@ -849,8 +852,47 @@ export const NAVIGATE_TOOL = {
 export const BROWSER_SNAPSHOT_TOOL = {
   name: "BrowserSnapshot",
   description:
-    "Read the current shared desk Chromium page (URL, title, visible text, max 12k). Same browser as Takeover — this is how you see the page the human is showing. Read-only; does not steal the session. Navigate fails with takeover_active while the human is driving.",
+    "Read the current shared desk Chromium page (URL, title, visible text, max 12k). Same browser as Takeover — this is how you see the page. Read-only. Prefer this plus Click/Type over raw CDP.",
   inputSchema: { type: "object", properties: {} },
+};
+
+export const CLICK_TOOL = {
+  name: "Click",
+  description:
+    "Click a control in the shared desk Chromium. Pass visible text (preferred) or a CSS selector. nth picks among matches (0-based). Fails with takeover_active while the human is in Takeover. Then BrowserSnapshot.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      text: { type: "string", description: "Visible label, e.g. Add to Cart" },
+      selector: { type: "string", description: "CSS selector" },
+      nth: { type: "number", description: "Which match, default 0" },
+    },
+  },
+};
+
+export const TYPE_TOOL = {
+  name: "Type",
+  description:
+    "Type into the focused field in the shared desk Chromium. Click the field first. clear=true empties it first. submit=true presses Enter. Fails with takeover_active while the human is driving.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      text: { type: "string" },
+      clear: { type: "boolean" },
+      submit: { type: "boolean" },
+    },
+    required: ["text"],
+  },
+};
+
+export const WAIT_TOOL = {
+  name: "Wait",
+  description:
+    "Pause this turn so the shared page can settle after Click/Navigate. ms 0–15000, default 800.",
+  inputSchema: {
+    type: "object",
+    properties: { ms: { type: "number", description: "Milliseconds, default 800" } },
+  },
 };
 
 export const CONFIRM_SERIES_TOOL = {
@@ -879,6 +921,9 @@ export function mcpToolsForRole(role: string | null | undefined): unknown[] {
       PAUSE_SERIES_TOOL,
       NAVIGATE_TOOL,
       BROWSER_SNAPSHOT_TOOL,
+      CLICK_TOOL,
+      TYPE_TOOL,
+      WAIT_TOOL,
     );
   return tools;
 }
@@ -911,6 +956,15 @@ export type McpHooks = {
     text?: string;
     error?: string;
   }>;
+  browserClick?: (
+    accountId: string,
+    input: { text?: string; selector?: string; nth?: number },
+  ) => Promise<{ ok: boolean; text?: string; tag?: string; count?: number; error?: string }>;
+  browserType?: (
+    accountId: string,
+    input: { text: string; clear?: boolean; submit?: boolean },
+  ) => Promise<{ ok: boolean; error?: string }>;
+  browserWait?: (accountId: string, ms: number) => Promise<{ ok: boolean; ms?: number; error?: string }>;
 };
 
 const INBOX_PREVIEW = 240;
@@ -1554,6 +1608,81 @@ export async function browserSnapshot(
   }
 }
 
+export async function clickBrowser(
+  db: OpenbotDb,
+  inflight: McpInflight,
+  bearer: string | undefined,
+  rawInput: unknown,
+  hooks?: McpHooks,
+): Promise<{ ok: boolean; text?: string; tag?: string; count?: number; error?: string }> {
+  const input = parseOrThrow(clickBrowserInput, coerceToolArgs(rawInput));
+  const claims = verifyMcpToken(db, bearer);
+  requireDesk(db, claims, "Click");
+  inflight.add(claims.harnessSessionId);
+  try {
+    const turn = lockRunningTurn(db, claims);
+    if (!turn) throw new McpError("no_active_turn", "no running turn for this harness session", 409);
+    if (!hooks?.browserClick) return { ok: false, error: "browser_unavailable" };
+    return await hooks.browserClick(claims.accountId, {
+      text: input.text,
+      selector: input.selector,
+      nth: input.nth,
+    });
+  } finally {
+    inflight.remove(claims.harnessSessionId);
+  }
+}
+
+export async function typeBrowser(
+  db: OpenbotDb,
+  inflight: McpInflight,
+  bearer: string | undefined,
+  rawInput: unknown,
+  hooks?: McpHooks,
+): Promise<{ ok: boolean; error?: string }> {
+  const input = parseOrThrow(typeBrowserInput, coerceToolArgs(rawInput));
+  const claims = verifyMcpToken(db, bearer);
+  requireDesk(db, claims, "Type");
+  inflight.add(claims.harnessSessionId);
+  try {
+    const turn = lockRunningTurn(db, claims);
+    if (!turn) throw new McpError("no_active_turn", "no running turn for this harness session", 409);
+    if (!hooks?.browserType) return { ok: false, error: "browser_unavailable" };
+    return await hooks.browserType(claims.accountId, {
+      text: input.text,
+      clear: input.clear,
+      submit: input.submit,
+    });
+  } finally {
+    inflight.remove(claims.harnessSessionId);
+  }
+}
+
+export async function waitBrowser(
+  db: OpenbotDb,
+  inflight: McpInflight,
+  bearer: string | undefined,
+  rawInput: unknown,
+  hooks?: McpHooks,
+): Promise<{ ok: boolean; ms?: number; error?: string }> {
+  const input = parseOrThrow(waitBrowserInput, coerceToolArgs(rawInput));
+  const claims = verifyMcpToken(db, bearer);
+  requireDesk(db, claims, "Wait");
+  inflight.add(claims.harnessSessionId);
+  try {
+    const turn = lockRunningTurn(db, claims);
+    if (!turn) throw new McpError("no_active_turn", "no running turn for this harness session", 409);
+    const ms = input.ms ?? 800;
+    if (!hooks?.browserWait) {
+      await Bun.sleep(ms);
+      return { ok: true, ms };
+    }
+    return await hooks.browserWait(claims.accountId, ms);
+  } finally {
+    inflight.remove(claims.harnessSessionId);
+  }
+}
+
 function federationIsOn(db: OpenbotDb, hooks?: McpHooks): boolean {
   if (hooks?.federationEffective) return hooks.federationEffective();
   const row = db.get<{ federation_enabled: number }>(
@@ -1727,6 +1856,12 @@ export async function handleMcpJsonRpc(
         result = await navigateBrowser(db, inflight, bearer, args, hooks);
       } else if (name === "BrowserSnapshot") {
         result = await browserSnapshot(db, inflight, bearer, args, hooks);
+      } else if (name === "Click") {
+        result = await clickBrowser(db, inflight, bearer, args, hooks);
+      } else if (name === "Type") {
+        result = await typeBrowser(db, inflight, bearer, args, hooks);
+      } else if (name === "Wait") {
+        result = await waitBrowser(db, inflight, bearer, args, hooks);
       } else {
         throw new McpError("unknown_tool", `unknown tool ${name}`, 400);
       }

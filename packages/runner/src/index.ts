@@ -17,6 +17,8 @@ export const BROWSER_SNAPSHOT_MAX_CHARS = 12_000;
 export const BROWSER_VIEWPORT_MIN = { width: 640, height: 400 };
 export const BROWSER_VIEWPORT_MAX = { width: 2560, height: 1440 };
 export const BROWSER_VIEWPORT_DEFAULT = { width: 1280, height: 720 };
+export const BROWSER_WAIT_MAX_MS = 15_000;
+export const BROWSER_WAIT_DEFAULT_MS = 800;
 
 function clampViewport(width: number, height: number): { width: number; height: number } {
   return {
@@ -656,6 +658,125 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     }
   }
 
+  async click(input: {
+    text?: string;
+    selector?: string;
+    nth?: number;
+  }): Promise<{ ok: boolean; text?: string; tag?: string; count?: number; error?: string }> {
+    if (this.browser?.takeoverActive) return { ok: false, error: "takeover_active" };
+    return this.withBrowser(async () => {
+      try {
+        await this.ensureBrowser();
+      } catch (err) {
+        return { ok: false, error: String(err) };
+      }
+      const spec = {
+        text: input.text?.trim() || "",
+        selector: input.selector?.trim() || "",
+        nth: input.nth ?? 0,
+      };
+      if (!spec.text && !spec.selector) return { ok: false, error: "text or selector required" };
+      try {
+        const found = await this.runtimeEval<{
+          ok: boolean;
+          error?: string;
+          x?: number;
+          y?: number;
+          w?: number;
+          h?: number;
+          tag?: string;
+          text?: string;
+          count?: number;
+          method?: string;
+        }>(clickFindExpr(spec));
+        if (!found?.ok) {
+          return { ok: false, error: found?.error ?? "not_found", count: found?.count };
+        }
+        if ((found.w ?? 0) >= 1 && (found.h ?? 0) >= 1 && found.x != null && found.y != null) {
+          await this.dispatchCssClick(found.x, found.y);
+        } else {
+          await this.runtimeEval("document.activeElement && document.activeElement.click && document.activeElement.click()");
+        }
+        return { ok: true, text: found.text, tag: found.tag, count: found.count };
+      } catch (err) {
+        return { ok: false, error: String(err) };
+      }
+    });
+  }
+
+  async typeText(input: {
+    text: string;
+    clear?: boolean;
+    submit?: boolean;
+  }): Promise<{ ok: boolean; error?: string }> {
+    if (this.browser?.takeoverActive) return { ok: false, error: "takeover_active" };
+    return this.withBrowser(async () => {
+      try {
+        await this.ensureBrowser();
+      } catch (err) {
+        return { ok: false, error: String(err) };
+      }
+      try {
+        const focus = await this.runtimeEval<{ ok: boolean; error?: string; tag?: string }>(
+          `(() => {
+            const el = document.activeElement;
+            if (!el || el === document.body || el === document.documentElement) {
+              return { ok: false, error: "no_focus" };
+            }
+            return { ok: true, tag: el.tagName };
+          })()`,
+        );
+        if (!focus?.ok) return { ok: false, error: focus?.error ?? "no_focus" };
+        if (input.clear) {
+          await this.runtimeEval(`(() => {
+            const el = document.activeElement;
+            if (!el) return false;
+            if ("value" in el) {
+              el.value = "";
+              el.dispatchEvent(new Event("input", { bubbles: true }));
+              el.dispatchEvent(new Event("change", { bubbles: true }));
+            } else if (el.isContentEditable) el.textContent = "";
+            return true;
+          })()`);
+        }
+        await this.cdpCall("Input.insertText", { text: input.text });
+        if (input.submit) {
+          await this.cdpCall("Input.dispatchKeyEvent", cdpKeyEvent({ action: "rawKeyDown", key: "Enter", code: "Enter" }));
+          await this.cdpCall("Input.dispatchKeyEvent", cdpKeyEvent({ action: "char", key: "Enter", code: "Enter", text: "\r" }));
+          await this.cdpCall("Input.dispatchKeyEvent", cdpKeyEvent({ action: "keyUp", key: "Enter", code: "Enter" }));
+        }
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: String(err) };
+      }
+    });
+  }
+
+  async waitFor(ms = BROWSER_WAIT_DEFAULT_MS): Promise<{ ok: boolean; ms: number }> {
+    const n = Math.max(0, Math.min(BROWSER_WAIT_MAX_MS, Math.round(ms)));
+    await Bun.sleep(n);
+    return { ok: true, ms: n };
+  }
+
+  private async dispatchCssClick(x: number, y: number): Promise<void> {
+    const at = { x, y, button: "left" };
+    await this.cdpCall("Input.dispatchMouseEvent", { type: "mouseMoved", ...at, buttons: 0, clickCount: 0 });
+    await this.cdpCall("Input.dispatchMouseEvent", { type: "mousePressed", ...at, buttons: 1, clickCount: 1 });
+    await this.cdpCall("Input.dispatchMouseEvent", { type: "mouseReleased", ...at, buttons: 0, clickCount: 1 });
+  }
+
+  private async cdpCall(method: string, params?: unknown): Promise<unknown> {
+    if (!this.browser?.cdpUrl) throw new Error("browser down");
+    const conn = this.browser.screencast;
+    if (conn) return conn.send(method, params);
+    const { ws, send } = await cdpConnect(this.browser.cdpUrl);
+    try {
+      return await send(method, params);
+    } finally {
+      ws.close();
+    }
+  }
+
   private async runtimeEval<T>(expression: string): Promise<T> {
     if (!this.browser?.cdpUrl) throw new Error("browser down");
     const conn = this.browser.screencast;
@@ -912,6 +1033,50 @@ async function cdpNavigate(cdpHttp: string, url: string): Promise<{ title?: stri
   } finally {
     ws.close();
   }
+}
+
+function clickFindExpr(spec: { text: string; selector: string; nth: number }): string {
+  return `(() => {
+    const spec = ${JSON.stringify(spec)};
+    const nth = spec.nth || 0;
+    let nodes = [];
+    if (spec.selector) {
+      try { nodes = Array.from(document.querySelectorAll(spec.selector)); }
+      catch (e) { return { ok: false, error: "bad_selector" }; }
+    } else {
+      const needle = String(spec.text || "").trim().toLowerCase();
+      const cand = Array.from(document.querySelectorAll('a, button, input, select, textarea, option, [role="button"], [role="link"], [role="menuitem"], label, summary'));
+      const scored = [];
+      for (const el of cand) {
+        const label = String(el.innerText || el.value || el.getAttribute("aria-label") || el.getAttribute("title") || el.getAttribute("alt") || "").replace(/\\s+/g, " ").trim();
+        const n = label.toLowerCase();
+        if (!n) continue;
+        let score = -1;
+        if (n === needle) score = 0;
+        else if (n.startsWith(needle)) score = 1;
+        else if (n.includes(needle)) score = 2;
+        if (score >= 0) scored.push({ el: el, score: score, len: label.length });
+      }
+      scored.sort((a, b) => a.score - b.score || a.len - b.len);
+      nodes = scored.map((s) => s.el);
+    }
+    if (!nodes.length) return { ok: false, error: "not_found", count: 0 };
+    if (nth >= nodes.length) return { ok: false, error: "not_found", count: nodes.length };
+    const el = nodes[nth];
+    el.scrollIntoView({ block: "center", inline: "nearest" });
+    if (typeof el.focus === "function") el.focus();
+    const r = el.getBoundingClientRect();
+    return {
+      ok: true,
+      x: r.left + r.width / 2,
+      y: r.top + r.height / 2,
+      w: r.width,
+      h: r.height,
+      tag: el.tagName,
+      text: String(el.innerText || el.value || "").replace(/\\s+/g, " ").trim().slice(0, 80),
+      count: nodes.length,
+    };
+  })()`;
 }
 
 async function cdpEvaluate<T>(cdpHttp: string, expression: string): Promise<T> {

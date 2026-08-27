@@ -18,6 +18,9 @@
  *   [[confirm:seriesId]]
  *   [[nav:url]]       Navigate the shared desk Chromium
  *   [[snap]]          BrowserSnapshot, then SendMessage the JSON
+ *   [[click:text]]    Click visible text
+ *   [[type:text]]     Type into the focused field
+ *   [[wait:ms]]       Wait milliseconds
  *   [[thread:Title:body]]  SendToThread by group title (empty Title omits name/threadId)
  *   [[threadid:uuid:body]] SendToThread by group thread id
  *   [[write:name]]    write name into cwd
@@ -347,6 +350,36 @@ async function handle(msg: {
         }
       }
 
+      const click = /\[\[click:([^\]]+)\]\]/.exec(current);
+      if (click) {
+        try {
+          const result = await callTool(mcpUrl, mcpToken, "Click", { text: click[1]!.trim() });
+          await callSend(mcpUrl, mcpToken, JSON.stringify(result));
+        } catch (err) {
+          noteMcpError(err);
+        }
+      }
+
+      const type = /\[\[type:([^\]]+)\]\]/.exec(current);
+      if (type) {
+        try {
+          const result = await callTool(mcpUrl, mcpToken, "Type", { text: type[1]!.trim() });
+          await callSend(mcpUrl, mcpToken, JSON.stringify(result));
+        } catch (err) {
+          noteMcpError(err);
+        }
+      }
+
+      const wait = /\[\[wait:(\d+)\]\]/.exec(current);
+      if (wait) {
+        try {
+          const result = await callTool(mcpUrl, mcpToken, "Wait", { ms: Number(wait[1]) });
+          await callSend(mcpUrl, mcpToken, JSON.stringify(result));
+        } catch (err) {
+          noteMcpError(err);
+        }
+      }
+
       const inboxack = /\[\[inboxack:([^\]]+)\]\]/.exec(current);
       if (inboxack) {
         try {
@@ -394,6 +427,9 @@ async function handle(msg: {
           !current.includes("[[confirm:") &&
           !current.includes("[[nav:") &&
           !current.includes("[[snap]]") &&
+          !current.includes("[[click:") &&
+          !current.includes("[[type:") &&
+          !current.includes("[[wait:") &&
           !current.includes("[[sendto:") &&
           !current.includes("[[sendorg:") &&
           !current.includes("[[inbox]]") &&

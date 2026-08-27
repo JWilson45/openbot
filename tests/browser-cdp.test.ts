@@ -59,7 +59,29 @@ describe("CDP + takeover", () => {
       expect(blocked.error).toBe("takeover_active");
       const during = await runner.pageText();
       expect(during.ok).toBe(true);
+      expect((await runner.click({ text: "OpenBot" })).error).toBe("takeover_active");
+      expect((await runner.typeText({ text: "x" })).error).toBe("takeover_active");
       runner.browser!.takeoverActive = false;
+      const demo =
+        "data:text/html," +
+        encodeURIComponent(
+          `<!doctype html><button id="b">Add to Cart</button><input id="t"><p id="out"></p>
+           <script>
+             document.getElementById("b").addEventListener("click", function() {
+               var t = document.getElementById("t");
+               t.value = "clicked";
+               t.focus();
+               document.getElementById("out").textContent = "clicked";
+             });
+           </script>`,
+        );
+      expect((await runner.navigate(demo)).ok).toBe(true);
+      const c = await runner.click({ text: "Add to Cart" });
+      expect(c.ok).toBe(true);
+      const typed = await runner.typeText({ text: " hi" });
+      expect(typed.ok).toBe(true);
+      const html = await runner.snapshot();
+      expect(html.html ?? "").toContain("clicked");
       log.push("navigate_ok");
     }
 

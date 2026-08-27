@@ -1776,6 +1776,9 @@ export function createApp(cfg: HomeConfig): {
         },
         browserNavigate: (accountId, url) => ctx.engine.runnerFor(accountId).navigate(url),
         browserSnapshot: (accountId) => ctx.engine.runnerFor(accountId).pageText(),
+        browserClick: (accountId, input) => ctx.engine.runnerFor(accountId).click(input),
+        browserType: (accountId, input) => ctx.engine.runnerFor(accountId).typeText(input),
+        browserWait: (_accountId, ms) => ctx.engine.runnerFor(_accountId).waitFor(ms),
       });
       const json = result.json as { result?: { content?: unknown[] } };
       if (result.status === 200 && json?.result?.content) {

@@ -227,6 +227,9 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     expect(desk).toContain("ConfirmSeries");
     expect(desk).toContain("Navigate");
     expect(desk).toContain("BrowserSnapshot");
+    expect(desk).toContain("Click");
+    expect(desk).toContain("Type");
+    expect(desk).toContain("Wait");
     expect(gw).not.toContain("ListCalendar");
     expect(gw).not.toContain("CreateEvent");
     expect(gw).not.toContain("BrowserSnapshot");
@@ -259,6 +262,9 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
       "PauseSeries",
       "Navigate",
       "BrowserSnapshot",
+      "Click",
+      "Type",
+      "Wait",
     ]);
     expect(mcpToolsForRole("desk").map((t) => (t as { name: string }).name)).toEqual([
       "SendMessage",
@@ -273,6 +279,9 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
       "PauseSeries",
       "Navigate",
       "BrowserSnapshot",
+      "Click",
+      "Type",
+      "Wait",
     ]);
 
     db.run("UPDATE bots SET role = 'gateway' WHERE id = ?", [w.botId]);

@@ -34,6 +34,15 @@ async function call(
       text?: string;
       error?: string;
     }>;
+    browserClick?: (
+      accountId: string,
+      input: { text?: string; selector?: string; nth?: number },
+    ) => Promise<{ ok: boolean; text?: string; error?: string }>;
+    browserType?: (
+      accountId: string,
+      input: { text: string; clear?: boolean; submit?: boolean },
+    ) => Promise<{ ok: boolean; error?: string }>;
+    browserWait?: (accountId: string, ms: number) => Promise<{ ok: boolean; ms?: number }>;
   },
 ) {
   const inflight = new McpInflight();
@@ -103,11 +112,39 @@ describe("desk browser MCP", () => {
       text: `seen:${w.accountId}`,
     });
 
+    const noTarget = await call(db, w.token, "Click", {});
+    expect(noTarget.status).toBe(400);
+
+    const clicked = await call(
+      db,
+      w.token,
+      "Click",
+      { text: "Add to Cart" },
+      { browserClick: async (accountId, input) => ({ ok: true, text: `${accountId}:${input.text}` }) },
+    );
+    expect(payload(clicked.json)).toEqual({ ok: true, text: `${w.accountId}:Add to Cart` });
+
+    const typed = await call(
+      db,
+      w.token,
+      "Type",
+      { text: "hello", clear: true },
+      { browserType: async () => ({ ok: true }) },
+    );
+    expect(payload(typed.json)).toEqual({ ok: true });
+
+    const waited = await call(db, w.token, "Wait", { ms: 0 }, { browserWait: async (_id, ms) => ({ ok: true, ms }) });
+    expect(payload(waited.json)).toEqual({ ok: true, ms: 0 });
+
     db.run("UPDATE bots SET role = 'gateway' WHERE id = ?", [w.botId]);
     const gwNav = await call(db, w.token, "Navigate", { url: "https://example.com" });
     expect(gwNav.status).toBe(403);
     const gwSnap = await call(db, w.token, "BrowserSnapshot", {});
     expect(gwSnap.status).toBe(403);
+    const gwClick = await call(db, w.token, "Click", { text: "x" });
+    expect(gwClick.status).toBe(403);
+    const gwType = await call(db, w.token, "Type", { text: "x" });
+    expect(gwType.status).toBe(403);
     db.close();
   });
 

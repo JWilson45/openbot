@@ -155,6 +155,30 @@ export const browserSnapshotInput = z.object({});
 
 export type BrowserSnapshotInput = z.infer<typeof browserSnapshotInput>;
 
+export const clickBrowserInput = z
+  .object({
+    text: z.string().trim().min(1).max(200).optional(),
+    selector: z.string().trim().min(1).max(500).optional(),
+    nth: z.number().int().min(0).max(20).optional(),
+  })
+  .refine((v) => Boolean(v.text || v.selector), { message: "text or selector required" });
+
+export type ClickBrowserInput = z.infer<typeof clickBrowserInput>;
+
+export const typeBrowserInput = z.object({
+  text: z.string().min(1).max(8000),
+  clear: z.boolean().optional(),
+  submit: z.boolean().optional(),
+});
+
+export type TypeBrowserInput = z.infer<typeof typeBrowserInput>;
+
+export const waitBrowserInput = z.object({
+  ms: z.number().int().min(0).max(15_000).optional(),
+});
+
+export type WaitBrowserInput = z.infer<typeof waitBrowserInput>;
+
 export const createGroupThreadInput = z.object({
   kind: z.literal("group"),
   title: z.string().max(200).optional(),
