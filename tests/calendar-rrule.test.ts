@@ -39,10 +39,13 @@ describe("parseRrule", () => {
   test("HOURLY INTERVAL=1 and MINUTELY INTERVAL=5 parse", () => {
     expect(parseRrule("FREQ=HOURLY;INTERVAL=1").freq).toBe("HOURLY");
     expect(parseRrule("FREQ=HOURLY;INTERVAL=1").interval).toBe(1);
+    const two = parseRrule("FREQ=MINUTELY;INTERVAL=2");
+    expect(two.freq).toBe("MINUTELY");
+    expect(two.interval).toBe(2);
+    expect(two.interval * 60_000).toBe(CAL_MIN_INTERVAL_MS);
     const five = parseRrule("FREQ=MINUTELY;INTERVAL=5");
     expect(five.freq).toBe("MINUTELY");
     expect(five.interval).toBe(5);
-    expect(five.interval * 60_000).toBe(CAL_MIN_INTERVAL_MS);
     expect(parseRrule("FREQ=DAILY;INTERVAL=1;BYHOUR=9;BYMINUTE=0").byHour).toEqual([9]);
     expect(parseRrule("FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0").byDay).toEqual([1, 2, 3, 4, 5]);
     expect(parseRrule("FREQ=MONTHLY;BYMONTHDAY=31").byMonthDay).toEqual([31]);

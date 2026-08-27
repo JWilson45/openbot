@@ -278,7 +278,7 @@ CREATE TABLE IF NOT EXISTS calendar_series (
   source_turn_id text REFERENCES turns(id) ON DELETE SET NULL,
   source_thread_id text REFERENCES threads(id) ON DELETE SET NULL,
   capture_summary text,
-  min_interval_ms integer NOT NULL DEFAULT 300000,
+  min_interval_ms integer NOT NULL DEFAULT 120000,
   last_fired_at integer,
   next_due_at integer,
   created_at integer NOT NULL,

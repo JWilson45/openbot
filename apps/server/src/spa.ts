@@ -1373,14 +1373,18 @@ export const SPA_HTML = `<!DOCTYPE html>
     return p.year + '-' + pad2(p.month) + '-' + pad2(p.day) + 'T' + pad2(p.hour) + ':' + pad2(p.minute);
   }
   function rruleInterval(rrule) {
-    const m = /(?:^|;)INTERVAL=(\d+)/i.exec(String(rrule || ''));
+    const m = /(?:^|;)INTERVAL=([0-9]+)/i.exec(String(rrule || ''));
     return m ? Math.max(1, Number(m[1])) : 1;
   }
-  function rruleProse(rrule) {
+  function rruleProse(rrule, minMs) {
     if (!rrule) return 'Once';
     const u = String(rrule).replace(/^RRULE:/i, '').toUpperCase();
     const n = rruleInterval(u);
-    if (u.indexOf('FREQ=MINUTELY') === 0) return n === 1 ? 'Every minute' : 'Every ' + n + ' minutes';
+    const floorMin = minMs ? Math.max(1, Math.round(Number(minMs) / 60000)) : 1;
+    if (u.indexOf('FREQ=MINUTELY') === 0) {
+      const minutes = Math.max(n, floorMin);
+      return minutes === 1 ? 'Every minute' : 'Every ' + minutes + ' minutes';
+    }
     if (u.indexOf('FREQ=HOURLY') === 0) return n === 1 ? 'Hourly' : 'Every ' + n + ' hours';
     if (u.indexOf('BYDAY=MO,TU,WE,TH,FR') >= 0 && u.indexOf('BYHOUR=9') >= 0) return 'Weekdays at 9:00';
     if (u.indexOf('FREQ=DAILY') === 0) return 'Daily';
@@ -1402,7 +1406,7 @@ export const SPA_HTML = `<!DOCTYPE html>
   function seriesRowHtml(s) {
     const tz = orgTimezone();
     const next = seriesNextFire(s);
-    const cadence = rruleProse(s.rrule);
+    const cadence = rruleProse(s.rrule, s.min_interval_ms);
     let when = 'no next fire';
     if (s.status === 'paused') when = 'paused';
     else if (s.status === 'proposed') when = 'needs confirm';

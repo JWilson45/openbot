@@ -1,4 +1,4 @@
-export const CAL_MIN_INTERVAL_MS = 5 * 60 * 1000;
+export const CAL_MIN_INTERVAL_MS = 2 * 60 * 1000;
 export const CAL_MAX_SERIES = 32;
 export const CAL_HORIZON_MS = 14 * 24 * 60 * 60 * 1000;
 export const CAL_MAX_INSTANCES_HORIZON = 64;

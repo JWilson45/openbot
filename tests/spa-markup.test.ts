@@ -56,6 +56,7 @@ describe("desk SPA markup", () => {
     expect(html).toContain("seriesRowHtml");
     expect(html).toContain("Schedules");
     expect(html).toContain("Every ");
+    expect(html).toContain("INTERVAL=([0-9]+)");
     expect(html).toContain("needs confirm");
     expect(html).toContain("Fires on");
     expect(html).not.toContain("Schedule vs Routine");
