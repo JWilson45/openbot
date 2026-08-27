@@ -8,9 +8,11 @@ import {
   MAX_ACTIVE_BOTS,
   OpenbotDb,
   deleteBotPermanently,
+  humanThread,
   id,
   isGatewayRole,
   now,
+  pauseCalendarSeriesForAssignee,
   type TurnRow,
 } from "@openbot/db";
 import {
@@ -32,12 +34,29 @@ import {
   queueGroupMentions,
   rejectMessage,
 } from "@openbot/mcp-send-message";
-import { McpError, addThreadParticipantInput, createGroupThreadInput, postMessageInput } from "@openbot/api-types";
+import {
+  McpError,
+  addThreadParticipantInput,
+  createCalendarSeriesInput,
+  createGroupThreadInput,
+  learnRoutineInput,
+  patchCalendarSeriesInput,
+  postMessageInput,
+} from "@openbot/api-types";
 import { insertMessage, parseLivePayload, promote, summarizeLiveEvent } from "@openbot/live-work";
 import { sha256Hex } from "@openbot/db";
 import { detectCliLogins, listGrokModels, resolveBotInference } from "@openbot/acp-grok";
 import { FED_MAX_REQUEST_BYTES } from "@openbot/federation";
-import { isValidTimeZone } from "@openbot/calendar";
+import {
+  CAL_MAX_SERIES,
+  CAL_MIN_INTERVAL_MS,
+  RruleError,
+  civilToUtc,
+  isValidTimeZone,
+  materializeHorizon,
+  parseRrule,
+  utcToCivil,
+} from "@openbot/calendar";
 import { SPA_HTML } from "./spa.ts";
 import { TurnEngine } from "./engine.ts";
 import { mountOpenAiCompat } from "./openai.ts";
@@ -637,6 +656,13 @@ export function createApp(cfg: HomeConfig): {
       "UPDATE turns SET status = 'cancelled', finished_at = ? WHERE bot_id = ? AND status IN ('queued', 'running')",
       [t, bot.id],
     );
+    pauseCalendarSeriesForAssignee(db, bot.id);
+    for (const row of db.all<{ id: string }>(
+      "SELECT id FROM calendar_series WHERE assignee_bot_id = ? AND status = 'paused'",
+      [bot.id],
+    )) {
+      suppressOpenCalendarInstances(db, row.id, "pause");
+    }
     const runner = ctx.engine.runnerFor(s.accountId);
     void runner.acpFor(bot.id)?.kill();
     return c.json({ ok: true, archivedAt: t, deleteAfter: t + ARCHIVE_TTL_MS });
@@ -664,6 +690,386 @@ export function createApp(cfg: HomeConfig): {
     if (dup) return c.json({ error: "duplicate_name" }, 409);
     db.run("UPDATE bots SET status = 'active', archived_at = NULL WHERE id = ?", [bot.id]);
     return c.json({ ok: true });
+  });
+
+  app.get("/v1/calendar", (c) => {
+    const s = requireSession(c);
+    const fromRaw = c.req.query("from");
+    const toRaw = c.req.query("to");
+    if (fromRaw == null || fromRaw === "" || toRaw == null || toRaw === "") {
+      return c.json({ error: "bad_request" }, 400);
+    }
+    const from = Number(fromRaw);
+    const to = Number(toRaw);
+    if (!Number.isFinite(from) || !Number.isFinite(to)) return c.json({ error: "bad_request" }, 400);
+    const status = c.req.query("status");
+    const kind = c.req.query("kind");
+    if (status && !CAL_SERIES_STATUSES.has(status)) return c.json({ error: "bad_request" }, 400);
+    if (kind && !CAL_SERIES_KINDS.has(kind)) return c.json({ error: "bad_request" }, 400);
+    const instances = db.all(
+      `SELECT i.* FROM calendar_instances i
+       JOIN calendar_series s ON s.id = i.series_id
+       WHERE s.account_id = ? AND i.scheduled_at >= ? AND i.scheduled_at <= ?
+         AND (? IS NULL OR s.status = ?)
+         AND (? IS NULL OR s.kind = ?)
+       ORDER BY i.scheduled_at, i.id`,
+      [s.accountId, from, to, status ?? null, status ?? null, kind ?? null, kind ?? null],
+    );
+    const seriesById = new Map<string, CalendarSeriesRow>();
+    const windowIds = [...new Set(instances.map((row) => (row as { series_id: string }).series_id))];
+    if (windowIds.length) {
+      const placeholders = windowIds.map(() => "?").join(",");
+      for (const row of db.all<CalendarSeriesRow>(
+        `SELECT * FROM calendar_series WHERE id IN (${placeholders})`,
+        windowIds,
+      )) {
+        seriesById.set(row.id, row);
+      }
+    }
+    if (!status || status === "proposed") {
+      for (const row of db.all<CalendarSeriesRow>(
+        `SELECT * FROM calendar_series WHERE account_id = ? AND status = 'proposed' AND (? IS NULL OR kind = ?)`,
+        [s.accountId, kind ?? null, kind ?? null],
+      )) {
+        seriesById.set(row.id, row);
+      }
+    }
+    const org = currentOrgMeta(db);
+    return c.json({
+      timezone: org?.timezone ?? "UTC",
+      series: [...seriesById.values()],
+      instances,
+    });
+  });
+
+  app.get("/v1/calendar/series/:id", (c) => {
+    const s = requireSession(c);
+    const series = loadCalendarSeries(db, s.accountId, c.req.param("id"));
+    if (!series) return c.json({ error: "not_found" }, 404);
+    const instances = db.all(
+      `SELECT * FROM calendar_instances WHERE series_id = ? ORDER BY scheduled_at DESC, id DESC LIMIT 20`,
+      [series.id],
+    );
+    return c.json({ series, instances, nextFire: nextCalendarFireUtc(db, series) });
+  });
+
+  app.post("/v1/calendar/series", async (c) => {
+    const s = requireSession(c);
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      return c.json({ error: "bad_request" }, 400);
+    }
+    if (raw && typeof raw === "object" && "kind" in raw) return c.json({ error: "kind_not_allowed" }, 400);
+    const parsed = createCalendarSeriesInput.safeParse(raw);
+    if (!parsed.success) return c.json({ error: "bad_request" }, 400);
+    const input = parsed.data;
+    const bot = resolveCalendarAssignee(db, s.accountId, input.botId);
+    if ("error" in bot) return c.json({ error: bot.error }, bot.status);
+    const thread = resolveCalendarThread(db, s.accountId, bot.id, input.threadId);
+    if ("error" in thread) return c.json({ error: thread.error }, thread.status);
+    const timezone = (input.timezone ?? currentOrgMeta(db)?.timezone ?? "UTC").trim();
+    if (!isValidTimeZone(timezone)) return c.json({ error: "invalid_timezone" }, 400);
+    const rrule = emptyToNull(input.rrule);
+    const rruleErr = validateCalendarRrule(rrule);
+    if (rruleErr) return c.json({ error: rruleErr }, 400);
+    let dtstartUtc: number;
+    try {
+      dtstartUtc = parseCalendarDtstart(input.dtstart, timezone);
+    } catch (err) {
+      return c.json({ error: err instanceof RruleError ? err.code : "invalid_dtstart" }, 400);
+    }
+    if (nonCancelledSeriesCount(db, s.accountId) >= CAL_MAX_SERIES) return c.json({ error: "cap" }, 409);
+    const t = now();
+    const seriesId = id();
+    const requireHuman = calendarRequireHumanApproval(input.requireHumanApproval, thread.kind, bot.require_human_approval);
+    db.immediate(() => {
+      db.run(
+        `INSERT INTO calendar_series (
+           id, account_id, title, prompt, assignee_bot_id, thread_id, kind, status, rrule,
+           dtstart_utc, timezone, require_human_approval, created_by, min_interval_ms,
+           created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, 'schedule', 'active', ?, ?, ?, ?, 'human', ?, ?, ?)`,
+        [
+          seriesId,
+          s.accountId,
+          input.title,
+          input.prompt,
+          bot.id,
+          thread.id,
+          rrule,
+          dtstartUtc,
+          timezone,
+          requireHuman ? 1 : 0,
+          CAL_MIN_INTERVAL_MS,
+          t,
+          t,
+        ],
+      );
+      const series = loadCalendarSeries(db, s.accountId, seriesId);
+      if (series) rematerializeScheduledInstances(db, series);
+    });
+    const series = loadCalendarSeries(db, s.accountId, seriesId);
+    return c.json({ series }, 201);
+  });
+
+  app.patch("/v1/calendar/series/:id", async (c) => {
+    const s = requireSession(c);
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      return c.json({ error: "bad_request" }, 400);
+    }
+    if (raw && typeof raw === "object" && ("until" in raw || "count" in raw)) {
+      return c.json({ error: "bad_request" }, 400);
+    }
+    const parsed = patchCalendarSeriesInput.safeParse(raw);
+    if (!parsed.success) return c.json({ error: "bad_request" }, 400);
+    const series = loadCalendarSeries(db, s.accountId, c.req.param("id"));
+    if (!series) return c.json({ error: "not_found" }, 404);
+    const input = parsed.data;
+    let assigneeId = series.assignee_bot_id;
+    if (input.botId) {
+      const bot = resolveCalendarAssignee(db, s.accountId, input.botId);
+      if ("error" in bot) return c.json({ error: bot.error }, bot.status);
+      assigneeId = bot.id;
+    }
+    let threadId = input.threadId === undefined ? series.thread_id : input.threadId;
+    if (input.threadId) {
+      const thread = resolveCalendarThread(db, s.accountId, assigneeId ?? "", input.threadId);
+      if ("error" in thread) return c.json({ error: thread.error }, thread.status);
+      threadId = thread.id;
+    }
+    const timezone = input.timezone != null ? input.timezone.trim() : series.timezone;
+    if (!isValidTimeZone(timezone)) return c.json({ error: "invalid_timezone" }, 400);
+    const rrule = input.rrule === undefined ? series.rrule : emptyToNull(input.rrule);
+    const rruleErr = validateCalendarRrule(rrule);
+    if (rruleErr) return c.json({ error: rruleErr }, 400);
+    let dtstartUtc = series.dtstart_utc;
+    if (input.dtstart != null) {
+      try {
+        dtstartUtc = parseCalendarDtstart(input.dtstart, timezone);
+      } catch (err) {
+        return c.json({ error: err instanceof RruleError ? err.code : "invalid_dtstart" }, 400);
+      }
+    }
+    const nextStatus = input.status ?? series.status;
+    if (
+      (nextStatus === "active" || nextStatus === "paused") &&
+      nonCancelledSeriesCount(db, s.accountId, series.id) >= CAL_MAX_SERIES
+    ) {
+      return c.json({ error: "cap" }, 409);
+    }
+    const requireHuman =
+      input.requireHumanApproval != null ? (input.requireHumanApproval ? 1 : 0) : series.require_human_approval;
+    const scheduleChanged =
+      rrule !== series.rrule || dtstartUtc !== series.dtstart_utc || timezone !== series.timezone;
+    const t = now();
+    db.immediate(() => {
+      db.run(
+        `UPDATE calendar_series SET
+           title = ?, prompt = ?, assignee_bot_id = ?, thread_id = ?, rrule = ?,
+           dtstart_utc = ?, timezone = ?, require_human_approval = ?, status = ?, updated_at = ?
+         WHERE id = ?`,
+        [
+          input.title ?? series.title,
+          input.prompt ?? series.prompt,
+          assigneeId,
+          threadId,
+          rrule,
+          dtstartUtc,
+          timezone,
+          requireHuman,
+          nextStatus,
+          t,
+          series.id,
+        ],
+      );
+      if (nextStatus === "paused" && series.status !== "paused") {
+        suppressOpenCalendarInstances(db, series.id, "pause");
+      } else if (nextStatus === "cancelled" && series.status !== "cancelled") {
+        suppressOpenCalendarInstances(db, series.id, "cancel");
+      } else if (nextStatus === "active") {
+        const updated = loadCalendarSeries(db, s.accountId, series.id);
+        if (updated && (scheduleChanged || series.status !== "active")) rematerializeScheduledInstances(db, updated);
+      }
+    });
+    return c.json({ series: loadCalendarSeries(db, s.accountId, series.id) });
+  });
+
+  app.post("/v1/calendar/series/:id/confirm", (c) => {
+    const s = requireSession(c);
+    const series = loadCalendarSeries(db, s.accountId, c.req.param("id"));
+    if (!series) return c.json({ error: "not_found" }, 404);
+    if (series.status !== "proposed") return c.json({ error: "not_proposed" }, 409);
+    if (nonCancelledSeriesCount(db, s.accountId, series.id) >= CAL_MAX_SERIES) {
+      return c.json({ error: "cap" }, 409);
+    }
+    db.immediate(() => {
+      db.run(`UPDATE calendar_series SET status = 'active', updated_at = ? WHERE id = ?`, [now(), series.id]);
+      const updated = loadCalendarSeries(db, s.accountId, series.id);
+      if (updated) rematerializeScheduledInstances(db, updated);
+    });
+    return c.json({ series: loadCalendarSeries(db, s.accountId, series.id) });
+  });
+
+  app.post("/v1/calendar/series/:id/pause", async (c) => {
+    const s = requireSession(c);
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      return c.json({ error: "bad_request" }, 400);
+    }
+    if (!raw || typeof raw !== "object" || typeof (raw as { paused?: unknown }).paused !== "boolean") {
+      return c.json({ error: "bad_request" }, 400);
+    }
+    const paused = (raw as { paused: boolean }).paused;
+    const series = loadCalendarSeries(db, s.accountId, c.req.param("id"));
+    if (!series) return c.json({ error: "not_found" }, 404);
+    if (paused) {
+      if (series.status === "cancelled") return c.json({ error: "cancelled" }, 409);
+      if (series.status !== "paused") {
+        db.immediate(() => {
+          db.run(`UPDATE calendar_series SET status = 'paused', updated_at = ? WHERE id = ?`, [now(), series.id]);
+          suppressOpenCalendarInstances(db, series.id, "pause");
+        });
+      }
+    } else {
+      if (series.status === "active") return c.json({ series });
+      if (series.status !== "paused") return c.json({ error: "not_paused" }, 409);
+      if (nonCancelledSeriesCount(db, s.accountId, series.id) >= CAL_MAX_SERIES) {
+        return c.json({ error: "cap" }, 409);
+      }
+      db.immediate(() => {
+        db.run(`UPDATE calendar_series SET status = 'active', updated_at = ? WHERE id = ?`, [now(), series.id]);
+        const updated = loadCalendarSeries(db, s.accountId, series.id);
+        if (updated) rematerializeScheduledInstances(db, updated);
+      });
+    }
+    return c.json({ series: loadCalendarSeries(db, s.accountId, series.id) });
+  });
+
+  app.delete("/v1/calendar/series/:id", (c) => {
+    const s = requireSession(c);
+    const series = loadCalendarSeries(db, s.accountId, c.req.param("id"));
+    if (!series) return c.json({ error: "not_found" }, 404);
+    if (series.status !== "cancelled") {
+      db.immediate(() => {
+        db.run(`UPDATE calendar_series SET status = 'cancelled', updated_at = ? WHERE id = ?`, [now(), series.id]);
+        suppressOpenCalendarInstances(db, series.id, "cancel");
+      });
+    }
+    return c.json({ series: loadCalendarSeries(db, s.accountId, series.id) });
+  });
+
+  app.post("/v1/calendar/instances/:id/cancel", (c) => {
+    const s = requireSession(c);
+    const inst = db.get<CalendarInstanceRow & { account_id: string }>(
+      `SELECT i.*, s.account_id FROM calendar_instances i
+       JOIN calendar_series s ON s.id = i.series_id
+       WHERE i.id = ? AND s.account_id = ?`,
+      [c.req.param("id"), s.accountId],
+    );
+    if (!inst) return c.json({ error: "not_found" }, 404);
+    if (inst.status === "running") return c.json({ error: "in_flight" }, 409);
+    db.immediate(() => {
+      if (inst.status === "queued" && inst.turn_id) {
+        db.run(`UPDATE turns SET status = 'cancelled', finished_at = ? WHERE id = ? AND status = 'queued'`, [
+          now(),
+          inst.turn_id,
+        ]);
+      }
+      db.run(`UPDATE calendar_instances SET status = 'cancelled' WHERE id = ?`, [inst.id]);
+    });
+    const instance = db.get("SELECT * FROM calendar_instances WHERE id = ?", [inst.id]);
+    return c.json({ instance });
+  });
+
+  app.post("/v1/calendar/learn", async (c) => {
+    const s = requireSession(c);
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      return c.json({ error: "bad_request" }, 400);
+    }
+    const parsed = learnRoutineInput.safeParse(raw);
+    if (!parsed.success) return c.json({ error: "bad_request" }, 400);
+    const thread = db.get<{ id: string; bot_id: string; kind: string; title: string }>(
+      "SELECT id, bot_id, kind, title FROM threads WHERE id = ? AND account_id = ?",
+      [parsed.data.threadId, s.accountId],
+    );
+    if (!thread) return c.json({ error: "not_found" }, 404);
+    const assigneeId = parsed.data.botId ?? thread.bot_id;
+    const bot = resolveCalendarAssignee(db, s.accountId, assigneeId);
+    if ("error" in bot) return c.json({ error: bot.error }, bot.status);
+    if (nonCancelledSeriesCount(db, s.accountId) >= CAL_MAX_SERIES) return c.json({ error: "cap" }, 409);
+    const timezone = currentOrgMeta(db)?.timezone ?? "UTC";
+    const t = now();
+    const dtstartUtc = localNineTomorrow(timezone, t);
+    const messages = db
+      .all<{ role: string; origin: string; body: string }>(
+        `SELECT role, origin, body FROM messages
+         WHERE thread_id = ? AND origin NOT IN ('prompt', 'calendar')
+         ORDER BY created_at DESC LIMIT 20`,
+        [thread.id],
+      )
+      .reverse();
+    const lastTurn = db.get<{ id: string }>(
+      "SELECT id FROM turns WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1",
+      [thread.id],
+    );
+    const liveWork: string[] = [];
+    if (lastTurn) {
+      const events = db.all<{ kind: string; payload: string }>(
+        "SELECT kind, payload FROM live_work_events WHERE turn_id = ? ORDER BY seq ASC LIMIT 40",
+        [lastTurn.id],
+      );
+      for (const ev of events) {
+        const text = summarizeLiveEvent(ev.kind, parseLivePayload(ev.payload));
+        if (text) liveWork.push(text);
+      }
+    }
+    let pageUrl = "";
+    try {
+      const display = await ctx.engine.runnerFor(s.accountId).display();
+      pageUrl = display.pageUrl ?? "";
+    } catch {
+      pageUrl = "";
+    }
+    const { prompt, captureSummary } = stitchLearnPrompt({ messages, liveWork, pageUrl });
+    const title = thread.title.trim() || `Routine from ${bot.name}`;
+    const seriesId = id();
+    const requireHuman = calendarRequireHumanApproval(undefined, thread.kind, bot.require_human_approval);
+    db.run(
+      `INSERT INTO calendar_series (
+         id, account_id, title, prompt, assignee_bot_id, thread_id, kind, status, rrule,
+         dtstart_utc, timezone, require_human_approval, created_by, source_turn_id, source_thread_id,
+         capture_summary, min_interval_ms, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, 'routine', 'proposed', NULL, ?, ?, ?, 'learn', ?, ?, ?, ?, ?, ?)`,
+      [
+        seriesId,
+        s.accountId,
+        title,
+        prompt,
+        bot.id,
+        thread.id,
+        dtstartUtc,
+        timezone,
+        requireHuman ? 1 : 0,
+        lastTurn?.id ?? null,
+        thread.id,
+        captureSummary,
+        CAL_MIN_INTERVAL_MS,
+        t,
+        t,
+      ],
+    );
+    onPush(s.accountId, { type: "calendar.proposed", seriesId });
+    return c.json({ series: loadCalendarSeries(db, s.accountId, seriesId) }, 201);
   });
 
   async function purgeBot(c: { req: { json: () => Promise<unknown>; param: (n: string) => string } }, accountId: string) {
@@ -1611,6 +2017,311 @@ function activityForAccount(ctx: AppContext, accountId: string) {
         : null,
     };
   });
+}
+
+const CAL_SERIES_STATUSES = new Set(["proposed", "active", "paused", "cancelled"]);
+const CAL_SERIES_KINDS = new Set(["schedule", "routine"]);
+
+type CalendarSeriesRow = {
+  id: string;
+  account_id: string;
+  title: string;
+  prompt: string;
+  assignee_bot_id: string | null;
+  thread_id: string | null;
+  kind: string;
+  status: string;
+  rrule: string | null;
+  dtstart_utc: number;
+  timezone: string;
+  require_human_approval: number;
+  created_by: string;
+  created_by_bot_id: string | null;
+  source_turn_id: string | null;
+  source_thread_id: string | null;
+  capture_summary: string | null;
+  min_interval_ms: number;
+  last_fired_at: number | null;
+  next_due_at: number | null;
+  created_at: number;
+  updated_at: number;
+};
+
+type CalendarInstanceRow = {
+  id: string;
+  series_id: string;
+  scheduled_at: number;
+  status: string;
+  turn_id: string | null;
+  skipped_reason: string | null;
+  created_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+};
+
+type CalendarAssignee = {
+  id: string;
+  name: string;
+  require_human_approval: number;
+};
+
+function emptyToNull(value: string | null | undefined): string | null {
+  if (value == null) return null;
+  const t = value.trim();
+  return t ? t : null;
+}
+
+function clipText(value: string, max: number): string {
+  return value.length <= max ? value : value.slice(0, max);
+}
+
+function validateCalendarRrule(rrule: string | null): string | null {
+  if (rrule == null) return null;
+  try {
+    parseRrule(rrule);
+    return null;
+  } catch (err) {
+    return err instanceof RruleError ? err.code : "invalid_rrule";
+  }
+}
+
+function parseCalendarDtstart(raw: string | number, timeZone: string): number {
+  if (typeof raw === "number") {
+    if (!Number.isFinite(raw)) throw new RruleError("invalid_dtstart");
+    return Math.trunc(raw);
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) throw new RruleError("invalid_dtstart");
+  if (/^-?\d+$/.test(trimmed)) {
+    const n = Number(trimmed);
+    if (!Number.isFinite(n)) throw new RruleError("invalid_dtstart");
+    return n;
+  }
+  if (/Z$|[+-]\d{2}:?\d{2}$/i.test(trimmed)) {
+    const ms = Date.parse(trimmed);
+    if (!Number.isFinite(ms)) throw new RruleError("invalid_dtstart");
+    return ms;
+  }
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(trimmed);
+  if (!m) throw new RruleError("invalid_dtstart");
+  const utc = civilToUtc(
+    Number(m[1]),
+    Number(m[2]),
+    Number(m[3]),
+    m[4] != null ? Number(m[4]) : 0,
+    m[5] != null ? Number(m[5]) : 0,
+    timeZone,
+  );
+  if (utc == null) throw new RruleError("invalid_dtstart");
+  return utc;
+}
+
+function localNineTomorrow(timeZone: string, nowMs: number): number {
+  const later = utcToCivil(nowMs + 24 * 60 * 60 * 1000, timeZone);
+  for (const hour of [9, 10, 11, 8, 12]) {
+    const utc = civilToUtc(later.year, later.month, later.day, hour, 0, timeZone);
+    if (utc != null) return utc;
+  }
+  return nowMs + 24 * 60 * 60 * 1000;
+}
+
+function calendarRequireHumanApproval(
+  requested: boolean | undefined,
+  threadKind: string,
+  botFlag: number,
+): boolean {
+  return Boolean(requested) || threadKind === "group" || Boolean(botFlag);
+}
+
+function nonCancelledSeriesCount(db: OpenbotDb, accountId: string, excludeId?: string): number {
+  const row = excludeId
+    ? db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM calendar_series
+          WHERE account_id = ? AND status IN ('active', 'paused', 'proposed') AND id != ?`,
+        [accountId, excludeId],
+      )
+    : db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM calendar_series
+          WHERE account_id = ? AND status IN ('active', 'paused', 'proposed')`,
+        [accountId],
+      );
+  return row?.n ?? 0;
+}
+
+function loadCalendarSeries(db: OpenbotDb, accountId: string, seriesId: string): CalendarSeriesRow | undefined {
+  return db.get<CalendarSeriesRow>("SELECT * FROM calendar_series WHERE id = ? AND account_id = ?", [
+    seriesId,
+    accountId,
+  ]);
+}
+
+function resolveCalendarAssignee(
+  db: OpenbotDb,
+  accountId: string,
+  botId: string,
+): CalendarAssignee | { error: string; status: 400 | 404 } {
+  const bot = db.get<{
+    id: string;
+    name: string;
+    status: string;
+    role: string | null;
+    require_human_approval: number;
+  }>("SELECT id, name, status, role, require_human_approval FROM bots WHERE id = ? AND account_id = ?", [
+    botId,
+    accountId,
+  ]);
+  if (!bot) return { error: "not_found", status: 404 };
+  if (isGatewayRole(bot.role) || bot.status !== "active") return { error: "invalid_assignee", status: 400 };
+  return { id: bot.id, name: bot.name, require_human_approval: bot.require_human_approval };
+}
+
+function resolveCalendarThread(
+  db: OpenbotDb,
+  accountId: string,
+  botId: string,
+  threadId?: string | null,
+): { id: string; kind: string } | { error: string; status: 400 | 404 } {
+  if (threadId) {
+    const thread = db.get<{ id: string; kind: string }>(
+      "SELECT id, kind FROM threads WHERE id = ? AND account_id = ?",
+      [threadId, accountId],
+    );
+    if (!thread) return { error: "not_found", status: 404 };
+    return thread;
+  }
+  const dm = humanThread(db, botId);
+  if (!dm || dm.account_id !== accountId) return { error: "not_found", status: 404 };
+  return { id: dm.id, kind: "human" };
+}
+
+function suppressOpenCalendarInstances(db: OpenbotDb, seriesId: string, mode: "pause" | "cancel"): void {
+  const t = now();
+  const next = mode === "pause" ? "skipped_paused" : "cancelled";
+  db.run(
+    `UPDATE calendar_instances SET status = ? WHERE series_id = ? AND status IN ('scheduled', 'due')`,
+    [next, seriesId],
+  );
+  const queued = db.all<{ id: string; turn_id: string | null }>(
+    `SELECT id, turn_id FROM calendar_instances WHERE series_id = ? AND status = 'queued'`,
+    [seriesId],
+  );
+  for (const inst of queued) {
+    if (inst.turn_id) {
+      db.run(`UPDATE turns SET status = 'cancelled', finished_at = ? WHERE id = ? AND status = 'queued'`, [
+        t,
+        inst.turn_id,
+      ]);
+    }
+    db.run(`UPDATE calendar_instances SET status = ? WHERE id = ?`, [next, inst.id]);
+  }
+}
+
+function rematerializeScheduledInstances(db: OpenbotDb, series: CalendarSeriesRow): void {
+  const t = now();
+  const queued = db.all<{ id: string; turn_id: string | null }>(
+    `SELECT id, turn_id FROM calendar_instances WHERE series_id = ? AND status = 'queued'`,
+    [series.id],
+  );
+  for (const inst of queued) {
+    if (inst.turn_id) {
+      db.run(`UPDATE turns SET status = 'cancelled', finished_at = ? WHERE id = ? AND status = 'queued'`, [
+        t,
+        inst.turn_id,
+      ]);
+    }
+    db.run(`UPDATE calendar_instances SET status = 'cancelled' WHERE id = ?`, [inst.id]);
+  }
+  db.run(`DELETE FROM calendar_instances WHERE series_id = ? AND status IN ('scheduled', 'due')`, [series.id]);
+  let times: number[] = [];
+  try {
+    const horizon = materializeHorizon({
+      dtstartUtc: series.dtstart_utc,
+      timezone: series.timezone,
+      rrule: series.rrule,
+      nowMs: t,
+    });
+    times = [...(horizon.catchup != null ? [horizon.catchup] : []), ...horizon.future];
+  } catch {
+    if (series.dtstart_utc >= t) times = [series.dtstart_utc];
+  }
+  const seen = new Set<number>();
+  for (const scheduledAt of times) {
+    if (seen.has(scheduledAt)) continue;
+    seen.add(scheduledAt);
+    const exists = db.get("SELECT id FROM calendar_instances WHERE series_id = ? AND scheduled_at = ?", [
+      series.id,
+      scheduledAt,
+    ]);
+    if (exists) continue;
+    db.run(
+      `INSERT INTO calendar_instances (id, series_id, scheduled_at, status, created_at)
+       VALUES (?, ?, ?, 'scheduled', ?)`,
+      [id(), series.id, scheduledAt, t],
+    );
+  }
+  const next = db.get<{ scheduled_at: number }>(
+    `SELECT scheduled_at FROM calendar_instances
+      WHERE series_id = ? AND status IN ('scheduled', 'due')
+      ORDER BY scheduled_at LIMIT 1`,
+    [series.id],
+  );
+  db.run(`UPDATE calendar_series SET next_due_at = ?, updated_at = ? WHERE id = ?`, [
+    next?.scheduled_at ?? null,
+    t,
+    series.id,
+  ]);
+}
+
+function nextCalendarFireUtc(db: OpenbotDb, series: CalendarSeriesRow): number | null {
+  const inst = db.get<{ scheduled_at: number }>(
+    `SELECT scheduled_at FROM calendar_instances
+      WHERE series_id = ? AND status IN ('scheduled', 'due') AND scheduled_at >= ?
+      ORDER BY scheduled_at LIMIT 1`,
+    [series.id, now()],
+  );
+  if (inst) return inst.scheduled_at;
+  try {
+    const horizon = materializeHorizon({
+      dtstartUtc: series.dtstart_utc,
+      timezone: series.timezone,
+      rrule: series.rrule,
+      nowMs: now(),
+    });
+    if (horizon.future.length) return horizon.future[0]!;
+    if (horizon.catchup != null && horizon.catchup >= now()) return horizon.catchup;
+  } catch {
+    /* fall through */
+  }
+  return series.dtstart_utc >= now() ? series.dtstart_utc : null;
+}
+
+function stitchLearnPrompt(opts: {
+  messages: Array<{ role: string; origin: string; body: string }>;
+  liveWork: string[];
+  pageUrl: string;
+}): { prompt: string; captureSummary: string } {
+  const transcriptLines = opts.messages.map((m) => `${m.role}: ${clipText(m.body, 1500)}`);
+  const prompt = clipText(
+    [
+      "Repeat this workflow:",
+      "Transcript:",
+      transcriptLines.join("\n") || "(none)",
+      "Live work:",
+      opts.liveWork.join("\n") || "(none)",
+      `Page: ${opts.pageUrl}`,
+    ].join("\n"),
+    32_000,
+  );
+  const captureSummary = JSON.stringify({
+    transcript: opts.messages.map((m) => ({
+      role: m.role,
+      origin: m.origin,
+      body: clipText(m.body, 1500),
+    })),
+    liveWork: opts.liveWork,
+    pageUrl: opts.pageUrl,
+  });
+  return { prompt, captureSummary };
 }
 
 function healthPayload(ctx: AppContext, accountId: string) {

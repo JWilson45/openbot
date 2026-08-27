@@ -128,6 +128,42 @@ describe("roster", () => {
     server.stop(true);
   });
 
+  test("archive pauses assignee calendar series; restore does not unpause", async () => {
+    process.env.OPENBOT_ACP_COMMAND = fakeAgentCommand();
+    const { ctx, server, origin } = startTestServer({ home: tempHome() });
+    const { cookie } = loginCookie({ ctx }, "alice");
+    const headers = { cookie, "content-type": "application/json" };
+    const created = (await fetch(`${origin}/v1/bots`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name: "Ada" }),
+    }).then((r) => r.json())) as { bot: { id: string } };
+    const seriesId = (await fetch(`${origin}/v1/calendar/series`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        title: "mail",
+        prompt: "summarize",
+        botId: created.bot.id,
+        dtstart: Date.now() + 86_400_000,
+      }),
+    }).then((r) => r.json())) as { series: { id: string; status: string } };
+    expect(seriesId.series.status).toBe("active");
+
+    const arch = await fetch(`${origin}/v1/bots/${created.bot.id}/archive`, { method: "POST", headers });
+    expect(arch.status).toBe(200);
+    expect(
+      ctx.db.get<{ status: string }>("SELECT status FROM calendar_series WHERE id = ?", [seriesId.series.id])?.status,
+    ).toBe("paused");
+
+    const restored = await fetch(`${origin}/v1/bots/${created.bot.id}/restore`, { method: "POST", headers });
+    expect(restored.status).toBe(200);
+    expect(
+      ctx.db.get<{ status: string }>("SELECT status FROM calendar_series WHERE id = ?", [seriesId.series.id])?.status,
+    ).toBe("paused");
+    server.stop(true);
+  });
+
   test("Gateway is a sidecar, not a desk slot, and locked fields 409", async () => {
     process.env.OPENBOT_ACP_COMMAND = fakeAgentCommand();
     const { ctx, server, origin } = startTestServer({ home: tempHome() });

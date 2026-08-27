@@ -64,6 +64,40 @@ export const postMessageInput = z.object({
   body: z.string().min(1).max(32_000),
 });
 
+export const createCalendarSeriesInput = z.object({
+  title: z.string().trim().min(1).max(200),
+  prompt: z.string().min(1).max(32_000),
+  botId: z.string().min(1),
+  dtstart: z.union([z.number().int(), z.string().min(1)]),
+  timezone: z.string().min(1).max(80).optional(),
+  rrule: z.string().max(512).nullable().optional(),
+  threadId: z.string().min(1).optional(),
+  requireHumanApproval: z.boolean().optional(),
+});
+
+export type CreateCalendarSeriesInput = z.infer<typeof createCalendarSeriesInput>;
+
+export const patchCalendarSeriesInput = z.object({
+  title: z.string().trim().min(1).max(200).optional(),
+  prompt: z.string().min(1).max(32_000).optional(),
+  botId: z.string().min(1).optional(),
+  dtstart: z.union([z.number().int(), z.string().min(1)]).optional(),
+  timezone: z.string().min(1).max(80).optional(),
+  rrule: z.string().max(512).nullable().optional(),
+  threadId: z.string().min(1).nullable().optional(),
+  requireHumanApproval: z.boolean().optional(),
+  status: z.enum(["active", "paused", "cancelled"]).optional(),
+});
+
+export type PatchCalendarSeriesInput = z.infer<typeof patchCalendarSeriesInput>;
+
+export const learnRoutineInput = z.object({
+  threadId: z.string().min(1),
+  botId: z.string().min(1).optional(),
+});
+
+export type LearnRoutineInput = z.infer<typeof learnRoutineInput>;
+
 export const createGroupThreadInput = z.object({
   kind: z.literal("group"),
   title: z.string().max(200).optional(),
