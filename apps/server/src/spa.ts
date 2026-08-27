@@ -266,12 +266,12 @@ export const SPA_HTML = `<!DOCTYPE html>
     #tk-nav input { width: auto; flex: 1 1 auto; min-width: 0; }
     #tk-nav button { flex: 0 0 auto; }
     .tk-stage {
-      min-height: 0; background: #11161e; display: flex; align-items: center; justify-content: center;
+      min-height: 0; background: #11161e; position: relative; overflow: hidden;
     }
     .modal-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; flex: 0 0 auto; }
     #takeover-frame {
-      width: auto; height: auto; max-width: 100%; max-height: 100%;
-      object-fit: contain; background: #11161e; display: block; border: 0; border-radius: 0;
+      display: block; width: 100%; height: 100%;
+      background: #11161e; border: 0; border-radius: 0;
     }
     .empty { margin: auto; text-align: center; color: var(--muted); padding: 24px; }
     .side-toggle { display: none; }
@@ -2867,35 +2867,56 @@ export const SPA_HTML = `<!DOCTYPE html>
       </div>
     </div></div>\`);
     overlay.querySelector('.modal').setAttribute('aria-labelledby', 'tk-title');
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(proto + '://' + location.host + '/v1/takeover');
-    ws.binaryType = 'arraybuffer';
-    const close = openOverlay(overlay, () => { try { ws.close(); } catch {} window.removeEventListener('resize', sendViewport); });
-    function endTakeover() { try { ws.close(); } catch {} window.removeEventListener('resize', sendViewport); close(); }
-    overlay.querySelector('#done').onclick = endTakeover;
     const canvas = overlay.querySelector('#takeover-frame');
     canvas.tabIndex = 0;
+    const stage = overlay.querySelector('.tk-stage');
+    let ws = null;
+    let viewportTimer = 0;
+    let frameUrl = '';
+    function sendViewport() {
+      if (!ws || ws.readyState !== 1 || !stage) return;
+      const r = stage.getBoundingClientRect();
+      const w = Math.round(r.width);
+      const h = Math.round(r.height);
+      if (w < 40 || h < 40) return;
+      if (canvas.width !== w) canvas.width = w;
+      if (canvas.height !== h) canvas.height = h;
+      ws.send(JSON.stringify({ type:'viewport', width: w, height: h }));
+    }
+    function scheduleViewport() {
+      clearTimeout(viewportTimer);
+      viewportTimer = setTimeout(sendViewport, 50);
+    }
+    const ro = new ResizeObserver(scheduleViewport);
+    function cleanupTk() {
+      try { if (ws) ws.close(); } catch {}
+      window.removeEventListener('resize', scheduleViewport);
+      try { ro.disconnect(); } catch {}
+      clearTimeout(viewportTimer);
+    }
+    const close = openOverlay(overlay, cleanupTk);
+    function endTakeover() { close(); }
+    overlay.querySelector('#done').onclick = endTakeover;
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(proto + '://' + location.host + '/v1/takeover');
+    ws.binaryType = 'arraybuffer';
     overlay.querySelector('#tk-nav').onsubmit = (e) => {
       e.preventDefault();
       let url = String(overlay.querySelector('#tk-url').value || '').trim();
       if (!url) return;
       if (!/^https?:\\/\\//i.test(url)) url = 'https://' + url;
       overlay.querySelector('#tk-url').value = url;
-      ws.send(JSON.stringify({ type:'navigate', url }));
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type:'navigate', url }));
     };
-    function sendViewport() {
-      const stage = overlay.querySelector('.tk-stage');
-      if (!stage || ws.readyState !== 1) return;
-      const r = stage.getBoundingClientRect();
-      if (r.width < 40 || r.height < 40) return;
-      ws.send(JSON.stringify({ type:'viewport', width: Math.round(r.width), height: Math.round(r.height) }));
-    }
     ws.onopen = () => {
       ws.send(JSON.stringify({ type:'auth', ticket: t.ticket }));
-      setTimeout(sendViewport, 200);
+      requestAnimationFrame(function() {
+        sendViewport();
+        requestAnimationFrame(sendViewport);
+      });
     };
-    window.addEventListener('resize', sendViewport);
-    let frameUrl = '';
+    ro.observe(stage);
+    window.addEventListener('resize', scheduleViewport);
     ws.onmessage = (ev) => {
       if (typeof ev.data === 'string') {
         const msg = JSON.parse(ev.data);
@@ -2910,10 +2931,6 @@ export const SPA_HTML = `<!DOCTYPE html>
         const blob = new Blob([ev.data], { type: 'image/jpeg' });
         const img = new Image();
         img.onload = () => {
-          if (img.width && img.height && (canvas.width !== img.width || canvas.height !== img.height)) {
-            canvas.width = img.width;
-            canvas.height = img.height;
-          }
           const ctx = canvas.getContext('2d');
           ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
           if (frameUrl) URL.revokeObjectURL(frameUrl);

@@ -79,6 +79,10 @@ describe("CDP + takeover", () => {
       expect(runner.lastDispatchedInput).toBeTruthy();
       expect(runner.lastDispatchedInput?.type).toBe("mouse");
       expect(runner.screencastFrames).toBeGreaterThan(0);
+      session.ws.send(JSON.stringify({ type: "viewport", width: 1600, height: 900 }));
+      const vpStart = Date.now();
+      while (Date.now() - vpStart < 2000 && runner.browser?.viewport?.width !== 1600) await Bun.sleep(40);
+      expect(runner.browser?.viewport).toEqual({ width: 1600, height: 900 });
       session.ws.close();
     }
 

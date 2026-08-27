@@ -14,6 +14,16 @@ import { botProjectDir, deleteBotProject, ensureBotProject, ensureGatewayWorkspa
 export const DEFAULT_ACP_IDLE_MS = 10 * 60 * 1000;
 export const DEFAULT_GATEWAY_ACP_IDLE_MS = 30 * 60 * 1000;
 export const BROWSER_SNAPSHOT_MAX_CHARS = 12_000;
+export const BROWSER_VIEWPORT_MIN = { width: 640, height: 400 };
+export const BROWSER_VIEWPORT_MAX = { width: 2560, height: 1440 };
+export const BROWSER_VIEWPORT_DEFAULT = { width: 1280, height: 720 };
+
+function clampViewport(width: number, height: number): { width: number; height: number } {
+  return {
+    width: Math.max(BROWSER_VIEWPORT_MIN.width, Math.min(BROWSER_VIEWPORT_MAX.width, Math.round(width))),
+    height: Math.max(BROWSER_VIEWPORT_MIN.height, Math.min(BROWSER_VIEWPORT_MAX.height, Math.round(height))),
+  };
+}
 
 function envTtlMs(raw: string | undefined, fallback: number): number {
   if (raw == null || raw === "") return fallback;
@@ -77,6 +87,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   permissionMode: "ask" | "auto" | "always-approve" = "auto";
   lastDispatchedInput: Record<string, unknown> | null = null;
   screencastFrames = 0;
+  viewportTimer: ReturnType<typeof setTimeout> | null = null;
   browserLock: Promise<void> = Promise.resolve();
   onScreencastFrame?: (jpeg: Uint8Array, meta: { pageUrl?: string; pageOrigin?: string }) => void;
   onLiveWork?: (ev: LiveWorkEvent, botId?: string) => void;
@@ -286,48 +297,66 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
       if (!p.data) return;
       const jpeg = Buffer.from(p.data, "base64");
       this.screencastFrames += 1;
-      if (p.metadata?.deviceWidth && p.metadata?.deviceHeight) {
-        this.browser!.viewport = { width: p.metadata.deviceWidth, height: p.metadata.deviceHeight };
-      }
       const info = await cdpPageInfo(this.browser!.cdpUrl).catch(() => ({}));
       this.onScreencastFrame?.(jpeg, info);
     });
     this.browser!.screencast = conn;
     await conn.send("Page.enable");
     await conn.send("Runtime.enable");
-    const vp = this.browser!.viewport ?? { width: 1280, height: 720 };
-    await conn.send("Emulation.setDeviceMetricsOverride", {
-      width: vp.width,
-      height: vp.height,
-      deviceScaleFactor: 1,
-      mobile: false,
-    });
+    const vp = this.browser!.viewport ?? BROWSER_VIEWPORT_DEFAULT;
+    await this.applyViewportToCdp(conn, vp.width, vp.height);
     await conn.send("Page.startScreencast", {
       format: "jpeg",
       quality: 70,
-      maxWidth: Math.max(vp.width, 1280),
-      maxHeight: Math.max(vp.height, 720),
+      maxWidth: BROWSER_VIEWPORT_MAX.width,
+      maxHeight: BROWSER_VIEWPORT_MAX.height,
       everyNthFrame: 1,
     });
   }
 
   async setScreencastViewport(width: number, height: number): Promise<void> {
-    const w = Math.max(640, Math.min(2560, Math.round(width)));
-    const h = Math.max(400, Math.min(1440, Math.round(height)));
+    const vp = clampViewport(width, height);
     if (!this.browser) return;
-    this.browser.viewport = { width: w, height: h };
+    const same =
+      this.browser.viewport.width === vp.width && this.browser.viewport.height === vp.height;
+    this.browser.viewport = vp;
     const conn = this.browser.screencast;
     if (!conn) return;
+    if (same) return;
+    if (this.viewportTimer) clearTimeout(this.viewportTimer);
+    this.viewportTimer = setTimeout(() => {
+      this.viewportTimer = null;
+      if (this.browser?.screencast !== conn) return;
+      void this.applyViewportToCdp(conn, vp.width, vp.height);
+    }, 80);
+  }
+
+  private async applyViewportToCdp(conn: CdpConn, width: number, height: number): Promise<void> {
     await conn.send("Emulation.setDeviceMetricsOverride", {
-      width: w,
-      height: h,
+      width,
+      height,
       deviceScaleFactor: 1,
       mobile: false,
     });
+    try {
+      const win = (await conn.send("Browser.getWindowForTarget")) as { windowId?: number };
+      if (win?.windowId != null) {
+        await conn.send("Browser.setWindowBounds", {
+          windowId: win.windowId,
+          bounds: { width, height, windowState: "normal" },
+        });
+      }
+    } catch {
+      /* headless may not expose a window */
+    }
   }
 
   stopTakeover(): void {
     this.onScreencastFrame = undefined;
+    if (this.viewportTimer) {
+      clearTimeout(this.viewportTimer);
+      this.viewportTimer = null;
+    }
     if (this.browser) {
       this.browser.takeoverActive = false;
       const conn = this.browser.screencast;
@@ -355,7 +384,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
       cdpUrl: `http://127.0.0.1:${port}`,
       userDataDir,
       takeoverActive: false,
-      viewport: { width: 1280, height: 720 },
+      viewport: { ...BROWSER_VIEWPORT_DEFAULT },
     };
     return this.browser;
   }
@@ -688,7 +717,7 @@ async function launchChromium(
       "--disable-gpu",
       "--no-first-run",
       "--disable-extensions",
-      "--window-size=1280,720",
+      `--window-size=${BROWSER_VIEWPORT_MAX.width},${BROWSER_VIEWPORT_MAX.height}`,
       "about:blank",
     ],
     stdout: "pipe",

@@ -42,6 +42,10 @@ describe("desk SPA markup", () => {
     expect(html).toContain("overlay.tk");
     expect(html).toContain("type:'navigate'");
     expect(html).toContain("type:'viewport'");
+    expect(html).toContain("ResizeObserver");
+    expect(html).toContain("requestAnimationFrame");
+    expect(html).toContain("width: 100%; height: 100%");
+    expect(html).not.toContain("object-fit: contain");
     expect(html).toContain("Type DELETE to confirm wipe");
     expect(html).toContain("open-archive");
     expect(html).toContain("Archive");
