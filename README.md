@@ -18,7 +18,7 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 - **Closing this browser tab does not stop your teammate.** A turn the calendar already queued keeps running.
 - **Stopping `openbot server` / `openbot demo` does.** Stopping the **VM** that runs it makes that org **unreachable** until it boots again. Peers see timeouts, not a hosted retry. sqlite, `org.ed25519`, and inbox rows stay on disk. Stopping the process stops the **clock and the turn**.
 - If you want work to continue while a laptop is closed, run the server on a machine that stays up (VPS, home server, systemd) — not on the laptop you are about to shut.
-- **The calendar runs only while `openbot server` runs.** Closed laptop / stopped unit / stopped VM: the 9am did not happen. At most one catch-up if down less than a day. OpenBot will not replay a weekend of missed summaries.
+- **The calendar runs only while `openbot server` / `openbot demo` runs.** Closed laptop / stopped unit / stopped VM: the 9am did not happen. At most one catch-up if down less than a day. OpenBot will not replay a weekend of missed summaries. “9am” is the org IANA timezone in Settings (default `UTC`; not browser detect).
 - **Watch-me-do-it v1 is not a recording.** **Learn this** drafts a proposed calendar event from a thread. You edit it. No click replay.
 - **This is not Google Calendar.** No sync. No invites. Org-local sqlite.
 - **Schedules and learned routines are two products** on the same grid.
@@ -219,6 +219,10 @@ bun run openbot server --origin https://desk.example.com
 - Live work (thinking, tools) is the right sidebar; drag the handle to resize. **Activity** is a folder in the rail for every teammate at once.
 - **Handoff** threads are the A2A log (read-only from the human UI). Message a bot from their human DM.
 
+### Calendar
+
+**Calendar** is a Library folder (agenda + month). **New event** is a schedule. **Learn this** on a human DM or group drafts a proposed routine you confirm. Org timezone is Settings (IANA; default `UTC`, not from the browser).
+
 ### Takeover
 
 **Takeover** shows the shared Chromium. `about:blank` means no page is open yet. Esc or **Close** ends takeover. One browser, mutexed with bot browser tools.
@@ -248,7 +252,7 @@ Control dir is `~/.openbot`. Each org profile is its own data root (`$OPENBOT_HO
 | `~/.openbot/profiles.json` | Slug → data dir map and current profile |
 | `~/.openbot/orgs/<slug>/` | Default data root for a named org |
 | `~/.openbot/openbot.sqlite` | Legacy single-home layout (still valid; first `org init <slug>` adopts it) |
-| `$OPENBOT_HOME/openbot.sqlite` | Bots, threads, turns, messages, live-work, sessions, `org_meta`, `org_peers`, `org_inbox` |
+| `$OPENBOT_HOME/openbot.sqlite` | Bots, threads, turns, messages, live-work, sessions, `org_meta` (incl. timezone), `org_peers`, `org_inbox`, `calendar_series`, `calendar_instances` |
 | `org.json` | Optional org slug/name/origin. DB wins once written; `org init` rewrites this file. |
 | `org.ed25519` | Sealed Ed25519 org key (mode 0600). Not under `desk/`. Not a `credentials` row. |
 | `master.key` | Vault master (mode 0600). Not under `desk/` |
@@ -304,7 +308,7 @@ Cookie session (`openbot_session`) or `Authorization: Bearer` (session token or 
 | `GET` | `/v1/healthz` `/v1/readyz` | Liveness / SQLite + desk writable |
 | `GET` | `/v1/me` | Current user |
 | `GET` | `/fed/v1/info` | Public-ish org identity + pubkey. Rate-limited. No cookies. |
-| `GET`/`PATCH` | `/v1/org` | Member snapshot; `{ federationEnabled }` (cookie, not `sk-ob_`) |
+| `GET`/`PATCH` | `/v1/org` | Member snapshot; `{ federationEnabled, timezone }` (cookie, not `sk-ob_`). Timezone is IANA; default `UTC` |
 | `GET`/`POST`/`DELETE` | `/v1/org/peers` | Allowlist. `POST /v1/org/peers/from-info` is preview only |
 | `GET` | `/v1/org/inbox` | Trusted mail only (`pending` / `held`). Untrusted solicits are Gateway-DM `origin=system` + `fed.solicit` |
 | `POST` | `/fed/v1/messages` | Signed inbound mail (JWS). 403 when federation is off (trusted → `held`) |
@@ -318,6 +322,7 @@ Cookie session (`openbot_session`) or `Authorization: Bearer` (session token or 
 | `POST` | `/v1/threads/:id/messages` | Queue a turn (`202`) |
 | `GET` | `/v1/turns/:id/live-work` | Tool / thought events |
 | `GET` | `/v1/activity` | Team presence |
+| `GET`/`POST`/`PATCH`/`DELETE` | `/v1/calendar…` | Cookie, not `sk-ob_`. Window `GET /v1/calendar?from=&to=`; series CRUD, confirm, pause; instance cancel; `POST /learn` |
 | `POST` | `/v1/compute/takeover` | Mint takeover ticket |
 | `POST` | `/v1/compute/wipe` | Body `{ confirm: "DELETE" }` |
 | `POST` | `/v1/api-keys` | Mint OpenAI-compatible key (shown once) |
