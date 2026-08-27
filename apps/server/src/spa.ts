@@ -179,7 +179,7 @@ export const SPA_HTML = `<!DOCTYPE html>
     .cal-cell.out { opacity: .45; }
     .cal-cell.today { border-color: var(--acc); }
     .cal-cell .num { font-size: .78rem; color: var(--muted); }
-    .cal-chip { display: block; width: 100%; text-align: left; font-size: .75rem; padding: 4px 6px; min-height: 32px; margin: 2px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .cal-chip { display: block; width: 100%; text-align: left; font-size: .75rem; padding: 4px 6px; min-height: 44px; margin: 2px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: normal; }
     .cal-chip.muted { opacity: .65; }
     .cal-nav { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0 0 10px; }
     .org-row, .peer-row {
@@ -1349,10 +1349,22 @@ export const SPA_HTML = `<!DOCTYPE html>
     const p = tzParts(ms, tz);
     return p.year + '-' + pad2(p.month) + '-' + pad2(p.day);
   }
+  function zoneShort(ms, tz) {
+    try {
+      const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'short' }).formatToParts(new Date(Number(ms) || Date.now()));
+      const p = parts.find(x => x.type === 'timeZoneName');
+      if (p && p.value) return p.value;
+    } catch {}
+    return tz;
+  }
+  function fmtClockTz(ms, tz) {
+    const p = tzParts(ms, tz);
+    return pad2(p.hour) + ':' + pad2(p.minute) + ' ' + zoneShort(ms, tz);
+  }
   function fmtWhenTz(ms, tz) {
     if (!ms) return '';
     const p = tzParts(ms, tz);
-    return p.weekday + ' ' + p.month + '/' + p.day + ' ' + pad2(p.hour) + ':' + pad2(p.minute);
+    return p.weekday + ' ' + p.month + '/' + p.day + ' ' + pad2(p.hour) + ':' + pad2(p.minute) + ' ' + tz;
   }
   function toLocalInput(ms, tz) {
     const p = tzParts(ms, tz);
@@ -1515,8 +1527,7 @@ export const SPA_HTML = `<!DOCTYPE html>
       }
       const s = seriesById(i.series_id);
       const note = instNote(i);
-      const tp = tzParts(i.scheduled_at, tz);
-      html += '<button type="button" class="cal-item' + (instMuted(i) ? ' muted' : '') + '" data-series="' + escapeHtml(i.series_id) + '" data-inst="' + escapeHtml(i.id) + '"><strong>' + escapeHtml((s && s.title) || 'Event') + '</strong> <span class="muted">' + pad2(tp.hour) + ':' + pad2(tp.minute) + (s ? ' · ' + escapeHtml(kindBadge(s)) + ' · ' + escapeHtml(botName(s.assignee_bot_id)) : '') + (note ? ' · ' + escapeHtml(note) : '') + '</span></button>';
+      html += '<button type="button" class="cal-item' + (instMuted(i) ? ' muted' : '') + '" data-series="' + escapeHtml(i.series_id) + '" data-inst="' + escapeHtml(i.id) + '"><strong>' + escapeHtml((s && s.title) || 'Event') + '</strong> <span class="muted">' + escapeHtml(fmtClockTz(i.scheduled_at, tz)) + (s ? ' · ' + escapeHtml(kindBadge(s)) + ' · ' + escapeHtml(botName(s.assignee_bot_id)) : '') + (note ? ' · ' + escapeHtml(note) : '') + '</span></button>';
     }
     if (lastDay) html += '</div>';
     body.innerHTML = html;
@@ -1553,8 +1564,7 @@ export const SPA_HTML = `<!DOCTYPE html>
       const list = (inMonth && byDay.get(key)) || [];
       for (const i of list) {
         const s = seriesById(i.series_id);
-        const p = tzParts(i.scheduled_at, tz);
-        html += '<button type="button" class="cal-chip' + (instMuted(i) ? ' muted' : '') + '" data-series="' + escapeHtml(i.series_id) + '" data-inst="' + escapeHtml(i.id) + '">' + pad2(p.hour) + ':' + pad2(p.minute) + ' ' + escapeHtml((s && s.title) || 'Event') + '</button>';
+        html += '<button type="button" class="cal-chip' + (instMuted(i) ? ' muted' : '') + '" data-series="' + escapeHtml(i.series_id) + '" data-inst="' + escapeHtml(i.id) + '">' + escapeHtml(fmtClockTz(i.scheduled_at, tz) + ' ' + ((s && s.title) || 'Event')) + '</button>';
       }
       html += '</div>';
     }
@@ -1596,23 +1606,36 @@ export const SPA_HTML = `<!DOCTYPE html>
     } catch {}
     if (!series) return;
     const inst = instanceId ? (instances.find(i => i.id === instanceId) || (state.calendar.instances || []).find(i => i.id === instanceId)) : null;
-    const lastRun = instances.find(i => i.turn_id);
-    const tz = series.timezone || orgTimezone();
+    let lastRun = null;
+    for (const i of instances) {
+      if (!i.turn_id) continue;
+      if (i.status !== 'completed' && i.status !== 'failed' && i.status !== 'running') continue;
+      if (!lastRun || Number(i.scheduled_at) > Number(lastRun.scheduled_at)) lastRun = i;
+    }
+    const orgTz = orgTimezone();
+    const seriesTz = series.timezone || orgTz;
     const running = inst && inst.status === 'running';
+    const canCancelOcc = inst && (inst.status === 'scheduled' || inst.status === 'due' || inst.status === 'queued');
+    const cancelled = series.status === 'cancelled';
+    function whenBoth(ms) {
+      let s = fmtWhenTz(ms, orgTz);
+      if (seriesTz && seriesTz !== orgTz) s += ' · ' + fmtWhenTz(ms, seriesTz);
+      return s;
+    }
     const overlay = h('<div class="overlay"><div class="modal">' +
       '<h2 id="cal-d-title">' + escapeHtml(series.title) + '</h2>' +
       '<p class="muted">' + escapeHtml(kindBadge(series)) + (series.status && series.status !== 'proposed' && series.status !== 'active' ? ' · ' + escapeHtml(series.status) : '') + '</p>' +
       '<p>' + escapeHtml(rruleProse(series.rrule)) + '</p>' +
       '<p class="muted">Assignee · ' + escapeHtml(botName(series.assignee_bot_id)) + '</p>' +
-      (lastRun && lastRun.turn_id ? '<p><button type="button" class="linkish" id="cal-last-run">Last run ' + escapeHtml(fmtWhenTz(lastRun.finished_at || lastRun.started_at || lastRun.scheduled_at, tz)) + '</button></p>' : '') +
-      (nextFire ? '<p class="muted">Next fire · ' + escapeHtml(fmtWhenTz(nextFire, tz)) + '</p>' : '') +
+      (lastRun && lastRun.turn_id ? '<p><button type="button" class="linkish" id="cal-last-run">Last run ' + escapeHtml(whenBoth(lastRun.finished_at || lastRun.started_at || lastRun.scheduled_at)) + '</button></p>' : '') +
+      (nextFire ? '<p class="muted">Next fire · ' + escapeHtml(whenBoth(nextFire)) + '</p>' : '') +
       (running ? '<p class="muted">In-flight — this run will finish.</p>' : '') +
       '<p class="err" id="cal-d-err" hidden></p>' +
       '<div class="modal-actions">' +
-      (series.status === 'proposed' ? '' : '<button type="button" id="cal-pause">' + (series.status === 'paused' ? 'Resume' : 'Pause') + '</button>') +
-      '<button type="button" id="cal-edit">Edit</button>' +
-      (inst && !running ? '<button type="button" id="cal-del-occ">Delete this occurrence</button>' : '') +
-      '<button type="button" id="cal-del-series">Delete this series</button>' +
+      (series.status === 'proposed' || cancelled ? '' : '<button type="button" id="cal-pause">' + (series.status === 'paused' ? 'Resume' : 'Pause') + '</button>') +
+      (cancelled ? '' : '<button type="button" id="cal-edit">Edit</button>') +
+      (canCancelOcc ? '<button type="button" id="cal-del-occ">Delete this occurrence</button>' : '') +
+      (cancelled ? '' : '<button type="button" id="cal-del-series">Delete this series</button>') +
       '<button type="button" class="primary" id="cal-d-close">Close</button>' +
       '</div></div></div>');
     overlay.querySelector('.modal').setAttribute('aria-labelledby', 'cal-d-title');
@@ -1638,7 +1661,8 @@ export const SPA_HTML = `<!DOCTYPE html>
         err.textContent = e.message || 'Could not pause';
       }
     };
-    overlay.querySelector('#cal-edit').onclick = () => { close(); openEventForm(series); };
+    const editBtn = overlay.querySelector('#cal-edit');
+    if (editBtn) editBtn.onclick = () => { close(); openEventForm(series); };
     const delOcc = overlay.querySelector('#cal-del-occ');
     if (delOcc) delOcc.onclick = async () => {
       const ok = await askConfirm({ title: 'Delete this occurrence?', body: 'This occurrence will not fire. The rest of the series stays.', confirmLabel: 'Delete occurrence' });
@@ -1659,7 +1683,8 @@ export const SPA_HTML = `<!DOCTYPE html>
         err.textContent = e.message || 'Could not cancel';
       }
     };
-    overlay.querySelector('#cal-del-series').onclick = async () => {
+    const delSeries = overlay.querySelector('#cal-del-series');
+    if (delSeries) delSeries.onclick = async () => {
       const ok = await askConfirm({ title: 'Delete this series?', body: 'This series will stop. History stays.', confirmLabel: 'Delete series' });
       if (!ok) return;
       try {
@@ -2490,6 +2515,7 @@ export const SPA_HTML = `<!DOCTYPE html>
         const res = await api('/v1/org', { method:'PATCH', body: JSON.stringify({ timezone: tz }) });
         state.org = res;
         err.hidden = true;
+        if (state.view === 'calendar') void paintCalendar();
         return true;
       } catch (e) {
         err.hidden = false;
