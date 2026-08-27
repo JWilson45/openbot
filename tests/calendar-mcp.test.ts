@@ -106,8 +106,9 @@ describe("calendar MCP", () => {
     expect(names).not.toContain("CreateEvent");
     expect(names).not.toContain("ProposeRoutine");
     expect(names).not.toContain("PauseSeries");
+    expect(names).not.toContain("ConfirmSeries");
 
-    for (const name of ["ListCalendar", "CreateEvent", "ProposeRoutine", "PauseSeries"]) {
+    for (const name of ["ListCalendar", "CreateEvent", "ProposeRoutine", "ConfirmSeries", "PauseSeries"]) {
       const res = await call(db, w.token, name, {
         title: "t",
         prompt: "p",
@@ -191,6 +192,47 @@ describe("calendar MCP", () => {
     const a2aTurn = await call(db, w.token, "CreateEvent", { title: "a2a", prompt: "nope", threadId: a2a });
     expect(a2aTurn.status).toBe(400);
     expect(rpc(a2aTurn.json).error?.data?.code).toBe("invalid_thread");
+    db.close();
+  });
+
+  test("ConfirmSeries activates a proposed series and ticks", async () => {
+    const db = OpenbotDb.open(join(tempHome(), "openbot.sqlite"));
+    const w = seedWorld(db);
+    insertTurn(db, w, "running");
+    let ticks = 0;
+    const created = await call(db, w.token, "CreateEvent", {
+      title: "brief",
+      prompt: "ping",
+      rrule: "FREQ=MINUTELY;INTERVAL=5",
+    });
+    const seriesId = payload(created.json).seriesId as string;
+    const before = await call(db, w.token, "ListCalendar", {});
+    const listed = payload(before.json).series as Array<{ id: string; status: string; nextFire: number | null }>;
+    expect(listed.find((s) => s.id === seriesId)?.status).toBe("proposed");
+    expect(listed.find((s) => s.id === seriesId)?.nextFire).toBeNull();
+
+    const confirmed = await call(
+      db,
+      w.token,
+      "ConfirmSeries",
+      { seriesId },
+      { onCalendarDue: () => ticks++ },
+    );
+    expect(confirmed.status).toBe(200);
+    const body = payload(confirmed.json);
+    expect(body.status).toBe("active");
+    expect(ticks).toBe(1);
+    expect(db.get<{ status: string }>("SELECT status FROM calendar_series WHERE id = ?", [seriesId])?.status).toBe(
+      "active",
+    );
+    expect(db.get<{ n: number }>("SELECT COUNT(*) AS n FROM calendar_instances WHERE series_id = ?", [seriesId])?.n).toBeGreaterThan(
+      0,
+    );
+
+    const other = insertBot(db, w.accountId, "Bob");
+    const foreign = insertSeries(db, w.accountId, { status: "proposed", assigneeBotId: other });
+    const denied = await call(db, w.token, "ConfirmSeries", { seriesId: foreign });
+    expect(denied.status).toBe(403);
     db.close();
   });
 

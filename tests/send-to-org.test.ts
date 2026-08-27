@@ -224,6 +224,7 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     expect(desk).toContain("/auth/local");
     expect(desk).toContain("Time:");
     expect(desk).toContain("ListCalendar");
+    expect(desk).toContain("ConfirmSeries");
     expect(gw).not.toContain("ListCalendar");
     expect(gw).not.toContain("CreateEvent");
     expect(gw).toContain("You do not hire desk bots");
@@ -251,6 +252,7 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
       "ListCalendar",
       "CreateEvent",
       "ProposeRoutine",
+      "ConfirmSeries",
       "PauseSeries",
     ]);
     expect(mcpToolsForRole("desk").map((t) => (t as { name: string }).name)).toEqual([
@@ -262,6 +264,7 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
       "ListCalendar",
       "CreateEvent",
       "ProposeRoutine",
+      "ConfirmSeries",
       "PauseSeries",
     ]);
 

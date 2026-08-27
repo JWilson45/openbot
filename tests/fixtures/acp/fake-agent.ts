@@ -15,6 +15,7 @@
  *   [[createevent:Title:Prompt:RRULE]]
  *   [[propose:Title:Prompt]]
  *   [[pause:seriesId]]
+ *   [[confirm:seriesId]]
  *   [[thread:Title:body]]  SendToThread by group title (empty Title omits name/threadId)
  *   [[threadid:uuid:body]] SendToThread by group thread id
  *   [[write:name]]    write name into cwd
@@ -316,6 +317,15 @@ async function handle(msg: {
         }
       }
 
+      const confirm = /\[\[confirm:([^\]]+)\]\]/.exec(current);
+      if (confirm) {
+        try {
+          await callTool(mcpUrl, mcpToken, "ConfirmSeries", { seriesId: confirm[1]!.trim() });
+        } catch (err) {
+          noteMcpError(err);
+        }
+      }
+
       const inboxack = /\[\[inboxack:([^\]]+)\]\]/.exec(current);
       if (inboxack) {
         try {
@@ -360,6 +370,7 @@ async function handle(msg: {
           !current.includes("[[createevent:") &&
           !current.includes("[[propose:") &&
           !current.includes("[[pause:") &&
+          !current.includes("[[confirm:") &&
           !current.includes("[[sendto:") &&
           !current.includes("[[sendorg:") &&
           !current.includes("[[inbox]]") &&

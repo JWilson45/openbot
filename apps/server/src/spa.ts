@@ -1576,7 +1576,21 @@ export const SPA_HTML = `<!DOCTYPE html>
       if (!byDay.has(k)) byDay.set(k, []);
       byDay.get(k).push(i);
     }
+    const proposed = (state.calendar.series || []).filter(s => s.status === 'proposed');
+    const proposedByDay = new Map();
+    for (const s of proposed) {
+      if (s.dtstart_utc == null) continue;
+      const k = ymdKey(s.dtstart_utc, tz);
+      if (!proposedByDay.has(k)) proposedByDay.set(k, []);
+      proposedByDay.get(k).push(s);
+    }
     let html = '<div class="cal-nav"><button type="button" id="cal-prev">Previous</button><strong>' + escapeHtml(monthName) + '</strong><button type="button" id="cal-next">Next</button></div>';
+    if (proposed.length) {
+      html += '<h3>Proposed</h3>';
+      for (const s of proposed) {
+        html += '<button type="button" class="cal-item" data-series="' + escapeHtml(s.id) + '"><strong>' + escapeHtml(s.title) + '</strong> <span class="muted">' + escapeHtml(kindBadge(s)) + ' · ' + escapeHtml(botName(s.assignee_bot_id)) + '</span><div class="snip">' + escapeHtml(rruleProse(s.rrule)) + '</div></button>';
+      }
+    }
     html += '<div class="cal-month">';
     for (const d of ['Sun','Mon','Tue','Wed','Thu','Fri','Sat']) html += '<div class="dow">' + d + '</div>';
     const cells = lead + dim;
@@ -1592,6 +1606,10 @@ export const SPA_HTML = `<!DOCTYPE html>
       for (const i of list) {
         const s = seriesById(i.series_id);
         html += '<button type="button" class="cal-chip' + (instMuted(i) ? ' muted' : '') + '" data-series="' + escapeHtml(i.series_id) + '" data-inst="' + escapeHtml(i.id) + '">' + escapeHtml(fmtClockTz(i.scheduled_at, tz) + ' ' + ((s && s.title) || 'Event')) + '</button>';
+      }
+      const drafts = (inMonth && proposedByDay.get(key)) || [];
+      for (const s of drafts) {
+        html += '<button type="button" class="cal-chip" data-series="' + escapeHtml(s.id) + '">' + escapeHtml('Proposed · ' + (s.title || 'Event')) + '</button>';
       }
       html += '</div>';
     }

@@ -22,7 +22,7 @@ describe("SendMessage approvals", () => {
       "SELECT COUNT(*) as n FROM messages WHERE turn_id = ? AND origin = 'fallback'",
       [turnId],
     );
-    expect(fallback?.n).toBe(1);
+    expect(fallback?.n).toBe(0);
     const ok = approveMessage(db, w.accountId, result.messageId);
     expect(ok).toBe(true);
     const after = db.get<{ origin: string }>("SELECT origin FROM messages WHERE id = ?", [result.messageId]);

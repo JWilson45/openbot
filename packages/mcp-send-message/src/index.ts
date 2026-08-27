@@ -20,6 +20,7 @@ import {
 import {
   McpError,
   createBotInput,
+  confirmSeriesInput,
   createEventInput,
   inboxInput,
   listCalendarInput,
@@ -767,7 +768,7 @@ export const CREATE_BOT_TOOL = {
 export const LIST_CALENDAR_TOOL = {
   name: "ListCalendar",
   description:
-    "List this org's calendar series (title, kind, status, next fire, assignee). Use before CreateEvent. The human edits the same calendar in the UI.",
+    "List this org's calendar series (title, kind, status, next fire, assignee). Proposed series do not fire (nextFire is null) until ConfirmSeries or Calendar Confirm. Use before CreateEvent.",
   inputSchema: {
     type: "object",
     properties: {
@@ -780,7 +781,7 @@ export const LIST_CALENDAR_TOOL = {
 export const CREATE_EVENT_TOOL = {
   name: "CreateEvent",
   description:
-    "Create a calendar schedule (one-shot or recurring) for a desk bot (you or another). Always status=proposed — the human must confirm in Calendar. Never auto-activates. Min interval 5 minutes. Cap 32 non-cancelled series. Do not install every-minute jobs. Do not curl OpenBot HTTP.",
+    "Create a calendar schedule (one-shot or recurring) for a desk bot (you or another). Always status=proposed — it does not fire until ConfirmSeries (after the human agrees in chat) or they Confirm in Calendar. Never auto-activates. Min interval 5 minutes. Cap 32 non-cancelled series. SendMessage urgency=normal when telling them it is waiting. Do not curl OpenBot HTTP.",
   inputSchema: {
     type: "object",
     properties: {
@@ -832,10 +833,31 @@ export const PAUSE_SERIES_TOOL = {
   },
 };
 
+export const CONFIRM_SERIES_TOOL = {
+  name: "ConfirmSeries",
+  description:
+    "Activate a proposed calendar series so it starts firing. Use when the human agrees in this thread (e.g. 'approved', 'confirm it'). Do not use SendMessage urgency=needs_user for calendar confirm. seriesId from ListCalendar or CreateEvent.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      seriesId: { type: "string" },
+    },
+    required: ["seriesId"],
+  },
+};
+
 export function mcpToolsForRole(role: string | null | undefined): unknown[] {
   const tools: unknown[] = [SEND_MESSAGE_TOOL, SEND_TO_AGENT_TOOL, SEND_TO_THREAD_TOOL, LIST_BOTS_TOOL];
   if (role === "gateway") tools.push(SEND_TO_ORG_TOOL, INBOX_TOOL);
-  else tools.push(CREATE_BOT_TOOL, LIST_CALENDAR_TOOL, CREATE_EVENT_TOOL, PROPOSE_ROUTINE_TOOL, PAUSE_SERIES_TOOL);
+  else
+    tools.push(
+      CREATE_BOT_TOOL,
+      LIST_CALENDAR_TOOL,
+      CREATE_EVENT_TOOL,
+      PROPOSE_ROUTINE_TOOL,
+      CONFIRM_SERIES_TOOL,
+      PAUSE_SERIES_TOOL,
+    );
   return tools;
 }
 
@@ -1392,6 +1414,59 @@ export function pauseSeries(
   }
 }
 
+export function confirmSeries(
+  db: OpenbotDb,
+  inflight: McpInflight,
+  bearer: string | undefined,
+  rawInput: unknown,
+  hooks?: McpHooks,
+): { ok: true; seriesId: string; status: "active"; nextFire: number | null } {
+  const input = parseOrThrow(confirmSeriesInput, coerceToolArgs(rawInput));
+  const claims = verifyMcpToken(db, bearer);
+  requireDesk(db, claims, "ConfirmSeries");
+  inflight.add(claims.harnessSessionId);
+  try {
+    const result = db.immediate(() => {
+      const turn = lockRunningTurn(db, claims);
+      if (!turn) throw new McpError("no_active_turn", "no running turn for this harness session", 409);
+      const series = db.get<CalendarSeriesRow>("SELECT * FROM calendar_series WHERE id = ? AND account_id = ?", [
+        input.seriesId,
+        claims.accountId,
+      ]);
+      if (!series) throw new McpError("not_found", "series not found", 404);
+      if (series.status === "active") {
+        return { ok: true as const, seriesId: series.id, status: "active" as const, nextFire: series.next_due_at };
+      }
+      if (series.status !== "proposed") throw new McpError("not_proposed", "series is not proposed", 409);
+      if (series.assignee_bot_id !== claims.botId && series.created_by_bot_id !== claims.botId) {
+        throw new McpError("forbidden", "ConfirmSeries is for series you own or created", 403);
+      }
+      if (nonCancelledSeriesCount(db, claims.accountId, series.id) >= CAL_MAX_SERIES) {
+        throw new McpError("cap", `calendar cap ${CAL_MAX_SERIES} reached`, 409);
+      }
+      db.run(`UPDATE calendar_series SET status = 'active', updated_at = ? WHERE id = ?`, [now(), series.id]);
+      const updated = db.get<CalendarSeriesRow>("SELECT * FROM calendar_series WHERE id = ?", [series.id]);
+      if (updated) rematerializeScheduledInstances(db, updated);
+      const after = db.get<CalendarSeriesRow>("SELECT * FROM calendar_series WHERE id = ?", [series.id]);
+      db.run(
+        `INSERT INTO audit_events (id, account_id, actor, type, payload, created_at)
+         VALUES (?, ?, 'harness', 'calendar.confirm', ?, ?)`,
+        [id(), claims.accountId, JSON.stringify({ seriesId: series.id, turnId: turn.id }), now()],
+      );
+      return {
+        ok: true as const,
+        seriesId: series.id,
+        status: "active" as const,
+        nextFire: after?.next_due_at ?? null,
+      };
+    });
+    hooks?.onCalendarDue?.();
+    return result;
+  } finally {
+    inflight.remove(claims.harnessSessionId);
+  }
+}
+
 function federationIsOn(db: OpenbotDb, hooks?: McpHooks): boolean {
   if (hooks?.federationEffective) return hooks.federationEffective();
   const row = db.get<{ federation_enabled: number }>(
@@ -1559,6 +1634,8 @@ export async function handleMcpJsonRpc(
         result = proposeRoutine(db, inflight, bearer, args);
       } else if (name === "PauseSeries") {
         result = pauseSeries(db, inflight, bearer, args, hooks);
+      } else if (name === "ConfirmSeries") {
+        result = confirmSeries(db, inflight, bearer, args, hooks);
       } else {
         throw new McpError("unknown_tool", `unknown tool ${name}`, 400);
       }

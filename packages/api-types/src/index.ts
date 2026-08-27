@@ -139,6 +139,12 @@ export const pauseSeriesInput = z.object({
 
 export type PauseSeriesInput = z.infer<typeof pauseSeriesInput>;
 
+export const confirmSeriesInput = z.object({
+  seriesId: z.string().min(1),
+});
+
+export type ConfirmSeriesInput = z.infer<typeof confirmSeriesInput>;
+
 export const createGroupThreadInput = z.object({
   kind: z.literal("group"),
   title: z.string().max(200).optional(),

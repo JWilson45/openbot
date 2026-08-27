@@ -21,7 +21,11 @@ export function promote(db: OpenbotDb, turnId: string, cause: PromoteCause): Mes
       "SELECT COUNT(*) as n FROM messages WHERE turn_id = ? AND origin = 'send_message'",
       [turnId],
     );
-    const hasSend = turn.sent_message_count > 0 || (sendRows?.n ?? 0) > 0;
+    const pendingRows = db.get<{ n: number }>(
+      "SELECT COUNT(*) as n FROM messages WHERE turn_id = ? AND origin = 'pending_approval'",
+      [turnId],
+    );
+    const hasSend = turn.sent_message_count > 0 || (sendRows?.n ?? 0) > 0 || (pendingRows?.n ?? 0) > 0;
 
     let inserted: MessageRow | null = null;
 

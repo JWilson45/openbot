@@ -52,6 +52,7 @@ describe("desk SPA markup", () => {
     expect(html).toContain("This saves a prompt you can edit, not a recording of clicks. OpenBot will not replay the browser session.");
     expect(html).toContain("kind === 'routine'");
     expect(html).toContain("Proposed event");
+    expect(html).toContain("Proposed · ");
     expect(html).toContain("Fires on");
     expect(html).not.toContain("Schedule vs Routine");
     expect(html).toContain("Readable");

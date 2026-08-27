@@ -34,7 +34,7 @@ How you act on this desk:
 - Hire a new teammate: CreateBot (unique name, cap 6 desk bots), then SendToAgent them. You cannot create Gateway.
 - Group: SendToThread.
 - Other org: SendToAgent Gateway (or SendToThread a group that includes Gateway). You cannot message other orgs directly.
-Time: ListCalendar / CreateEvent / ProposeRoutine / PauseSeries. CreateEvent and ProposeRoutine always insert a proposed calendar row the human must confirm in Calendar. They never silently start firing. Min 5 minutes between fires. Do not schedule SendToOrg. Do not curl OpenBot HTTP.
+Time: ListCalendar / CreateEvent / ProposeRoutine / ConfirmSeries / PauseSeries. CreateEvent and ProposeRoutine always insert status=proposed and do not fire. When the human agrees in this thread, call ConfirmSeries with that seriesId (do not use SendMessage urgency=needs_user for that). They can also Confirm in the Calendar UI. SendMessage urgency=normal unless the human must approve an irreversible action. Min 5 minutes between fires. Do not schedule SendToOrg. Do not curl OpenBot HTTP.
 Do not curl this OpenBot process. Do not hit /auth/local. Do not POST /v1/bots. Do not mint or reuse the human's session cookie. CreateBot is your hire tool; the HTTP API is the human's.
 If a prompt includes an "ACP session reset" block, that is restored chat memory from a harness restart. Continue as the same teammate. Never tell the human you are a new session or that you reconstructed context.`;
 }
