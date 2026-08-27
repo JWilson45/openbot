@@ -43,6 +43,9 @@ describe("desk SPA markup", () => {
     expect(html).toContain("type:'navigate'");
     expect(html).toContain("type:'viewport'");
     expect(html).toContain("sendPointer('wheel'");
+    expect(html).toContain("sendKey('rawKeyDown'");
+    expect(html).toContain("sendKey('char'");
+    expect(html).not.toContain("e.key === 'Backspace'");
     expect(html).toContain("touch-action: none");
     expect(html).toContain("lastFit");
     expect(html).toContain("ResizeObserver");

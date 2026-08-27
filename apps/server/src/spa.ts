@@ -2989,19 +2989,22 @@ export const SPA_HTML = `<!DOCTYPE html>
       if (e.deltaMode === 2) { dx *= canvas.height; dy *= canvas.height; }
       sendPointer('wheel', { x:p.x, y:p.y, deltaX: dx, deltaY: dy });
     }, { passive: false });
+    function sendKey(action, e, text) {
+      sendPointer('key', {
+        action: action, key: e.key, code: e.code, text: text,
+        altKey: e.altKey, ctrlKey: e.ctrlKey, metaKey: e.metaKey, shiftKey: e.shiftKey, repeat: e.repeat,
+      });
+    }
     canvas.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') { e.preventDefault(); endTakeover(); return; }
       e.preventDefault();
-      ws.send(JSON.stringify({ type:'key', action:'rawKeyDown', key:e.key, code:e.code }));
-      if (e.key.length === 1) {
-        ws.send(JSON.stringify({ type:'key', action:'char', key:e.key, code:e.code, text:e.key }));
-      } else if (e.key === 'Backspace' || e.key === 'Delete' || e.key === 'Enter' || e.key === 'Tab') {
-        ws.send(JSON.stringify({ type:'key', action:'char', key:e.key, code:e.code, text: e.key === 'Enter' ? '\\r' : '' }));
-      }
+      sendKey('rawKeyDown', e);
+      if (e.key.length === 1) sendKey('char', e, e.key);
+      else if (e.key === 'Enter') sendKey('char', e, '\\r');
     });
     canvas.addEventListener('keyup', (e) => {
       if (e.key === 'Escape') return;
-      ws.send(JSON.stringify({ type:'key', action:'keyUp', key:e.key, code:e.code }));
+      sendKey('keyUp', e);
     });
   }
 

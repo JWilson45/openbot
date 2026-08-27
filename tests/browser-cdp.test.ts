@@ -1,9 +1,22 @@
 import { describe, expect, test } from "bun:test";
 import { sha256Hex } from "@openbot/db";
+import { cdpKeyEvent } from "@openbot/runner";
 import { fakeAgentCommand, tempHome } from "./helpers.ts";
 import { loginCookie, startTestServer } from "../apps/server/src/test-helpers.ts";
 
 describe("CDP + takeover", () => {
+  test("Backspace is a virtual key, not an empty char", () => {
+    const down = cdpKeyEvent({ action: "rawKeyDown", key: "Backspace", code: "Backspace" });
+    expect(down.type).toBe("rawKeyDown");
+    expect(down.windowsVirtualKeyCode).toBe(8);
+    expect(down.text).toBeUndefined();
+    const del = cdpKeyEvent({ action: "rawKeyDown", key: "Delete", code: "Delete" });
+    expect(del.windowsVirtualKeyCode).toBe(46);
+    const letter = cdpKeyEvent({ action: "char", key: "a", code: "KeyA", text: "a" });
+    expect(letter.text).toBe("a");
+    expect(letter.windowsVirtualKeyCode).toBe(65);
+  });
+
   test("display reports loopback CDP; Chromium is not root; navigate/snapshot; takeover tickets", async () => {
     const home = tempHome();
     process.env.OPENBOT_ACP_COMMAND = fakeAgentCommand();

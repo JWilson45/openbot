@@ -25,6 +25,63 @@ function clampViewport(width: number, height: number): { width: number; height: 
   };
 }
 
+const NAMED_VK: Record<string, number> = {
+  Backspace: 8,
+  Tab: 9,
+  Enter: 13,
+  Shift: 16,
+  Control: 17,
+  Alt: 18,
+  CapsLock: 20,
+  Escape: 27,
+  Space: 32,
+  PageUp: 33,
+  PageDown: 34,
+  End: 35,
+  Home: 36,
+  ArrowLeft: 37,
+  ArrowUp: 38,
+  ArrowRight: 39,
+  ArrowDown: 40,
+  Insert: 45,
+  Delete: 46,
+  Meta: 91,
+  ContextMenu: 93,
+};
+
+for (let f = 1; f <= 12; f++) NAMED_VK[`F${f}`] = 111 + f;
+
+function modifierBits(event: Record<string, unknown>): number {
+  return (
+    (event.altKey ? 1 : 0) + (event.ctrlKey ? 2 : 0) + (event.metaKey ? 4 : 0) + (event.shiftKey ? 8 : 0)
+  );
+}
+
+export function cdpKeyEvent(event: Record<string, unknown>): Record<string, unknown> {
+  const action = String(event.action ?? "rawKeyDown");
+  const key = String(event.key ?? "");
+  const code = String(event.code ?? "");
+  let vk = NAMED_VK[key] ?? NAMED_VK[code] ?? 0;
+  if (!vk && /^Digit[0-9]$/.test(code)) vk = code.charCodeAt(5);
+  else if (!vk && /^Key[A-Z]$/.test(code)) vk = code.charCodeAt(3);
+  else if (!vk && key.length === 1) vk = key.toUpperCase().charCodeAt(0);
+  const params: Record<string, unknown> = {
+    type: action,
+    key,
+    code,
+    windowsVirtualKeyCode: vk,
+    nativeVirtualKeyCode: vk,
+    modifiers: modifierBits(event),
+    autoRepeat: Boolean(event.repeat),
+  };
+  const text = event.text != null ? String(event.text) : action === "char" && key.length === 1 ? key : "";
+  if (text) {
+    params.text = text;
+    params.unmodifiedText = text;
+  }
+  return params;
+}
+
 function envTtlMs(raw: string | undefined, fallback: number): number {
   if (raw == null || raw === "") return fallback;
   const n = Number(raw);
@@ -656,13 +713,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
       return;
     }
     if (type === "key") {
-      const action = String(event.action ?? "rawKeyDown");
-      const params = {
-        type: action,
-        key: String(event.key ?? ""),
-        code: String(event.code ?? ""),
-        text: event.text ? String(event.text) : undefined,
-      };
+      const params = cdpKeyEvent(event);
       if (conn) await conn.send("Input.dispatchKeyEvent", params);
       else await cdpInput(this.browser.cdpUrl, { type: "key", params });
     }
