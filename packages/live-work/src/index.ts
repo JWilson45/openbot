@@ -141,6 +141,7 @@ export function buildThreadDigest(
     `SELECT origin, body, from_bot_id FROM messages
      WHERE thread_id = ?
        AND origin IN ('user', 'send_message', 'fallback', 'agent', 'system', 'thread', 'federation')
+       AND origin NOT IN ('prompt', 'calendar')
        AND (turn_id IS NULL OR turn_id != ?)
      ORDER BY created_at DESC
      LIMIT ?`,

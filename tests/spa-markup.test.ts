@@ -62,6 +62,7 @@ describe("desk SPA markup", () => {
     expect(html).toContain("new-group");
     expect(html).toContain("data-group");
     expect(html).toContain("origin === 'prompt'");
+    expect(html).toContain("origin === 'calendar'");
     expect(html).toContain("turnIds");
     expect(html).toContain("_turnIds");
     expect(html).toContain("dropFinishedTurn");

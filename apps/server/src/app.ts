@@ -120,7 +120,7 @@ function cookies(c: { req: { header: (n: string) => string | undefined } }): str
 }
 
 const VISIBLE_MESSAGES_SQL =
-  "SELECT * FROM messages WHERE thread_id = ? AND origin != 'prompt' ORDER BY created_at";
+  "SELECT * FROM messages WHERE thread_id = ? AND origin NOT IN ('prompt', 'calendar') ORDER BY created_at";
 
 function groupMeetsMinimum(botCount: number, principalCount: number): boolean {
   return botCount >= 2 || principalCount >= 3;
@@ -173,7 +173,9 @@ export function createApp(cfg: HomeConfig): {
     if (event && typeof event === "object") {
       const ev = event as { type?: string; message?: { origin?: string } };
       // Group prompt clones are per-turn engine input, not transcript bubbles.
-      if (ev.type === "message.created" && ev.message?.origin === "prompt") return;
+      if (ev.type === "message.created" && (ev.message?.origin === "prompt" || ev.message?.origin === "calendar")) {
+        return;
+      }
     }
     const set = push.get(accountId);
     if (!set) return;
@@ -195,7 +197,10 @@ export function createApp(cfg: HomeConfig): {
     mcpPort: () => ctx.port,
     onPush,
   });
-  ctx.maintenanceTimer = setInterval(() => ctx.engine.maintenance(), 30_000);
+  ctx.maintenanceTimer = setInterval(() => {
+    ctx.engine.tickCalendar();
+    ctx.engine.kick();
+  }, 30_000);
   ctx.maintenanceTimer.unref();
 
   const { upgradeWebSocket, websocket } = createBunWebSocket<ServerWebSocket>();
@@ -810,8 +815,9 @@ export function createApp(cfg: HomeConfig): {
       const series = loadCalendarSeries(db, s.accountId, seriesId);
       if (series) rematerializeScheduledInstances(db, series);
     });
-    const series = loadCalendarSeries(db, s.accountId, seriesId);
-    return c.json({ series }, 201);
+    ctx.engine.tickCalendar();
+    ctx.engine.kick();
+    return c.json({ series: loadCalendarSeries(db, s.accountId, seriesId) }, 201);
   });
 
   app.patch("/v1/calendar/series/:id", async (c) => {
@@ -896,6 +902,10 @@ export function createApp(cfg: HomeConfig): {
         if (updated && (scheduleChanged || series.status !== "active")) rematerializeScheduledInstances(db, updated);
       }
     });
+    if (nextStatus === "active") {
+      ctx.engine.tickCalendar();
+      ctx.engine.kick();
+    }
     return c.json({ series: loadCalendarSeries(db, s.accountId, series.id) });
   });
 
@@ -912,6 +922,8 @@ export function createApp(cfg: HomeConfig): {
       const updated = loadCalendarSeries(db, s.accountId, series.id);
       if (updated) rematerializeScheduledInstances(db, updated);
     });
+    ctx.engine.tickCalendar();
+    ctx.engine.kick();
     return c.json({ series: loadCalendarSeries(db, s.accountId, series.id) });
   });
 
@@ -948,6 +960,8 @@ export function createApp(cfg: HomeConfig): {
         const updated = loadCalendarSeries(db, s.accountId, series.id);
         if (updated) rematerializeScheduledInstances(db, updated);
       });
+      ctx.engine.tickCalendar();
+      ctx.engine.kick();
     }
     return c.json({ series: loadCalendarSeries(db, s.accountId, series.id) });
   });
@@ -1990,7 +2004,9 @@ function activityForAccount(ctx: AppContext, accountId: string) {
     );
     const lastMessage = thread
       ? ctx.db.get<{ role: string; body: string; created_at: number }>(
-          "SELECT role, body, created_at FROM messages WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1",
+          `SELECT role, body, created_at FROM messages
+           WHERE thread_id = ? AND origin NOT IN ('prompt', 'calendar')
+           ORDER BY created_at DESC LIMIT 1`,
           [thread.id],
         )
       : undefined;

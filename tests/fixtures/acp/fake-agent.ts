@@ -10,6 +10,7 @@
  *   [[inboxack:id]]   POST Inbox ack
  *   [[echo-prompt]]   SendMessage "got-digest" or "no-digest" based on ACP reset block
  *   [[echo-prefix]]   SendMessage "got-group-prefix" if the group runTurn prefix is present
+ *   [[echo-cal-prefix]] SendMessage "got-calendar-prefix" if the calendar runTurn block is present
  *   [[thread:Title:body]]  SendToThread by group title (empty Title omits name/threadId)
  *   [[threadid:uuid:body]] SendToThread by group thread id
  *   [[write:name]]    write name into cwd
@@ -288,6 +289,13 @@ async function handle(msg: {
             /To speak here call SendToThread/.test(text) ? "got-group-prefix" : "no-group-prefix",
           );
         }
+        if (current.includes("[[echo-cal-prefix]]")) {
+          const calIdx = text.indexOf("This turn was started by calendar event");
+          const groupIdx = text.indexOf('Group thread "');
+          const hasCal = calIdx >= 0;
+          const calBeforeGroup = hasCal && (groupIdx < 0 || calIdx < groupIdx);
+          await callSend(mcpUrl, mcpToken, calBeforeGroup ? "got-calendar-prefix" : "no-calendar-prefix");
+        }
 
         const send = /\[\[send:([\s\S]*?)\]\]/.exec(current);
         const sendCwd = current.includes("[[cwd]]");
@@ -299,6 +307,7 @@ async function handle(msg: {
           !current.includes("[[permission]]") &&
           !current.includes("[[echo-prompt]]") &&
           !current.includes("[[echo-prefix]]") &&
+          !current.includes("[[echo-cal-prefix]]") &&
           !current.includes("[[sendto:") &&
           !current.includes("[[sendorg:") &&
           !current.includes("[[inbox]]") &&

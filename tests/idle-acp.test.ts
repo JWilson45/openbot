@@ -5,6 +5,8 @@ import {
   acpIdleTtlMs,
   gatewayAcpIdleTtlMs,
 } from "@openbot/runner";
+import { id, now } from "@openbot/db";
+import { CAL_MIN_INTERVAL_MS } from "@openbot/calendar";
 import { fakeAgentCommand, tempHome } from "./helpers.ts";
 import { loginCookie, startTestServer } from "../apps/server/src/test-helpers.ts";
 
@@ -170,6 +172,58 @@ describe("idle ACP TTL", () => {
       else process.env.OPENBOT_ACP_IDLE_MS = prevIdle;
       if (prevGw === undefined) delete process.env.OPENBOT_GATEWAY_ACP_IDLE_MS;
       else process.env.OPENBOT_GATEWAY_ACP_IDLE_MS = prevGw;
+    }
+  });
+
+  test("maintenance() alone does not start calendar turns", async () => {
+    process.env.OPENBOT_ACP_COMMAND = fakeAgentCommand();
+    const { ctx, server, origin } = startTestServer({ home: tempHome() });
+    try {
+      const { cookie } = loginCookie({ ctx }, "alice");
+      const headers = { cookie, "content-type": "application/json" };
+      const created = (await fetch(`${origin}/v1/bots`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ name: "Ada" }),
+      }).then((r) => r.json())) as { bot: { id: string }; threadId: string };
+      const accountId = ctx.db.get<{ account_id: string }>(
+        "SELECT account_id FROM bots WHERE id = ?",
+        [created.bot.id],
+      )!.account_id;
+      const t = now();
+      const seriesId = id();
+      ctx.db.run(
+        `INSERT INTO calendar_series (
+           id, account_id, title, prompt, assignee_bot_id, thread_id, kind, status, rrule,
+           dtstart_utc, timezone, require_human_approval, created_by, min_interval_ms,
+           next_due_at, created_at, updated_at
+         ) VALUES (?, ?, 'idle', '[[send:nope]]', ?, ?, 'schedule', 'active', NULL, ?, 'UTC', 0, 'human', ?, ?, ?, ?)`,
+        [seriesId, accountId, created.bot.id, created.threadId, t - 60_000, CAL_MIN_INTERVAL_MS, t - 60_000, t, t],
+      );
+      ctx.engine.maintenance();
+      expect(ctx.db.all("SELECT id FROM turns WHERE bot_id = ?", [created.bot.id]).length).toBe(0);
+      ctx.engine.tickCalendar();
+      expect(
+        ctx.db.get<{ n: number }>(
+          "SELECT COUNT(*) AS n FROM turns WHERE bot_id = ? AND status = 'queued'",
+          [created.bot.id],
+        )?.n,
+      ).toBe(1);
+      ctx.engine.maintenance();
+      expect(
+        ctx.db.get<{ n: number }>(
+          "SELECT COUNT(*) AS n FROM turns WHERE bot_id = ? AND status = 'queued'",
+          [created.bot.id],
+        )?.n,
+      ).toBe(1);
+      expect(
+        ctx.db.get<{ n: number }>(
+          "SELECT COUNT(*) AS n FROM turns WHERE bot_id = ? AND status IN ('running', 'completed')",
+          [created.bot.id],
+        )?.n,
+      ).toBe(0);
+    } finally {
+      server.stop(true);
     }
   });
 });

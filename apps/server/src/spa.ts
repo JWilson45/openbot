@@ -1506,7 +1506,7 @@ export const SPA_HTML = `<!DOCTYPE html>
   function upsertMessage(m) {
     if (!m || !m.id) return;
     // Per-turn @mention clones are not transcript bubbles.
-    if (m.origin === 'prompt') return;
+    if (m.origin === 'prompt' || m.origin === 'calendar') return;
     const tid = m.thread_id || m.threadId;
     const sameThread = Boolean(state.thread && tid === state.thread.id);
     // Other threads' system/fallback must not land in this transcript.

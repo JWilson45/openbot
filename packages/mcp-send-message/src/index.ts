@@ -124,7 +124,17 @@ export function sendMessage(
         "SELECT require_human_approval FROM bots WHERE id = ?",
         [claims.botId],
       );
-      const park = input.urgency === "needs_user" || Boolean(bot?.require_human_approval);
+      const seriesFlag = db.get<{ require_human_approval: number }>(
+        `SELECT s.require_human_approval
+         FROM calendar_instances i
+         JOIN calendar_series s ON s.id = i.series_id
+         WHERE i.turn_id = ?`,
+        [turn.id],
+      );
+      const park =
+        input.urgency === "needs_user" ||
+        Boolean(bot?.require_human_approval) ||
+        Boolean(seriesFlag?.require_human_approval);
       const row = insertMessage(db, {
         threadId: human.id,
         turnId: turn.id,
