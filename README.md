@@ -22,7 +22,7 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 - **Watch-me-do-it v1 is not a recording.** **Learn this** drafts a proposed calendar event from a thread. You edit it. No click replay.
 - **This is not Google Calendar.** No sync. No invites. Org-local sqlite.
 - **Schedules and learned routines are two products** on the same grid.
-- `$OPENBOT_HOME/desk` is a **shared computer**. It is **not** a security boundary **inside** an org. Every bot on the account can read and write the desk the way you can. There is **one Chromium** for the whole team. Cross-org is messages only (hop=1).
+- `$OPENBOT_HOME/desk` is a **shared computer**. It is **not** a security boundary **inside** an org. Every bot on the account can read and write the desk the way you can. There is **one Chromium** for the whole team (**a tab per desk bot**; cookies shared). Cross-org is messages only (hop=1).
 - Vault files (`master.key`, `org.ed25519`, credentials) live **outside** `desk/`. Do not copy secrets into the workspace Grok can see.
 - Restarting the server starts a new Grok ACP process. Chat history is in SQLite; OpenBot injects a thread digest on the next turn so the bot continues instead of announcing amnesia.
 - **Federation is off until you turn it on** on **both** sides. OpenBot does not provision Fly Machines.
@@ -42,7 +42,7 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 | Warm Grok process | Each bot keeps an ACP child across turns. Model / reasoning changes respawn it on the **next** turn. |
 | Model & reasoning | Per-bot Grok model (e.g. grok-4.6) and effort (low / medium / high / extra high). Composer + Settings. |
 | Live work | Collapsible thinking and tool calls in a resizable sidebar. Activity board for the whole team. |
-| Takeover | You grab the shared Chromium (screencast + input). Esc / Close ends it. |
+| Takeover | You grab the human tab of the shared Chromium (screencast + input). Esc / Close ends it. Desk bots keep their own tabs. |
 | Archive | Soft-delete folder. Restore, or type `DELETE` to purge. Expired archives (30 days) are removed automatically. |
 | Calendar / schedules / Learn this | Org-local sqlite (not Google Calendar: no sync, no invites). Schedules and learned routines are two products on the same grid. **Learn this** drafts a proposed event from a thread — not a recording. The clock is the process. |
 | OpenAI-compatible API | Open WebUI (and similar) can use a bot as `openbot/<Name>` with a `sk-ob_…` key. Two connections = two orgs (mint the key on that VM). |
@@ -89,7 +89,7 @@ cd openbot
 bun install
 ```
 
-The CLI is `bun run openbot -- <command>` (or `bun run apps/server/src/cli.ts`). Current version is **0.3.0**. `openbot version` prints `{ openbot, grokPin, grok }`. OpenBot pins **Grok CLI 1.0.5** (warns if missing or older; does not refuse to start).
+The CLI is `bun run openbot -- <command>` (or `bun run apps/server/src/cli.ts`). Current version is **0.4.0**. `openbot version` prints `{ openbot, grokPin, grok }`. OpenBot pins **Grok CLI 1.0.5** (warns if missing or older; does not refuse to start).
 
 Merging to `main` with a **new** `package.json` version creates tag `vX.Y.Z` and publishes GitHub Release binaries. Pull requests run tests. Other branches do not. A version that already has a tag is not re-released.
 
