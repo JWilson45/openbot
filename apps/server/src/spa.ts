@@ -164,6 +164,24 @@ export const SPA_HTML = `<!DOCTYPE html>
       padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--bot);
     }
     .archive-row .meta { color: var(--muted); font-size: .9rem; }
+    .cal-board { flex: 1; overflow: auto; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+    .cal-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+    .cal-toolbar .cal-tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .cal-body { flex: 1; overflow: auto; padding: 12px 16px 24px; }
+    .cal-day { margin: 0 0 12px; }
+    .cal-day-label { color: var(--muted); font-size: .78rem; letter-spacing: .04em; text-transform: uppercase; margin: 0 0 6px; }
+    .cal-item { display: block; width: 100%; text-align: left; margin: 0 0 6px; }
+    .cal-item.muted { opacity: .65; }
+    .cal-item .snip { color: var(--muted); font-size: .85rem; margin-top: 4px; }
+    .cal-month { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+    .cal-month .dow { color: var(--muted); font-size: .72rem; text-align: center; padding: 4px; text-transform: uppercase; }
+    .cal-cell { min-height: 72px; border: 1px solid var(--line); border-radius: 8px; padding: 6px; background: var(--bot); }
+    .cal-cell.out { opacity: .45; }
+    .cal-cell.today { border-color: var(--acc); }
+    .cal-cell .num { font-size: .78rem; color: var(--muted); }
+    .cal-chip { display: block; width: 100%; text-align: left; font-size: .75rem; padding: 4px 6px; min-height: 32px; margin: 2px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .cal-chip.muted { opacity: .65; }
+    .cal-nav { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0 0 10px; }
     .org-row, .peer-row {
       display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between;
       padding: 10px 0; border-bottom: 1px solid var(--line);
@@ -272,7 +290,7 @@ export const SPA_HTML = `<!DOCTYPE html>
   <script>
   const state = {
     me:null, bots:[], gateway:null, groups:[], org:null, archived:[], archiveTtlMs: 30*24*60*60*1000, bot:null, thread:null, messages:[], live:[], compute:null, liveRaw: localStorage.getItem('openbot-live-raw') === '1', railCollapsed: localStorage.getItem('openbot-rail') === '1', sideCollapsed: localStorage.getItem('openbot-side') === '1',
-    turn:null, a2a:[], view:'human', auth:{}, harness:{}, ws:'down', sending:false, activity:[], models:[], sideW: Number(localStorage.getItem('openbot-side-w') || 320)
+    turn:null, a2a:[], view:'human', auth:{}, harness:{}, ws:'down', sending:false, activity:[], calendar:{ series:[], instances:[], timezone:'UTC' }, calMode:'agenda', calMonth:null, models:[], sideW: Number(localStorage.getItem('openbot-side-w') || 320)
   };
   let hostPoll = 0;
   let stickBottom = true;
@@ -769,9 +787,10 @@ export const SPA_HTML = `<!DOCTYPE html>
   function renderApp() {
     const inArchive = state.view === 'archive';
     const inActivity = state.view === 'activity';
+    const inCalendar = state.view === 'calendar';
     const inGroup = state.view === 'group';
     const gwSelected = isGatewayBot(state.bot) && state.view === 'human';
-    const heading = inArchive ? 'Archive' : inActivity ? 'Activity' : inGroup ? (state.thread?.title || 'Group') : (state.bot?.name || 'OpenBot');
+    const heading = inArchive ? 'Archive' : inActivity ? 'Activity' : inCalendar ? 'Calendar' : inGroup ? (state.thread?.title || 'Group') : (state.bot?.name || 'OpenBot');
     document.title = heading + ' · OpenBot';
     const railBots = state.bots.map(b => {
       const active = state.bot && b.id === state.bot.id && state.view === 'human' && !gwSelected;
@@ -797,7 +816,7 @@ export const SPA_HTML = `<!DOCTYPE html>
       '<div><button type="button" data-a2a="' + t.id + '">' + escapeHtml(handoffLabel(t)) + '</button></div>'
     ).join('') || '<p class="muted">No A2A threads yet. Bots use SendToAgent.</p>';
     const readonly = state.view === 'a2a';
-    const composer = inArchive || inActivity
+    const composer = inArchive || inActivity || inCalendar
       ? ''
       : readonly
       ? '<p class="muted" id="draft-help">This handoff log is read-only. Message the bot from their human thread.</p>'
@@ -820,6 +839,8 @@ export const SPA_HTML = `<!DOCTYPE html>
       ? '<ul class="archive-list" id="archive-folder"></ul>'
       : inActivity
       ? '<ul class="act-list" id="activity-board"></ul>'
+      : inCalendar
+      ? '<div class="cal-board" id="calendar-board"><div class="cal-toolbar"><div class="cal-tools"><div class="seg" role="group" aria-label="Calendar view"><button type="button" id="cal-agenda" aria-pressed="' + (state.calMode !== 'month' ? 'true' : 'false') + '">Agenda</button><button type="button" id="cal-month" aria-pressed="' + (state.calMode === 'month' ? 'true' : 'false') + '">Month</button></div></div><button type="button" class="primary" id="cal-new">New event</button></div><p class="muted" style="padding:8px 16px 0">The calendar runs only while <code>openbot server</code> runs. A closed laptop means the 9am did not happen.</p><div class="cal-body" id="cal-body"></div></div>'
       : '<ol class="msgs" id="msgs" tabindex="0"></ol><div class="composer-wrap">' + composer + '</div><p class="muted" style="padding:0 16px 12px">Closing this tab does not stop teammates. Stopping <code>openbot server</code> does.</p>';
 
     const orgName = thisOrgName();
@@ -831,7 +852,7 @@ export const SPA_HTML = `<!DOCTYPE html>
         <span class="pill" id="this-org" title="This instance">\${escapeHtml(orgName)}</span>
         <button type="button" id="open-orgs" aria-haspopup="dialog">Orgs</button>
         <button type="button" class="side-toggle" id="live-toggle" aria-expanded="false">Live work</button>
-        \${!inArchive && !inActivity && !inGroup && state.bot && !gwSelected ? '<button type="button" id="archive-bot">Archive</button>' : ''}
+        \${!inArchive && !inActivity && !inCalendar && !inGroup && state.bot && !gwSelected ? '<button type="button" id="archive-bot">Archive</button>' : ''}
         <button type="button" id="help" aria-haspopup="dialog">Help</button>
         <button type="button" id="takeover">Takeover</button>
         <button type="button" id="settings">Settings</button>
@@ -854,13 +875,17 @@ export const SPA_HTML = `<!DOCTYPE html>
           <span class="avatar" aria-hidden="true">📦</span>
           <span class="bot-meta"><strong>Archive</strong><span class="muted"> \${state.archived.length} teammate\${state.archived.length === 1 ? '' : 's'}</span></span>
         </button>
+        <button type="button" class="bot folder\${inCalendar ? ' active' : ''}" id="open-calendar" aria-current="\${inCalendar ? 'page' : 'false'}">
+          <span class="avatar" aria-hidden="true">📅</span>
+          <span class="bot-meta"><strong>Calendar</strong><span class="muted">Schedules</span></span>
+        </button>
         \${gatewayPin}
         <h2>Groups</h2>
         \${railGroups}
         <button type="button" id="new-group">New group</button>
         <p class="muted desk-note">Shared desk · one browser · SendToAgent is how bots talk.</p>
       </nav>
-      <main class="thread" aria-label="\${inArchive ? 'Archive' : inActivity ? 'Activity' : inGroup ? 'Group' : 'Conversation'}">
+      <main class="thread" aria-label="\${inArchive ? 'Archive' : inActivity ? 'Activity' : inCalendar ? 'Calendar' : inGroup ? 'Group' : 'Conversation'}">
         \${mainInner}
       </main>
       <div class="resize-side" id="resize-side" role="separator" aria-orientation="vertical" aria-label="Resize live work" tabindex="0"></div>
@@ -888,6 +913,7 @@ export const SPA_HTML = `<!DOCTYPE html>
     if (shellEl) shellEl.style.setProperty('--side-w', Math.max(240, state.sideW || 320) + 'px');
     if (inArchive) paintArchiveFolder();
     else if (inActivity) void paintActivity();
+    else if (inCalendar) void paintCalendar();
     else paintMessages();
     paintLive();
     bindResize();
@@ -902,6 +928,10 @@ export const SPA_HTML = `<!DOCTYPE html>
     bind('#open-orgs', openOrgs);
     bind('#open-archive', openArchiveFolder);
     bind('#open-activity', openActivity);
+    bind('#open-calendar', openCalendar);
+    bind('#cal-agenda', () => setCalMode('agenda'));
+    bind('#cal-month', () => setCalMode('month'));
+    bind('#cal-new', openNewEvent);
     bind('#archive-bot', archiveCurrentBot);
     bind('#collapse-rail', () => togglePane('rail'));
     bind('#collapse-side', () => togglePane('side'));
@@ -1288,6 +1318,441 @@ export const SPA_HTML = `<!DOCTYPE html>
     }
   }
 
+  function orgTimezone() {
+    return (state.org && state.org.timezone) || (state.calendar && state.calendar.timezone) || 'UTC';
+  }
+  function pad2(n) { return String(n).padStart(2, '0'); }
+  function ianaZones() {
+    try {
+      const z = Intl.supportedValuesOf?.('timeZone');
+      if (z && z.length) return z;
+    } catch {}
+    return null;
+  }
+  function tzParts(ms, tz) {
+    try {
+      const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: tz, year:'numeric', month:'2-digit', day:'2-digit',
+        hour:'2-digit', minute:'2-digit', weekday:'short', hourCycle:'h23'
+      }).formatToParts(new Date(Number(ms)));
+      const get = (t) => { const p = parts.find(x => x.type === t); return p ? p.value : ''; };
+      let hour = Number(get('hour'));
+      if (hour === 24) hour = 0;
+      return { year: Number(get('year')), month: Number(get('month')), day: Number(get('day')), hour, minute: Number(get('minute')), weekday: get('weekday') };
+    } catch {
+      if (tz !== 'UTC') return tzParts(ms, 'UTC');
+      const d = new Date(Number(ms));
+      return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate(), hour: d.getUTCHours(), minute: d.getUTCMinutes(), weekday: '' };
+    }
+  }
+  function ymdKey(ms, tz) {
+    const p = tzParts(ms, tz);
+    return p.year + '-' + pad2(p.month) + '-' + pad2(p.day);
+  }
+  function fmtWhenTz(ms, tz) {
+    if (!ms) return '';
+    const p = tzParts(ms, tz);
+    return p.weekday + ' ' + p.month + '/' + p.day + ' ' + pad2(p.hour) + ':' + pad2(p.minute);
+  }
+  function toLocalInput(ms, tz) {
+    const p = tzParts(ms, tz);
+    return p.year + '-' + pad2(p.month) + '-' + pad2(p.day) + 'T' + pad2(p.hour) + ':' + pad2(p.minute);
+  }
+  function rruleProse(rrule) {
+    if (!rrule) return 'Once';
+    const u = String(rrule).replace(/^RRULE:/i, '').toUpperCase();
+    if (u.indexOf('BYDAY=MO,TU,WE,TH,FR') >= 0 && u.indexOf('BYHOUR=9') >= 0) return 'Weekdays at 9:00';
+    if (u.indexOf('FREQ=DAILY') === 0) return 'Daily';
+    if (u.indexOf('FREQ=WEEKLY') === 0) return 'Weekly';
+    if (u.indexOf('FREQ=MONTHLY') === 0) return 'Monthly';
+    if (u.indexOf('FREQ=HOURLY') === 0) return 'Hourly';
+    return rrule;
+  }
+  function repeatFromRrule(rrule) {
+    if (!rrule) return 'none';
+    const u = String(rrule).replace(/^RRULE:/i, '').toUpperCase();
+    if (u.indexOf('FREQ=WEEKLY') >= 0 && u.indexOf('BYDAY=MO,TU,WE,TH,FR') >= 0 && u.indexOf('BYHOUR=9') >= 0) return 'weekdays';
+    if (u.indexOf('FREQ=DAILY') === 0) return 'daily';
+    if (u.indexOf('FREQ=WEEKLY') === 0) return 'weekly';
+    return 'custom';
+  }
+  function rruleFromRepeat(repeat, localVal, custom) {
+    if (repeat === 'none' || !repeat) return null;
+    if (repeat === 'weekdays') return 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0';
+    if (repeat === 'custom') {
+      const t = String(custom || '').trim();
+      return t || null;
+    }
+    const bits = String(localVal || '').split('T');
+    const date = (bits[0] || '').split('-');
+    const time = (bits[1] || '00:00').split(':');
+    const y = Number(date[0]), mo = Number(date[1]), d = Number(date[2]);
+    const hh = Number(time[0] || 0), mm = Number(time[1] || 0);
+    if (repeat === 'daily') return 'FREQ=DAILY;INTERVAL=1;BYHOUR=' + hh + ';BYMINUTE=' + mm;
+    if (repeat === 'weekly') {
+      const by = ['SU','MO','TU','WE','TH','FR','SA'][new Date(Date.UTC(y, mo - 1, d)).getUTCDay()] || 'MO';
+      return 'FREQ=WEEKLY;BYDAY=' + by + ';BYHOUR=' + hh + ';BYMINUTE=' + mm;
+    }
+    return null;
+  }
+  function zoneSelectHtml(id, selected) {
+    const cur = selected || 'UTC';
+    const zones = ianaZones();
+    if (!zones) return '<input id="' + id + '" value="' + escapeHtml(cur) + '" placeholder="UTC" autocomplete="off" />';
+    const list = zones.indexOf(cur) >= 0 ? zones : [cur].concat(zones);
+    return '<select id="' + id + '">' + list.map(z => '<option value="' + escapeHtml(z) + '"' + (z === cur ? ' selected' : '') + '>' + escapeHtml(z) + '</option>').join('') + '</select>';
+  }
+  function deskBotOptions(selected) {
+    return (state.bots || []).map(b => '<option value="' + escapeHtml(b.id) + '"' + (b.id === selected ? ' selected' : '') + '>' + escapeHtml(b.name) + '</option>').join('');
+  }
+  function instNote(i) {
+    if (!i) return '';
+    if (i.status === 'skipped_offline') return 'missed — OpenBot was down';
+    if (i.status === 'skipped_coalesce') return 'coalesced';
+    if (i.status === 'skipped_paused') return 'paused';
+    if (i.status === 'due') return 'due';
+    if (i.status === 'running') return 'running';
+    if (i.status === 'queued') return 'queued';
+    if (i.status === 'failed') return 'failed';
+    if (i.status === 'cancelled') return 'cancelled';
+    if (i.status === 'completed') return 'done';
+    return '';
+  }
+  function instMuted(i) {
+    return i && (i.status === 'skipped_offline' || i.status === 'skipped_coalesce' || i.status === 'skipped_paused' || i.status === 'cancelled');
+  }
+  function kindBadge(s) {
+    if (!s) return '';
+    if (s.status === 'proposed') return 'Proposed';
+    if (s.kind === 'routine') return 'Routine';
+    return 'Schedule';
+  }
+  function calHorizon() {
+    const tz = orgTimezone();
+    const now = Date.now();
+    const p = tzParts(now, tz);
+    if (!state.calMonth) state.calMonth = { y: p.year, m: p.month };
+    const y = state.calMonth.y, m = state.calMonth.m;
+    const monthFrom = Date.UTC(y, m - 1, 1) - 14 * 86400000;
+    const monthTo = Date.UTC(y, m, 1) + 14 * 86400000;
+    const agendaFrom = now - 2 * 86400000;
+    const agendaTo = now + 14 * 86400000;
+    return { from: Math.min(monthFrom, agendaFrom), to: Math.max(monthTo, agendaTo), tz, now, todayKey: ymdKey(now, tz) };
+  }
+
+  async function openCalendar() {
+    state.view = 'calendar';
+    renderApp();
+    await paintCalendar();
+  }
+  function setCalMode(mode) {
+    state.calMode = mode === 'month' ? 'month' : 'agenda';
+    const ag = document.getElementById('cal-agenda');
+    const mo = document.getElementById('cal-month');
+    if (ag) ag.setAttribute('aria-pressed', state.calMode === 'agenda' ? 'true' : 'false');
+    if (mo) mo.setAttribute('aria-pressed', state.calMode === 'month' ? 'true' : 'false');
+    void paintCalendar();
+  }
+
+  async function paintCalendar() {
+    const body = document.getElementById('cal-body');
+    if (!body) return;
+    const range = calHorizon();
+    try {
+      const res = await api('/v1/calendar?from=' + range.from + '&to=' + range.to);
+      state.calendar = { series: res.series || [], instances: res.instances || [], timezone: res.timezone || range.tz };
+      if (res.timezone && state.org) state.org.timezone = res.timezone;
+    } catch { /* keep last snapshot */ }
+    if (!document.getElementById('cal-body')) return;
+    drawCalendar();
+  }
+
+  function drawCalendar() {
+    const body = document.getElementById('cal-body');
+    if (!body) return;
+    if (state.calMode === 'month') drawMonth(body);
+    else drawAgenda(body);
+  }
+
+  function seriesById(id) {
+    return (state.calendar.series || []).find(s => s.id === id) || null;
+  }
+
+  function drawAgenda(body) {
+    const tz = orgTimezone();
+    const now = Date.now();
+    const todayKey = ymdKey(now, tz);
+    const until = now + 14 * 86400000;
+    const proposed = (state.calendar.series || []).filter(s => s.status === 'proposed');
+    const inst = (state.calendar.instances || []).slice().sort((a, b) => a.scheduled_at - b.scheduled_at);
+    const rows = inst.filter(i => {
+      if (i.scheduled_at > until) return false;
+      const day = ymdKey(i.scheduled_at, tz);
+      if (instMuted(i)) return i.scheduled_at >= now - 2 * 86400000;
+      return day >= todayKey || i.scheduled_at >= now - 60 * 1000;
+    });
+    let html = '';
+    if (proposed.length) {
+      html += '<h3>Proposed</h3>';
+      for (const s of proposed) {
+        html += '<button type="button" class="cal-item" data-series="' + escapeHtml(s.id) + '"><strong>' + escapeHtml(s.title) + '</strong> <span class="muted">' + escapeHtml(kindBadge(s)) + ' · ' + escapeHtml(botName(s.assignee_bot_id)) + '</span><div class="snip">' + escapeHtml(rruleProse(s.rrule)) + '</div></button>';
+      }
+    }
+    if (!rows.length && !proposed.length) {
+      html += '<p class="empty">No upcoming events. New event creates a schedule.</p>';
+      body.innerHTML = html;
+      bindCalItems(body);
+      return;
+    }
+    let lastDay = '';
+    for (const i of rows) {
+      const day = ymdKey(i.scheduled_at, tz);
+      if (day !== lastDay) {
+        if (lastDay) html += '</div>';
+        lastDay = day;
+        const p = tzParts(i.scheduled_at, tz);
+        html += '<div class="cal-day"><div class="cal-day-label">' + escapeHtml((p.weekday || '') + ' ' + p.month + '/' + p.day) + '</div>';
+      }
+      const s = seriesById(i.series_id);
+      const note = instNote(i);
+      const tp = tzParts(i.scheduled_at, tz);
+      html += '<button type="button" class="cal-item' + (instMuted(i) ? ' muted' : '') + '" data-series="' + escapeHtml(i.series_id) + '" data-inst="' + escapeHtml(i.id) + '"><strong>' + escapeHtml((s && s.title) || 'Event') + '</strong> <span class="muted">' + pad2(tp.hour) + ':' + pad2(tp.minute) + (s ? ' · ' + escapeHtml(kindBadge(s)) + ' · ' + escapeHtml(botName(s.assignee_bot_id)) : '') + (note ? ' · ' + escapeHtml(note) : '') + '</span></button>';
+    }
+    if (lastDay) html += '</div>';
+    body.innerHTML = html;
+    bindCalItems(body);
+  }
+
+  function drawMonth(body) {
+    const tz = orgTimezone();
+    const now = Date.now();
+    const cur = tzParts(now, tz);
+    if (!state.calMonth) state.calMonth = { y: cur.year, m: cur.month };
+    const y = state.calMonth.y, m = state.calMonth.m;
+    const dim = new Date(Date.UTC(y, m, 0)).getUTCDate();
+    const lead = new Date(Date.UTC(y, m - 1, 1)).getUTCDay();
+    const monthName = new Date(Date.UTC(y, m - 1, 1)).toLocaleString(undefined, { month: 'long', year: 'numeric', timeZone: 'UTC' });
+    const byDay = new Map();
+    for (const i of state.calendar.instances || []) {
+      const k = ymdKey(i.scheduled_at, tz);
+      if (!byDay.has(k)) byDay.set(k, []);
+      byDay.get(k).push(i);
+    }
+    let html = '<div class="cal-nav"><button type="button" id="cal-prev">Previous</button><strong>' + escapeHtml(monthName) + '</strong><button type="button" id="cal-next">Next</button></div>';
+    html += '<div class="cal-month">';
+    for (const d of ['Sun','Mon','Tue','Wed','Thu','Fri','Sat']) html += '<div class="dow">' + d + '</div>';
+    const cells = lead + dim;
+    const total = Math.ceil(cells / 7) * 7;
+    for (let idx = 0; idx < total; idx++) {
+      const day = idx - lead + 1;
+      const inMonth = day >= 1 && day <= dim;
+      const key = inMonth ? (y + '-' + pad2(m) + '-' + pad2(day)) : '';
+      const isToday = inMonth && y === cur.year && m === cur.month && day === cur.day;
+      html += '<div class="cal-cell' + (inMonth ? '' : ' out') + (isToday ? ' today' : '') + '">';
+      html += '<div class="num">' + (inMonth ? day : '') + '</div>';
+      const list = (inMonth && byDay.get(key)) || [];
+      for (const i of list) {
+        const s = seriesById(i.series_id);
+        const p = tzParts(i.scheduled_at, tz);
+        html += '<button type="button" class="cal-chip' + (instMuted(i) ? ' muted' : '') + '" data-series="' + escapeHtml(i.series_id) + '" data-inst="' + escapeHtml(i.id) + '">' + pad2(p.hour) + ':' + pad2(p.minute) + ' ' + escapeHtml((s && s.title) || 'Event') + '</button>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+    body.innerHTML = html;
+    const prev = body.querySelector('#cal-prev');
+    const next = body.querySelector('#cal-next');
+    if (prev) prev.onclick = () => {
+      let mm = state.calMonth.m - 1, yy = state.calMonth.y;
+      if (mm < 1) { mm = 12; yy -= 1; }
+      state.calMonth = { y: yy, m: mm };
+      void paintCalendar();
+    };
+    if (next) next.onclick = () => {
+      let mm = state.calMonth.m + 1, yy = state.calMonth.y;
+      if (mm > 12) { mm = 1; yy += 1; }
+      state.calMonth = { y: yy, m: mm };
+      void paintCalendar();
+    };
+    bindCalItems(body);
+  }
+
+  function bindCalItems(root) {
+    root.querySelectorAll('[data-series]').forEach(btn => {
+      btn.onclick = () => openCalDetail(btn.getAttribute('data-series'), btn.getAttribute('data-inst'));
+    });
+  }
+
+  async function openCalDetail(seriesId, instanceId) {
+    if (!seriesId) return;
+    let series = seriesById(seriesId);
+    let instances = (state.calendar.instances || []).filter(i => i.series_id === seriesId);
+    let nextFire = null;
+    try {
+      const res = await api('/v1/calendar/series/' + encodeURIComponent(seriesId));
+      series = res.series || series;
+      if (res.instances) instances = res.instances;
+      nextFire = res.nextFire;
+    } catch {}
+    if (!series) return;
+    const inst = instanceId ? (instances.find(i => i.id === instanceId) || (state.calendar.instances || []).find(i => i.id === instanceId)) : null;
+    const lastRun = instances.find(i => i.turn_id);
+    const tz = series.timezone || orgTimezone();
+    const running = inst && inst.status === 'running';
+    const overlay = h('<div class="overlay"><div class="modal">' +
+      '<h2 id="cal-d-title">' + escapeHtml(series.title) + '</h2>' +
+      '<p class="muted">' + escapeHtml(kindBadge(series)) + (series.status && series.status !== 'proposed' && series.status !== 'active' ? ' · ' + escapeHtml(series.status) : '') + '</p>' +
+      '<p>' + escapeHtml(rruleProse(series.rrule)) + '</p>' +
+      '<p class="muted">Assignee · ' + escapeHtml(botName(series.assignee_bot_id)) + '</p>' +
+      (lastRun && lastRun.turn_id ? '<p><button type="button" class="linkish" id="cal-last-run">Last run ' + escapeHtml(fmtWhenTz(lastRun.finished_at || lastRun.started_at || lastRun.scheduled_at, tz)) + '</button></p>' : '') +
+      (nextFire ? '<p class="muted">Next fire · ' + escapeHtml(fmtWhenTz(nextFire, tz)) + '</p>' : '') +
+      (running ? '<p class="muted">In-flight — this run will finish.</p>' : '') +
+      '<p class="err" id="cal-d-err" hidden></p>' +
+      '<div class="modal-actions">' +
+      (series.status === 'proposed' ? '' : '<button type="button" id="cal-pause">' + (series.status === 'paused' ? 'Resume' : 'Pause') + '</button>') +
+      '<button type="button" id="cal-edit">Edit</button>' +
+      (inst && !running ? '<button type="button" id="cal-del-occ">Delete this occurrence</button>' : '') +
+      '<button type="button" id="cal-del-series">Delete this series</button>' +
+      '<button type="button" class="primary" id="cal-d-close">Close</button>' +
+      '</div></div></div>');
+    overlay.querySelector('.modal').setAttribute('aria-labelledby', 'cal-d-title');
+    const close = openOverlay(overlay);
+    overlay.querySelector('#cal-d-close').onclick = close;
+    const lastBtn = overlay.querySelector('#cal-last-run');
+    if (lastBtn) lastBtn.onclick = () => {
+      close();
+      const tid = series.thread_id;
+      const group = tid && (state.groups || []).some(g => g.id === tid);
+      if (group) void selectGroup(tid);
+      else if (series.assignee_bot_id) void selectBot(series.assignee_bot_id);
+    };
+    const pauseBtn = overlay.querySelector('#cal-pause');
+    if (pauseBtn) pauseBtn.onclick = async () => {
+      try {
+        await api('/v1/calendar/series/' + encodeURIComponent(series.id) + '/pause', { method:'POST', body: JSON.stringify({ paused: series.status !== 'paused' }) });
+        close();
+        await paintCalendar();
+      } catch (e) {
+        const err = overlay.querySelector('#cal-d-err');
+        err.hidden = false;
+        err.textContent = e.message || 'Could not pause';
+      }
+    };
+    overlay.querySelector('#cal-edit').onclick = () => { close(); openEventForm(series); };
+    const delOcc = overlay.querySelector('#cal-del-occ');
+    if (delOcc) delOcc.onclick = async () => {
+      const ok = await askConfirm({ title: 'Delete this occurrence?', body: 'This occurrence will not fire. The rest of the series stays.', confirmLabel: 'Delete occurrence' });
+      if (!ok) return;
+      try {
+        await api('/v1/calendar/instances/' + encodeURIComponent(inst.id) + '/cancel', { method:'POST', body: '{}' });
+        close();
+        await paintCalendar();
+      } catch (e) {
+        if (e.status === 409) {
+          const err = overlay.querySelector('#cal-d-err');
+          err.hidden = false;
+          err.textContent = 'In-flight — this run will finish.';
+          return;
+        }
+        const err = overlay.querySelector('#cal-d-err');
+        err.hidden = false;
+        err.textContent = e.message || 'Could not cancel';
+      }
+    };
+    overlay.querySelector('#cal-del-series').onclick = async () => {
+      const ok = await askConfirm({ title: 'Delete this series?', body: 'This series will stop. History stays.', confirmLabel: 'Delete series' });
+      if (!ok) return;
+      try {
+        await api('/v1/calendar/series/' + encodeURIComponent(series.id), { method:'DELETE' });
+        close();
+        await paintCalendar();
+      } catch (e) {
+        const err = overlay.querySelector('#cal-d-err');
+        err.hidden = false;
+        err.textContent = e.message || 'Could not delete';
+      }
+    };
+  }
+
+  function openNewEvent() { openEventForm(null); }
+
+  function openEventForm(series) {
+    const tzDefault = (series && series.timezone) || orgTimezone();
+    const botDefault = (series && series.assignee_bot_id) || (state.bot && !isGatewayBot(state.bot) ? state.bot.id : null) || (state.bots[0] && state.bots[0].id) || '';
+    const localDefault = series ? toLocalInput(series.dtstart_utc, tzDefault) : (function() {
+      const p = tzParts(Date.now() + 86400000, tzDefault);
+      return p.year + '-' + pad2(p.month) + '-' + pad2(p.day) + 'T09:00';
+    })();
+    const repeatDef = repeatFromRrule(series && series.rrule);
+    const bot = state.bots.find(b => b.id === botDefault);
+    const approveDef = series ? Boolean(Number(series.require_human_approval)) : Boolean(bot && Number(bot.require_human_approval));
+    const overlay = h('<div class="overlay"><div class="modal">' +
+      '<h2 id="cal-e-title">' + (series ? 'Edit event' : 'New event') + '</h2>' +
+      '<label for="cal-title">Title</label><input id="cal-title" maxlength="200" value="' + escapeHtml((series && series.title) || '') + '" />' +
+      '<label for="cal-bot">Assignee</label><select id="cal-bot">' + deskBotOptions(botDefault) + '</select>' +
+      '<label for="cal-when">When</label><input id="cal-when" type="datetime-local" value="' + escapeHtml(localDefault) + '" />' +
+      '<label for="cal-tz">Timezone</label>' + zoneSelectHtml('cal-tz', tzDefault) +
+      '<label for="cal-repeat">Repeat</label><select id="cal-repeat">' +
+        '<option value="none"' + (repeatDef === 'none' ? ' selected' : '') + '>Does not repeat</option>' +
+        '<option value="weekdays"' + (repeatDef === 'weekdays' ? ' selected' : '') + '>Weekdays 09:00</option>' +
+        '<option value="daily"' + (repeatDef === 'daily' ? ' selected' : '') + '>Daily</option>' +
+        '<option value="weekly"' + (repeatDef === 'weekly' ? ' selected' : '') + '>Weekly</option>' +
+        '<option value="custom"' + (repeatDef === 'custom' ? ' selected' : '') + '>Custom RRULE</option>' +
+      '</select>' +
+      '<label for="cal-rrule" id="cal-rrule-lab"' + (repeatDef === 'custom' ? '' : ' hidden') + '>RRULE</label>' +
+      '<input id="cal-rrule" maxlength="512" value="' + escapeHtml((repeatDef === 'custom' && series && series.rrule) || '') + '"' + (repeatDef === 'custom' ? '' : ' hidden') + ' />' +
+      '<label for="cal-prompt">Prompt</label><textarea id="cal-prompt" maxlength="32000" rows="5">' + escapeHtml((series && series.prompt) || '') + '</textarea>' +
+      '<label><input type="checkbox" id="cal-approve"' + (approveDef ? ' checked' : '') + ' /> Require approval for SendMessage</label>' +
+      '<p class="err" id="cal-e-err" hidden></p>' +
+      '<div class="modal-actions"><button type="button" class="primary" id="cal-save">' + (series ? 'Save' : 'Create') + '</button><button type="button" id="cal-e-close">Cancel</button></div>' +
+      '</div></div>');
+    overlay.querySelector('.modal').setAttribute('aria-labelledby', 'cal-e-title');
+    const close = openOverlay(overlay);
+    overlay.querySelector('#cal-e-close').onclick = close;
+    const repeatEl = overlay.querySelector('#cal-repeat');
+    const rruleEl = overlay.querySelector('#cal-rrule');
+    const rruleLab = overlay.querySelector('#cal-rrule-lab');
+    function syncRepeat() {
+      const custom = repeatEl.value === 'custom';
+      rruleEl.hidden = !custom;
+      rruleLab.hidden = !custom;
+    }
+    repeatEl.onchange = syncRepeat;
+    overlay.querySelector('#cal-bot').onchange = () => {
+      const b = state.bots.find(x => x.id === overlay.querySelector('#cal-bot').value);
+      if (!series) overlay.querySelector('#cal-approve').checked = Boolean(b && Number(b.require_human_approval));
+    };
+    overlay.querySelector('#cal-save').onclick = async () => {
+      const err = overlay.querySelector('#cal-e-err');
+      const title = overlay.querySelector('#cal-title').value.trim();
+      const prompt = overlay.querySelector('#cal-prompt').value;
+      const botId = overlay.querySelector('#cal-bot').value;
+      const dtstart = overlay.querySelector('#cal-when').value;
+      const timezone = overlay.querySelector('#cal-tz').value.trim();
+      const rrule = rruleFromRepeat(repeatEl.value, dtstart, rruleEl.value);
+      if (!title || !prompt || !botId || !dtstart) {
+        err.hidden = false;
+        err.textContent = 'Title, assignee, when, and prompt are required.';
+        return;
+      }
+      try {
+        if (series) {
+          await api('/v1/calendar/series/' + encodeURIComponent(series.id), { method:'PATCH', body: JSON.stringify({ title, prompt, botId, dtstart, timezone, rrule, requireHumanApproval: overlay.querySelector('#cal-approve').checked }) });
+        } else {
+          const body = { title, prompt, botId, dtstart, timezone, requireHumanApproval: overlay.querySelector('#cal-approve').checked };
+          if (rrule) body.rrule = rrule;
+          await api('/v1/calendar/series', { method:'POST', body: JSON.stringify(body) });
+        }
+        close();
+        if (state.view === 'calendar') await paintCalendar();
+        else { state.view = 'calendar'; renderApp(); }
+      } catch (e) {
+        err.hidden = false;
+        err.textContent = e.message || 'Could not save';
+      }
+    };
+  }
+
   function setLiveRaw(raw) {
     state.liveRaw = raw;
     try { localStorage.setItem('openbot-live-raw', raw ? '1' : '0'); } catch {}
@@ -1324,7 +1789,8 @@ export const SPA_HTML = `<!DOCTYPE html>
         if (match) { match.presence = b.presence; match.doing = b.doing; }
       }
       if (state.view === 'activity') void paintActivity();
-      else paintMessages();
+      else if (state.view === 'calendar') void paintCalendar();
+      else if (state.view !== 'archive') paintMessages();
     } catch {}
   }
 
@@ -1532,6 +1998,7 @@ export const SPA_HTML = `<!DOCTYPE html>
 
   async function reloadThread() {
     if (state.view === 'activity') { void paintActivity(); return; }
+    if (state.view === 'calendar') { void paintCalendar(); return; }
     if (state.view === 'archive') return;
     try {
       let t;
@@ -1599,6 +2066,9 @@ export const SPA_HTML = `<!DOCTYPE html>
       if (msg.type === 'permission_request') showPerm(msg);
       if (msg.type === 'bots.updated') {
         void refreshRoster().then(() => renderApp());
+      }
+      if (msg.type === 'calendar.updated' || msg.type === 'calendar.proposed' || msg.type === 'calendar.fire') {
+        if (state.view === 'calendar') void paintCalendar();
       }
     };
   }
@@ -1891,6 +2361,7 @@ export const SPA_HTML = `<!DOCTYPE html>
       if (info && info.pubkey) orgPub = String(info.pubkey);
       if (!orgId && info && info.orgId) orgId = String(info.orgId);
     } catch {}
+    const curTz = (state.org && state.org.timezone) || 'UTC';
     const overlay = h(\`<div class="overlay"><div class="modal">
       <h2 id="set-title">Settings</h2>
       <p class="muted">\${harnessBlurb()}</p>
@@ -1901,6 +2372,11 @@ export const SPA_HTML = `<!DOCTYPE html>
         <button type="button" id="fed-off" aria-pressed="\${fedOn ? 'false' : 'true'}">Off</button>
       </div>
       <p class="err" id="fed-err" hidden></p>
+      <h2 style="margin-top:16px;font-size:1rem">Timezone</h2>
+      <p class="muted">Used when you type 9am. Existing events keep their own zone. Defaults to UTC until you pick one.</p>
+      <label for="org-tz">IANA timezone</label>
+      \${zoneSelectHtml('org-tz', curTz)}
+      <p class="err" id="tz-err" hidden></p>
       <h2 style="margin-top:16px;font-size:1rem">This org</h2>
       <p class="muted">Share org id and pubkey with the other operator. Never the private key.</p>
       <label for="org-id">Org id</label>
@@ -2006,6 +2482,22 @@ export const SPA_HTML = `<!DOCTYPE html>
     }
     overlay.querySelector('#fed-on').onclick = () => setFederation(true);
     overlay.querySelector('#fed-off').onclick = () => setFederation(false);
+    async function saveTimezone() {
+      const err = overlay.querySelector('#tz-err');
+      const tz = (overlay.querySelector('#org-tz').value || '').trim();
+      if (!tz) { err.hidden = false; err.textContent = 'Pick a timezone'; return false; }
+      try {
+        const res = await api('/v1/org', { method:'PATCH', body: JSON.stringify({ timezone: tz }) });
+        state.org = res;
+        err.hidden = true;
+        return true;
+      } catch (e) {
+        err.hidden = false;
+        err.textContent = e.message || 'Invalid timezone';
+        return false;
+      }
+    }
+    overlay.querySelector('#org-tz').onchange = () => { void saveTimezone(); };
     overlay.querySelector('#copy-org-id').onclick = (e) => copyText(overlay.querySelector('#org-id').value, e.currentTarget, 'Copied org id');
     overlay.querySelector('#copy-org-pub').onclick = (e) => copyText(overlay.querySelector('#org-pub').value, e.currentTarget, 'Copied pubkey');
     let peerPreview = null;
@@ -2138,6 +2630,8 @@ export const SPA_HTML = `<!DOCTYPE html>
     void refreshSolicits();
     bindInferenceSelects(overlay, '#set-model', '#set-effort');
     overlay.querySelector('#save').onclick = async () => {
+      const tzOk = await saveTimezone();
+      if (!tzOk) return;
       const key = overlay.querySelector('#set-key').value.trim();
       if (key) await api('/v1/credentials/xai', { method:'PUT', body: JSON.stringify({ key }) });
       if (state.bot) {

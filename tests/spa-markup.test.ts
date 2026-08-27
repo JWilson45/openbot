@@ -41,6 +41,11 @@ describe("desk SPA markup", () => {
     expect(html).toContain("Type DELETE to confirm wipe");
     expect(html).toContain("open-archive");
     expect(html).toContain("Archive");
+    expect(html).toContain("open-calendar");
+    expect(html).toContain("inCalendar");
+    expect(html).toContain("timezone");
+    expect(html).toContain("calendar.proposed");
+    expect(html).not.toContain("Schedule vs Routine");
     expect(html).toContain("Readable");
     expect(html).toContain("live-human");
     expect(html).toContain("collapse-rail");
