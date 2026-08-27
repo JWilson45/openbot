@@ -853,6 +853,7 @@ export const SPA_HTML = `<!DOCTYPE html>
         <button type="button" id="open-orgs" aria-haspopup="dialog">Orgs</button>
         <button type="button" class="side-toggle" id="live-toggle" aria-expanded="false">Live work</button>
         \${!inArchive && !inActivity && !inCalendar && !inGroup && state.bot && !gwSelected ? '<button type="button" id="archive-bot">Archive</button>' : ''}
+        \${((state.view === 'human' && !gwSelected) || inGroup) && state.thread ? '<button type="button" id="learn-this">Learn this</button>' : ''}
         <button type="button" id="help" aria-haspopup="dialog">Help</button>
         <button type="button" id="takeover">Takeover</button>
         <button type="button" id="settings">Settings</button>
@@ -932,6 +933,7 @@ export const SPA_HTML = `<!DOCTYPE html>
     bind('#cal-agenda', () => setCalMode('agenda'));
     bind('#cal-month', () => setCalMode('month'));
     bind('#cal-new', openNewEvent);
+    bind('#learn-this', learnThis);
     bind('#archive-bot', archiveCurrentBot);
     bind('#collapse-rail', () => togglePane('rail'));
     bind('#collapse-side', () => togglePane('side'));
@@ -1457,6 +1459,25 @@ export const SPA_HTML = `<!DOCTYPE html>
     renderApp();
     await paintCalendar();
   }
+  async function learnThis() {
+    if (!state.thread || (state.view !== 'human' && state.view !== 'group')) return;
+    const ok = await askConfirm({
+      title: 'Learn this',
+      body: 'This saves a prompt you can edit, not a recording of clicks. OpenBot will not replay the browser session.',
+      confirmLabel: 'Learn this',
+    });
+    if (!ok) return;
+    try {
+      const res = await api('/v1/calendar/learn', { method:'POST', body: JSON.stringify({ threadId: state.thread.id }) });
+      state.calMode = 'agenda';
+      state.view = 'calendar';
+      renderApp();
+      await paintCalendar();
+      if (res && res.series) openEventForm(res.series);
+    } catch (e) {
+      announce(e.message || 'Could not learn this');
+    }
+  }
   function setCalMode(mode) {
     state.calMode = mode === 'month' ? 'month' : 'agenda';
     const ag = document.getElementById('cal-agenda');
@@ -1632,15 +1653,28 @@ export const SPA_HTML = `<!DOCTYPE html>
       (running ? '<p class="muted">In-flight — this run will finish.</p>' : '') +
       '<p class="err" id="cal-d-err" hidden></p>' +
       '<div class="modal-actions">' +
+      (series.status === 'proposed' ? '<button type="button" class="primary" id="cal-confirm">Confirm</button>' : '') +
       (series.status === 'proposed' || cancelled ? '' : '<button type="button" id="cal-pause">' + (series.status === 'paused' ? 'Resume' : 'Pause') + '</button>') +
       (cancelled ? '' : '<button type="button" id="cal-edit">Edit</button>') +
       (canCancelOcc ? '<button type="button" id="cal-del-occ">Delete this occurrence</button>' : '') +
       (cancelled ? '' : '<button type="button" id="cal-del-series">Delete this series</button>') +
-      '<button type="button" class="primary" id="cal-d-close">Close</button>' +
+      '<button type="button"' + (series.status === 'proposed' ? '' : ' class="primary"') + ' id="cal-d-close">Close</button>' +
       '</div></div></div>');
     overlay.querySelector('.modal').setAttribute('aria-labelledby', 'cal-d-title');
     const close = openOverlay(overlay);
     overlay.querySelector('#cal-d-close').onclick = close;
+    const confirmBtn = overlay.querySelector('#cal-confirm');
+    if (confirmBtn) confirmBtn.onclick = async () => {
+      try {
+        await api('/v1/calendar/series/' + encodeURIComponent(series.id) + '/confirm', { method:'POST', body: '{}' });
+        close();
+        await paintCalendar();
+      } catch (e) {
+        const err = overlay.querySelector('#cal-d-err');
+        err.hidden = false;
+        err.textContent = e.message || 'Could not confirm';
+      }
+    };
     const lastBtn = overlay.querySelector('#cal-last-run');
     if (lastBtn) lastBtn.onclick = () => {
       close();
@@ -1712,7 +1746,8 @@ export const SPA_HTML = `<!DOCTYPE html>
     const bot = state.bots.find(b => b.id === botDefault);
     const approveDef = series ? Boolean(Number(series.require_human_approval)) : Boolean(bot && Number(bot.require_human_approval));
     const overlay = h('<div class="overlay"><div class="modal">' +
-      '<h2 id="cal-e-title">' + (series ? 'Edit event' : 'New event') + '</h2>' +
+      '<h2 id="cal-e-title">' + (series ? (series.status === 'proposed' ? 'Proposed routine' : 'Edit event') : 'New event') + '</h2>' +
+      (series && series.status === 'proposed' ? '<p class="muted">This saves a prompt you can edit, not a recording of clicks. OpenBot will not replay the browser session.</p>' : '') +
       '<label for="cal-title">Title</label><input id="cal-title" maxlength="200" value="' + escapeHtml((series && series.title) || '') + '" />' +
       '<label for="cal-bot">Assignee</label><select id="cal-bot">' + deskBotOptions(botDefault) + '</select>' +
       '<label for="cal-when">When</label><input id="cal-when" type="datetime-local" value="' + escapeHtml(localDefault) + '" />' +
@@ -1729,7 +1764,10 @@ export const SPA_HTML = `<!DOCTYPE html>
       '<label for="cal-prompt">Prompt</label><textarea id="cal-prompt" maxlength="32000" rows="5">' + escapeHtml((series && series.prompt) || '') + '</textarea>' +
       '<label><input type="checkbox" id="cal-approve"' + (approveDef ? ' checked' : '') + ' /> Require approval for SendMessage</label>' +
       '<p class="err" id="cal-e-err" hidden></p>' +
-      '<div class="modal-actions"><button type="button" class="primary" id="cal-save">' + (series ? 'Save' : 'Create') + '</button><button type="button" id="cal-e-close">Cancel</button></div>' +
+      '<div class="modal-actions">' +
+      (series && series.status === 'proposed' ? '<button type="button" class="primary" id="cal-confirm">Confirm</button>' : '') +
+      '<button type="button"' + (series && series.status === 'proposed' ? '' : ' class="primary"') + ' id="cal-save">' + (series ? 'Save' : 'Create') + '</button>' +
+      '<button type="button" id="cal-e-close">Cancel</button></div>' +
       '</div></div>');
     overlay.querySelector('.modal').setAttribute('aria-labelledby', 'cal-e-title');
     const close = openOverlay(overlay);
@@ -1747,7 +1785,7 @@ export const SPA_HTML = `<!DOCTYPE html>
       const b = state.bots.find(x => x.id === overlay.querySelector('#cal-bot').value);
       if (!series) overlay.querySelector('#cal-approve').checked = Boolean(b && Number(b.require_human_approval));
     };
-    overlay.querySelector('#cal-save').onclick = async () => {
+    async function submitCalForm(activate) {
       const err = overlay.querySelector('#cal-e-err');
       const title = overlay.querySelector('#cal-title').value.trim();
       const prompt = overlay.querySelector('#cal-prompt').value;
@@ -1758,23 +1796,37 @@ export const SPA_HTML = `<!DOCTYPE html>
       if (!title || !prompt || !botId || !dtstart) {
         err.hidden = false;
         err.textContent = 'Title, assignee, when, and prompt are required.';
-        return;
+        return false;
       }
       try {
         if (series) {
           await api('/v1/calendar/series/' + encodeURIComponent(series.id), { method:'PATCH', body: JSON.stringify({ title, prompt, botId, dtstart, timezone, rrule, requireHumanApproval: overlay.querySelector('#cal-approve').checked }) });
+          if (activate && series.status === 'proposed') {
+            await api('/v1/calendar/series/' + encodeURIComponent(series.id) + '/confirm', { method:'POST', body: '{}' });
+          }
         } else {
           const body = { title, prompt, botId, dtstart, timezone, requireHumanApproval: overlay.querySelector('#cal-approve').checked };
           if (rrule) body.rrule = rrule;
           await api('/v1/calendar/series', { method:'POST', body: JSON.stringify(body) });
         }
-        close();
-        if (state.view === 'calendar') await paintCalendar();
-        else { state.view = 'calendar'; renderApp(); }
+        return true;
       } catch (e) {
         err.hidden = false;
-        err.textContent = e.message || 'Could not save';
+        err.textContent = e.message || (activate ? 'Could not confirm' : 'Could not save');
+        return false;
       }
+    }
+    async function finishCalForm() {
+      close();
+      if (state.view === 'calendar') await paintCalendar();
+      else { state.view = 'calendar'; renderApp(); }
+    }
+    overlay.querySelector('#cal-save').onclick = async () => {
+      if (await submitCalForm(false)) await finishCalForm();
+    };
+    const confirmBtn = overlay.querySelector('#cal-confirm');
+    if (confirmBtn) confirmBtn.onclick = async () => {
+      if (await submitCalForm(true)) await finishCalForm();
     };
   }
 
