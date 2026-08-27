@@ -15,9 +15,13 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 
 ## Honesty (read this)
 
-- **Closing this browser tab does not stop your teammate.**
-- **Stopping `openbot server` / `openbot demo` does.** Stopping the **VM** that runs it makes that org **unreachable** until it boots again. Peers see timeouts, not a hosted retry. sqlite, `org.ed25519`, and inbox rows stay on disk.
+- **Closing this browser tab does not stop your teammate.** A turn the calendar already queued keeps running.
+- **Stopping `openbot server` / `openbot demo` does.** Stopping the **VM** that runs it makes that org **unreachable** until it boots again. Peers see timeouts, not a hosted retry. sqlite, `org.ed25519`, and inbox rows stay on disk. Stopping the process stops the **clock and the turn**.
 - If you want work to continue while a laptop is closed, run the server on a machine that stays up (VPS, home server, systemd) — not on the laptop you are about to shut.
+- **The calendar runs only while `openbot server` runs.** Closed laptop / stopped unit / stopped VM: the 9am did not happen. At most one catch-up if down less than a day. OpenBot will not replay a weekend of missed summaries.
+- **Watch-me-do-it v1 is not a recording.** **Learn this** drafts a proposed calendar event from a thread. You edit it. No click replay.
+- **This is not Google Calendar.** No sync. No invites. Org-local sqlite.
+- **Schedules and learned routines are two products** on the same grid.
 - `$OPENBOT_HOME/desk` is a **shared computer**. It is **not** a security boundary **inside** an org. Every bot on the account can read and write the desk the way you can. There is **one Chromium** for the whole team. Cross-org is messages only (hop=1).
 - Vault files (`master.key`, `org.ed25519`, credentials) live **outside** `desk/`. Do not copy secrets into the workspace Grok can see.
 - Restarting the server starts a new Grok ACP process. Chat history is in SQLite; OpenBot injects a thread digest on the next turn so the bot continues instead of announcing amnesia.
@@ -40,6 +44,7 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 | Live work | Collapsible thinking and tool calls in a resizable sidebar. Activity board for the whole team. |
 | Takeover | You grab the shared Chromium (screencast + input). Esc / Close ends it. |
 | Archive | Soft-delete folder. Restore, or type `DELETE` to purge. Expired archives (30 days) are removed automatically. |
+| Calendar / schedules / Learn this | Org-local sqlite (not Google Calendar: no sync, no invites). Schedules and learned routines are two products on the same grid. **Learn this** drafts a proposed event from a thread — not a recording. The clock is the process. |
 | OpenAI-compatible API | Open WebUI (and similar) can use a bot as `openbot/<Name>` with a `sk-ob_…` key. Two connections = two orgs (mint the key on that VM). |
 | Org / Gateway | One process is one org. Auto-provisioned **Gateway** diplomat (not a seventh desk slot). Federation **off** until `openbot gateway on` on both peers. |
 | Auth | Local demo login on loopback, or GitHub OAuth + allowlist. Optional vaulted `XAI_API_KEY`; `grok login` is enough. |
@@ -363,6 +368,7 @@ Bun workspaces.
 ```
 apps/server/          Hono app, SPA, CLI, turn engine, OpenAI shim
 packages/acp-grok/    grok agent stdio client, isolated GROK_HOME, model catalog
+packages/calendar/    RRULE subset, civil expansion, calendar constants
 packages/runner/      localhost compute: desk, Chromium CDP, per-bot ACP
 packages/db/          SQLite schema + purge / archive
 packages/live-work/   messages, promote(), live-work events, thread digest
@@ -371,7 +377,7 @@ packages/federation/  Ed25519 JWS for /fed/v1
 packages/vault/       credential encryption
 packages/auth/        GitHub / local session, allowlist
 packages/compute-protocol/  five-method host contract
-docs/design/          Phase 1 / Phase 2 / Phase 3 design notes
+docs/design/          Phase 1–4 design notes
 tests/                bun:test; fake ACP, no live xAI required
 ```
 
@@ -404,7 +410,7 @@ CI (`.github/workflows/ci.yml`) is `bun install --frozen-lockfile` then `bun tes
 - Remote runner (orchestrator on A, grok on B).
 - Mobile / desktop apps, Postgres control plane, per-bot filesystem isolation.
 
-Design background: [docs/design/phase-1-always-on-teammate-loop.md](docs/design/phase-1-always-on-teammate-loop.md), [docs/design/phase-2-team-on-one-desk.md](docs/design/phase-2-team-on-one-desk.md), [docs/design/phase-3-orgs-vms-gateway.md](docs/design/phase-3-orgs-vms-gateway.md).
+Design background: [docs/design/phase-1-always-on-teammate-loop.md](docs/design/phase-1-always-on-teammate-loop.md), [docs/design/phase-2-team-on-one-desk.md](docs/design/phase-2-team-on-one-desk.md), [docs/design/phase-3-orgs-vms-gateway.md](docs/design/phase-3-orgs-vms-gateway.md), [docs/design/phase-4-calendar-automations.md](docs/design/phase-4-calendar-automations.md).
 
 ---
 
