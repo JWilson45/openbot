@@ -59,6 +59,7 @@ import {
 } from "@openbot/calendar";
 import { SPA_HTML } from "./spa.ts";
 import { TurnEngine } from "./engine.ts";
+import { reconcileCalendarInstance } from "./calendar-tick.ts";
 import { mountOpenAiCompat } from "./openai.ts";
 import {
   clientRateKey,
@@ -1544,6 +1545,7 @@ export function createApp(cfg: HomeConfig): {
       cancelled = true;
     }
     if (cancelled) {
+      reconcileCalendarInstance(db, turn.id);
       const bot = db.get<{ role: string | null }>("SELECT role FROM bots WHERE id = ?", [turn.bot_id]);
       if (isGatewayRole(bot?.role) && federationEffective(currentOrgMeta(db))) {
         ctx.engine.maybeKickGatewayDrain(turn.bot_id);

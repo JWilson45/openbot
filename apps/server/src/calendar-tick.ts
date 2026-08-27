@@ -106,6 +106,12 @@ export function tickCalendar(db: OpenbotDb, nowMs: number): TickCalendarResult {
         stats.skippedCoalesce += 1;
       }
 
+      if (!series.thread_id) {
+        skipNoThread(db, series, latest, nowMs);
+        refreshNextDue(db, series.id, nowMs);
+        continue;
+      }
+
       const inflight = db.get<{ n: number }>(
         `SELECT COUNT(*) AS n FROM calendar_instances
           WHERE series_id = ? AND status IN ('queued', 'running')`,
@@ -129,9 +135,9 @@ export function tickCalendar(db: OpenbotDb, nowMs: number): TickCalendarResult {
         continue;
       }
       const series = db.get<SeriesRow>("SELECT * FROM calendar_series WHERE id = ?", [cand.series.id]) ?? cand.series;
-      if (enqueueInstance(db, series, cand.instance, nowMs)) {
-        stats.enqueued += 1;
-      } else {
+      const outcome = enqueueInstance(db, series, cand.instance, nowMs);
+      if (outcome === "enqueued") stats.enqueued += 1;
+      else if (outcome === "due") {
         db.run(`UPDATE calendar_instances SET status = 'due' WHERE id = ?`, [cand.instance.id]);
       }
       refreshNextDue(db, series.id, nowMs);
@@ -259,23 +265,19 @@ function materializeActiveSeries(db: OpenbotDb, nowMs: number): void {
   }
 }
 
-function enqueueInstance(db: OpenbotDb, series: SeriesRow, inst: InstanceRow, nowMs: number): boolean {
-  if (!series.assignee_bot_id) return false;
-  if (!liveDeskAssignee(db, series.assignee_bot_id)) return false;
+function enqueueInstance(db: OpenbotDb, series: SeriesRow, inst: InstanceRow, nowMs: number): "enqueued" | "due" | "skipped" {
+  if (!series.assignee_bot_id) return "due";
+  if (!liveDeskAssignee(db, series.assignee_bot_id)) return "due";
   if (!series.thread_id) {
-    audit(db, series.account_id, "calendar.skip", {
-      seriesId: series.id,
-      instanceId: inst.id,
-      reason: "no_thread",
-    });
-    return false;
+    skipNoThread(db, series, inst, nowMs);
+    return "skipped";
   }
   const queued = db.get<{ n: number }>(
     "SELECT COUNT(*) AS n FROM turns WHERE bot_id = ? AND status = 'queued'",
     [series.assignee_bot_id],
   );
-  if ((queued?.n ?? 0) >= 5) return false;
-  if (series.last_fired_at != null && nowMs - series.last_fired_at < series.min_interval_ms) return false;
+  if ((queued?.n ?? 0) >= 5) return "due";
+  if (series.last_fired_at != null && nowMs - series.last_fired_at < series.min_interval_ms) return "due";
 
   const turnId = id();
   db.run(
@@ -300,7 +302,21 @@ function enqueueInstance(db: OpenbotDb, series: SeriesRow, inst: InstanceRow, no
     instanceId: inst.id,
     turnId,
   });
-  return true;
+  return "enqueued";
+}
+
+function skipNoThread(db: OpenbotDb, series: SeriesRow, inst: InstanceRow, nowMs: number): void {
+  db.run(
+    `UPDATE calendar_instances
+      SET status = 'cancelled', skipped_reason = 'no_thread', finished_at = ?
+      WHERE id = ? AND status IN ('scheduled', 'due')`,
+    [nowMs, inst.id],
+  );
+  audit(db, series.account_id, "calendar.skip", {
+    seriesId: series.id,
+    instanceId: inst.id,
+    reason: "no_thread",
+  });
 }
 
 function liveDeskAssignee(db: OpenbotDb, botId: string | null): boolean {

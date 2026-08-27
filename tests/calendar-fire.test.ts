@@ -38,7 +38,7 @@ function insertSeries(
   opts: {
     accountId: string;
     botId: string;
-    threadId: string;
+    threadId: string | null;
     title?: string;
     prompt: string;
     dtstartUtc: number;
@@ -146,6 +146,85 @@ describe("calendar fire", () => {
     expect(ctx.db.get<{ status: string }>("SELECT status FROM turns WHERE id = ?", [inst!.turn_id])?.status).toBe(
       "cancelled",
     );
+    server.stop(true);
+  });
+
+  test("POST /v1/turns/:id/cancel reconciles a queued calendar instance", async () => {
+    const { ctx, server, origin, headers } = startWorld();
+    const ada = await createBot(origin, headers, "Ada");
+    const accountId = ctx.db.get<{ account_id: string }>("SELECT account_id FROM bots WHERE id = ?", [ada.bot.id])!
+      .account_id;
+    const nine = Date.UTC(2026, 0, 1, 9, 0, 0);
+    const ten = Date.UTC(2026, 0, 1, 10, 0, 0);
+    const seriesId = insertSeries(ctx, {
+      accountId,
+      botId: ada.bot.id,
+      threadId: ada.threadId,
+      prompt: "hourly",
+      dtstartUtc: nine,
+      rrule: "FREQ=HOURLY;INTERVAL=1",
+    });
+    ctx.engine.tickCalendar(nine);
+    const first = ctx.db.get<{ id: string; turn_id: string; status: string }>(
+      "SELECT id, turn_id, status FROM calendar_instances WHERE series_id = ? AND scheduled_at = ?",
+      [seriesId, nine],
+    );
+    expect(first?.status).toBe("queued");
+    const cancelled = await fetch(`${origin}/v1/turns/${first!.turn_id}/cancel`, { method: "POST", headers });
+    expect(cancelled.status).toBe(200);
+    expect(ctx.db.get<{ status: string }>("SELECT status FROM turns WHERE id = ?", [first!.turn_id])?.status).toBe(
+      "cancelled",
+    );
+    expect(ctx.db.get<{ status: string }>("SELECT status FROM calendar_instances WHERE id = ?", [first!.id])?.status).toBe(
+      "cancelled",
+    );
+    ctx.engine.tickCalendar(ten + 60_000);
+    expect(
+      ctx.db.get<{ status: string; turn_id: string | null }>(
+        "SELECT status, turn_id FROM calendar_instances WHERE series_id = ? AND scheduled_at = ?",
+        [seriesId, ten],
+      )?.status,
+    ).toBe("queued");
+    server.stop(true);
+  });
+
+  test("missing thread_id skips the instance once and does not leave due", async () => {
+    const { ctx, server, origin, headers } = startWorld();
+    const ada = await createBot(origin, headers, "Ada");
+    const accountId = ctx.db.get<{ account_id: string }>("SELECT account_id FROM bots WHERE id = ?", [ada.bot.id])!
+      .account_id;
+    const nowMs = Date.now();
+    const seriesId = insertSeries(ctx, {
+      accountId,
+      botId: ada.bot.id,
+      threadId: null,
+      prompt: "[[send:no-thread]]",
+      dtstartUtc: nowMs - 60_000,
+    });
+    ctx.engine.tickCalendar(nowMs);
+    const inst = ctx.db.get<{ status: string; skipped_reason: string | null }>(
+      "SELECT status, skipped_reason FROM calendar_instances WHERE series_id = ? ORDER BY scheduled_at LIMIT 1",
+      [seriesId],
+    );
+    expect(inst?.status).toBe("cancelled");
+    expect(inst?.skipped_reason).toBe("no_thread");
+    expect(ctx.db.all("SELECT id FROM turns WHERE bot_id = ?", [ada.bot.id]).length).toBe(0);
+    const audits = ctx.db.all<{ type: string; payload: string }>(
+      "SELECT type, payload FROM audit_events WHERE type = 'calendar.skip' AND account_id = ?",
+      [accountId],
+    );
+    expect(audits.length).toBe(1);
+    expect(JSON.parse(audits[0]!.payload).reason).toBe("no_thread");
+    ctx.engine.tickCalendar(nowMs + 30_000);
+    expect(
+      ctx.db.all("SELECT id FROM audit_events WHERE type = 'calendar.skip' AND account_id = ?", [accountId]).length,
+    ).toBe(1);
+    expect(
+      ctx.db.get<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM calendar_instances WHERE series_id = ? AND status = 'due'",
+        [seriesId],
+      )?.n,
+    ).toBe(0);
     server.stop(true);
   });
 
