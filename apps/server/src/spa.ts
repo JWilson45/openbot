@@ -1372,15 +1372,43 @@ export const SPA_HTML = `<!DOCTYPE html>
     const p = tzParts(ms, tz);
     return p.year + '-' + pad2(p.month) + '-' + pad2(p.day) + 'T' + pad2(p.hour) + ':' + pad2(p.minute);
   }
+  function rruleInterval(rrule) {
+    const m = /(?:^|;)INTERVAL=(\d+)/i.exec(String(rrule || ''));
+    return m ? Math.max(1, Number(m[1])) : 1;
+  }
   function rruleProse(rrule) {
     if (!rrule) return 'Once';
     const u = String(rrule).replace(/^RRULE:/i, '').toUpperCase();
+    const n = rruleInterval(u);
+    if (u.indexOf('FREQ=MINUTELY') === 0) return n === 1 ? 'Every minute' : 'Every ' + n + ' minutes';
+    if (u.indexOf('FREQ=HOURLY') === 0) return n === 1 ? 'Hourly' : 'Every ' + n + ' hours';
     if (u.indexOf('BYDAY=MO,TU,WE,TH,FR') >= 0 && u.indexOf('BYHOUR=9') >= 0) return 'Weekdays at 9:00';
     if (u.indexOf('FREQ=DAILY') === 0) return 'Daily';
     if (u.indexOf('FREQ=WEEKLY') === 0) return 'Weekly';
     if (u.indexOf('FREQ=MONTHLY') === 0) return 'Monthly';
-    if (u.indexOf('FREQ=HOURLY') === 0) return 'Hourly';
     return rrule;
+  }
+  function seriesIsDense(s) {
+    const u = String((s && s.rrule) || '').toUpperCase();
+    return u.indexOf('FREQ=MINUTELY') === 0 || u.indexOf('FREQ=HOURLY') === 0;
+  }
+  function seriesNextFire(s) {
+    if (!s) return null;
+    const inst = (state.calendar.instances || []).filter(i => i.series_id === s.id && (i.status === 'scheduled' || i.status === 'due' || i.status === 'queued' || i.status === 'running'));
+    inst.sort((a, b) => a.scheduled_at - b.scheduled_at);
+    if (inst[0]) return inst[0].scheduled_at;
+    return s.next_due_at || null;
+  }
+  function seriesRowHtml(s) {
+    const tz = orgTimezone();
+    const next = seriesNextFire(s);
+    const cadence = rruleProse(s.rrule);
+    let when = 'no next fire';
+    if (s.status === 'paused') when = 'paused';
+    else if (s.status === 'proposed') when = 'needs confirm';
+    else if (next) when = 'next ' + fmtClockTz(next, tz);
+    const muted = s.status === 'paused' || s.status === 'cancelled';
+    return '<button type="button" class="cal-item' + (muted ? ' muted' : '') + '" data-series="' + escapeHtml(s.id) + '"><strong>' + escapeHtml(s.title) + '</strong> <span class="muted">' + escapeHtml(cadence) + ' · ' + escapeHtml(when) + ' · ' + escapeHtml(botName(s.assignee_bot_id)) + '</span></button>';
   }
   function repeatFromRrule(rrule) {
     if (!rrule) return 'none';
@@ -1518,45 +1546,26 @@ export const SPA_HTML = `<!DOCTYPE html>
   }
 
   function drawAgenda(body) {
-    const tz = orgTimezone();
-    const now = Date.now();
-    const todayKey = ymdKey(now, tz);
-    const until = now + 14 * 86400000;
-    const proposed = (state.calendar.series || []).filter(s => s.status === 'proposed');
-    const inst = (state.calendar.instances || []).slice().sort((a, b) => a.scheduled_at - b.scheduled_at);
-    const rows = inst.filter(i => {
-      if (i.scheduled_at > until) return false;
-      const day = ymdKey(i.scheduled_at, tz);
-      if (instMuted(i)) return i.scheduled_at >= now - 2 * 86400000;
-      return day >= todayKey || i.scheduled_at >= now - 60 * 1000;
-    });
+    const series = (state.calendar.series || []).filter(s => s.status !== 'cancelled');
+    const proposed = series.filter(s => s.status === 'proposed');
+    const active = series.filter(s => s.status === 'active').slice().sort((a, b) => (seriesNextFire(a) || 1e15) - (seriesNextFire(b) || 1e15));
+    const paused = series.filter(s => s.status === 'paused');
     let html = '';
     if (proposed.length) {
       html += '<h3>Proposed</h3>';
-      for (const s of proposed) {
-        html += '<button type="button" class="cal-item" data-series="' + escapeHtml(s.id) + '"><strong>' + escapeHtml(s.title) + '</strong> <span class="muted">' + escapeHtml(kindBadge(s)) + ' · ' + escapeHtml(botName(s.assignee_bot_id)) + '</span><div class="snip">' + escapeHtml(rruleProse(s.rrule)) + '</div></button>';
-      }
+      for (const s of proposed) html += seriesRowHtml(s);
     }
-    if (!rows.length && !proposed.length) {
-      html += '<p class="empty">No upcoming events. New event creates a schedule.</p>';
-      body.innerHTML = html;
-      bindCalItems(body);
-      return;
+    if (active.length) {
+      html += '<h3>Schedules</h3>';
+      for (const s of active) html += seriesRowHtml(s);
     }
-    let lastDay = '';
-    for (const i of rows) {
-      const day = ymdKey(i.scheduled_at, tz);
-      if (day !== lastDay) {
-        if (lastDay) html += '</div>';
-        lastDay = day;
-        const p = tzParts(i.scheduled_at, tz);
-        html += '<div class="cal-day"><div class="cal-day-label">' + escapeHtml((p.weekday || '') + ' ' + p.month + '/' + p.day) + '</div>';
-      }
-      const s = seriesById(i.series_id);
-      const note = instNote(i);
-      html += '<button type="button" class="cal-item' + (instMuted(i) ? ' muted' : '') + '" data-series="' + escapeHtml(i.series_id) + '" data-inst="' + escapeHtml(i.id) + '"><strong>' + escapeHtml((s && s.title) || 'Event') + '</strong> <span class="muted">' + escapeHtml(fmtClockTz(i.scheduled_at, tz)) + (s ? ' · ' + escapeHtml(kindBadge(s)) + ' · ' + escapeHtml(botName(s.assignee_bot_id)) : '') + (note ? ' · ' + escapeHtml(note) : '') + '</span></button>';
+    if (paused.length) {
+      html += '<h3>Paused</h3>';
+      for (const s of paused) html += seriesRowHtml(s);
     }
-    if (lastDay) html += '</div>';
+    if (!html) {
+      html = '<p class="empty">No upcoming events. New event creates a schedule.</p>';
+    }
     body.innerHTML = html;
     bindCalItems(body);
   }
@@ -1602,11 +1611,25 @@ export const SPA_HTML = `<!DOCTYPE html>
       const isToday = inMonth && y === cur.year && m === cur.month && day === cur.day;
       html += '<div class="cal-cell' + (inMonth ? '' : ' out') + (isToday ? ' today' : '') + '">';
       html += '<div class="num">' + (inMonth ? day : '') + '</div>';
-      const list = (inMonth && byDay.get(key)) || [];
-      for (const i of list) {
+      const list = ((inMonth && byDay.get(key)) || []).filter(i => {
         const s = seriesById(i.series_id);
-        html += '<button type="button" class="cal-chip' + (instMuted(i) ? ' muted' : '') + '" data-series="' + escapeHtml(i.series_id) + '" data-inst="' + escapeHtml(i.id) + '">' + escapeHtml(fmtClockTz(i.scheduled_at, tz) + ' ' + ((s && s.title) || 'Event')) + '</button>';
+        return s && s.status !== 'paused' && s.status !== 'cancelled';
+      });
+      const grouped = new Map();
+      for (const i of list) {
+        if (!grouped.has(i.series_id)) grouped.set(i.series_id, []);
+        grouped.get(i.series_id).push(i);
       }
+      grouped.forEach((items, sid) => {
+        const s = seriesById(sid);
+        if (seriesIsDense(s) || items.length > 2) {
+          html += '<button type="button" class="cal-chip" data-series="' + escapeHtml(sid) + '">' + escapeHtml(rruleProse(s && s.rrule) + ' · ' + ((s && s.title) || 'Event')) + '</button>';
+          return;
+        }
+        items.forEach(i => {
+          html += '<button type="button" class="cal-chip' + (instMuted(i) ? ' muted' : '') + '" data-series="' + escapeHtml(sid) + '" data-inst="' + escapeHtml(i.id) + '">' + escapeHtml(fmtClockTz(i.scheduled_at, tz) + ' ' + ((s && s.title) || 'Event')) + '</button>';
+        });
+      });
       const drafts = (inMonth && proposedByDay.get(key)) || [];
       for (const s of drafts) {
         html += '<button type="button" class="cal-chip" data-series="' + escapeHtml(s.id) + '">' + escapeHtml('Proposed · ' + (s.title || 'Event')) + '</button>';

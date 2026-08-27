@@ -53,6 +53,10 @@ describe("desk SPA markup", () => {
     expect(html).toContain("kind === 'routine'");
     expect(html).toContain("Proposed event");
     expect(html).toContain("Proposed · ");
+    expect(html).toContain("seriesRowHtml");
+    expect(html).toContain("Schedules");
+    expect(html).toContain("Every ");
+    expect(html).toContain("needs confirm");
     expect(html).toContain("Fires on");
     expect(html).not.toContain("Schedule vs Routine");
     expect(html).toContain("Readable");
