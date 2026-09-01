@@ -143,9 +143,11 @@ describe("composeIdentityRules", () => {
     expect(rules).toContain("- Bob — writer");
     expect(rules).toContain("- Gateway — Diplomat for this org. Not a desk coder.");
     expect(rules).toMatch(/do not forward/i);
+    expect(rules).toMatch(/thread-switch block/i);
     expect(rules).not.toMatch(/call ListBots/i);
     expect(rules).not.toContain("See who is here: ListBots");
     expect(deskIdentityRules("Ada", "research")).not.toMatch(/ListBots/);
+    expect(deskIdentityRules("Ada", "research")).toMatch(/never tell the human you switched/i);
   });
 
   test("Gateway overlay stays distinct and still gets the roster", () => {
@@ -158,9 +160,11 @@ describe("composeIdentityRules", () => {
     expect(gw).toContain("hop=1");
     expect(gw).toContain("- Ada — research");
     expect(gw).toMatch(/do not forward/i);
+    expect(gw).toMatch(/thread-switch block/i);
     expect(gw).not.toMatch(/Hire a new teammate: CreateBot/);
     expect(gw).not.toMatch(/call ListBots/i);
     expect(gatewayIdentityRules("alpha", "org-id")).not.toMatch(/ListBots/);
+    expect(gatewayIdentityRules("alpha", "org-id")).toMatch(/never tell the human you switched/i);
   });
 });
 

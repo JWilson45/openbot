@@ -184,6 +184,8 @@ export interface RunnerSession {
     rosterFp?: string,
   ): MaybePromise<boolean>;
   hasWarmBot(botId: string): MaybePromise<boolean>;
+  lastPromptThread(botId: string): MaybePromise<string | undefined>;
+  markPromptThread(botId: string, threadId: string): MaybePromise<void>;
   invalidateAcp(botId: string): MaybePromise<void>;
   kill(botId: string): MaybePromise<void>;
   reapIdle(

@@ -1,6 +1,13 @@
 import { join } from "node:path";
 import { id, now, purgeExpiredArchivedBots, purgeExpiredOrgInbox, type OpenbotDb, type TurnRow } from "@openbot/db";
-import { appendLiveWork, buildThreadDigest, insertMessage, promote, wrapPromptWithDigest } from "@openbot/live-work";
+import {
+  appendLiveWork,
+  buildThreadMemory,
+  formatThreadDigest,
+  insertMessage,
+  promote,
+  wrapPromptWithDigest,
+} from "@openbot/live-work";
 import { loadOverlayRoster, mintMcpToken, persistMcpToken, type McpInflight } from "@openbot/mcp-send-message";
 import { open, type Envelope } from "@openbot/vault";
 import {
@@ -363,10 +370,14 @@ export class TurnEngine {
     }>("SELECT * FROM bots WHERE id = ?", [turn.bot_id]);
     if (!bot) return;
 
-    const thread = this.opts.db.get<{ id: string; account_id: string; kind: string; title: string }>(
-      "SELECT * FROM threads WHERE id = ?",
-      [turn.thread_id],
-    );
+    const thread = this.opts.db.get<{
+      id: string;
+      account_id: string;
+      kind: string;
+      title: string;
+      bot_id: string;
+      peer_bot_id: string | null;
+    }>("SELECT * FROM threads WHERE id = ?", [turn.thread_id]);
     if (!thread) return;
 
     const compute = this.opts.db.get<{ id: string; workspace_path: string }>(
@@ -568,27 +579,50 @@ export class TurnEngine {
         "SELECT origin, body FROM messages WHERE turn_id = ? AND role = 'user' ORDER BY created_at DESC LIMIT 1",
         [turn.id],
       );
-      let prompt = userMsg?.body ?? "";
-      if (thread.kind === "group") {
-        prompt = `Group thread "${thread.title}". To speak here call SendToThread. SendMessage still DMs the human privately. SendToAgent is 1:1, not this group.\n\n${prompt}`;
-      }
-      if (userMsg?.origin === "calendar") {
-        prompt = `${calendarTurnBlock(this.opts.db, turn.id)}\n\n${prompt}`;
-      }
+      const lastThreadId =
+        (await runner.lastPromptThread(bot.id)) ?? lastFinishedThread(this.opts.db, bot.id, turn.id);
+      const switched = Boolean(lastThreadId) && lastThreadId !== turn.thread_id;
+      // PR6 adds wrap: "compact" as an alias of cold.
+      let wrap: TurnPromptWrap = "none";
       if (!warm) {
         if (harness.resumed) {
           appendLiveWork(this.opts.db, turn.id, "harness_session_reset", { reason: "resumed" });
+          if (switched) wrap = "switch";
         } else {
           appendLiveWork(this.opts.db, turn.id, "harness_session_reset", { reason: "cold_start" });
-          const digest = buildThreadDigest(this.opts.db, {
-            threadId: turn.thread_id,
-            botId: bot.id,
-            botName: bot.name,
-            excludeTurnId: turn.id,
-          });
-          prompt = wrapPromptWithDigest(digest, prompt);
+          wrap = "cold";
         }
+      } else if (switched) {
+        wrap = "switch";
       }
+      if (wrap === "switch" && lastThreadId) {
+        appendLiveWork(this.opts.db, turn.id, "thread_switch", {
+          from: lastThreadId,
+          to: turn.thread_id,
+        });
+      }
+      const digest =
+        wrap === "none"
+          ? null
+          : formatThreadDigest({
+              kind: wrap === "switch" ? "thread_switch" : "cold_start",
+              botName: bot.name,
+              threadLabel: threadDigestLabel(this.opts.db, thread, bot.id),
+              memory: buildThreadMemory(this.opts.db, {
+                threadId: turn.thread_id,
+                botId: bot.id,
+                botName: bot.name,
+                excludeTurnId: turn.id,
+              }),
+            });
+      const prompt = assembleTurnPrompt({
+        wrap,
+        userBody: userMsg?.body ?? "",
+        groupTitle: thread.kind === "group" ? thread.title : null,
+        calendarBlock: userMsg?.origin === "calendar" ? calendarTurnBlock(this.opts.db, turn.id) : null,
+        digest,
+      });
+      await runner.markPromptThread(bot.id, turn.thread_id);
       const result = await runner.prompt(prompt, bot.id);
       markCalendarPendingAsSend(this.opts.db, turn.id);
       promote(this.opts.db, turn.id, {
@@ -629,6 +663,57 @@ export class TurnEngine {
     }
     if (isGateway) this.maybeKickGatewayDrain(bot.id, turn.id);
   }
+}
+
+/** PR6 adds 'compact' alias of cold. */
+export type TurnPromptWrap = "none" | "cold" | "switch";
+
+export function assembleTurnPrompt(opts: {
+  wrap: TurnPromptWrap;
+  userBody: string;
+  groupTitle?: string | null;
+  calendarBlock?: string | null;
+  digest?: string | null;
+}): string {
+  let inner = opts.userBody;
+  if (opts.groupTitle) {
+    inner = `Group thread "${opts.groupTitle}". To speak here call SendToThread. SendMessage still DMs the human privately. SendToAgent is 1:1, not this group.\n\n${inner}`;
+  }
+  if (opts.calendarBlock) {
+    inner = `${opts.calendarBlock}\n\n${inner}`;
+  }
+  if (opts.wrap === "none") return inner;
+  return wrapPromptWithDigest(opts.digest ?? null, inner);
+}
+
+function lastFinishedThread(db: OpenbotDb, botId: string, excludeTurnId: string): string | undefined {
+  const row = db.get<{ thread_id: string }>(
+    `SELECT thread_id FROM turns
+     WHERE bot_id = ?
+       AND id != ?
+       AND status IN ('completed', 'cancelled', 'failed')
+       AND started_at IS NOT NULL
+       AND harness_session_id IS NOT NULL
+     ORDER BY started_at DESC
+     LIMIT 1`,
+    [botId, excludeTurnId],
+  );
+  return row?.thread_id;
+}
+
+function threadDigestLabel(
+  db: OpenbotDb,
+  thread: { kind: string; title: string; bot_id: string; peer_bot_id: string | null },
+  botId: string,
+): string {
+  if (thread.kind === "group") return `group "${thread.title}"`;
+  if (thread.kind === "a2a") {
+    const peerId = thread.bot_id === botId ? thread.peer_bot_id : thread.bot_id;
+    const peerName =
+      (peerId && db.get<{ name: string }>("SELECT name FROM bots WHERE id = ?", [peerId])?.name) || "peer";
+    return `your 1:1 with ${peerName}`;
+  }
+  return "your DM with the human";
 }
 
 function calendarTurnBlock(db: OpenbotDb, turnId: string): string {

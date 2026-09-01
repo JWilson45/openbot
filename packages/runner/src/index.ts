@@ -128,6 +128,8 @@ type AcpSlot = {
   inTurn?: boolean;
   /** Compared in matchesHarness. Warm overlay is this fingerprint. */
   rosterFingerprint: string;
+  /** Last thread this child session/prompt'd. Cleared on kill/spawn. */
+  lastThreadId?: string;
 };
 
 type CdpConn = {
@@ -530,6 +532,15 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     return this.acps.get(botId)?.client.pid;
   }
 
+  lastPromptThread(botId: string): string | undefined {
+    return this.acps.get(botId)?.lastThreadId;
+  }
+
+  markPromptThread(botId: string, threadId: string): void {
+    const slot = this.acps.get(botId);
+    if (slot) slot.lastThreadId = threadId;
+  }
+
   async kill(botId: string): Promise<void> {
     const slot = this.acps.get(botId);
     if (!slot) return;
@@ -631,6 +642,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
       existing!.role = role;
       existing!.resumed = false;
       existing!.rosterFingerprint = fp;
+      // lastThreadId stays: same child session, not a spawn.
       client.permissionMode = req.permissionMode;
       client.permissionHandler = permissionHandler;
       this.acp = client;

@@ -3,12 +3,16 @@ import { OpenbotDb, id, now, orderedBotPair, sha256Hex } from "@openbot/db";
 import {
   appendLiveWork,
   buildThreadDigest,
+  buildThreadMemory,
+  formatThreadDigest,
   insertMessage,
   parseLivePayload,
   promote,
   refreshThreadSummary,
+  summarizeLiveEvent,
   wrapPromptWithDigest,
 } from "@openbot/live-work";
+import { assembleTurnPrompt } from "../apps/server/src/engine.ts";
 import { McpError, type A2aCompleteEvent } from "@openbot/api-types";
 import {
   handleMcpJsonRpc,
@@ -423,6 +427,74 @@ describe("thread digest", () => {
     expect(digest).not.toContain("secret prompt clone");
     expect(digest).not.toContain("secret calendar fire");
     expect(digest).not.toContain("Earlier (summary):");
+  });
+
+  test("thread_switch digest always banners and never says ACP session reset", () => {
+    const db = openDb();
+    const w = seedWorld(db);
+    const old = insertTurn(db, w, "completed");
+    db.run(
+      `INSERT INTO messages (id, thread_id, turn_id, role, origin, body, urgency, created_at)
+       VALUES (?, ?, ?, 'user', 'user', 'remember the pineapple', 'normal', ?)`,
+      ["m-sw", w.threadId, old, 1],
+    );
+    const current = insertTurn(db, w, "queued");
+    const memory = buildThreadMemory(db, {
+      threadId: w.threadId,
+      botId: w.botId,
+      botName: "Ada",
+      excludeTurnId: current,
+    });
+    const digest = formatThreadDigest({
+      kind: "thread_switch",
+      botName: "Ada",
+      threadLabel: 'group "Design"',
+      memory,
+    });
+    expect(digest).toContain("You are now on a different thread: group \"Design\".");
+    expect(digest).toContain("Human: remember the pineapple");
+    expect(digest).not.toContain("ACP session reset");
+    expect(formatThreadDigest({
+      kind: "thread_switch",
+      botName: "Ada",
+      threadLabel: "your DM with the human",
+      memory: { summary: "", tailLines: [] },
+    })).toContain("You are now on a different thread: your DM with the human.");
+    expect(
+      formatThreadDigest({
+        kind: "cold_start",
+        botName: "Ada",
+        threadLabel: "",
+        memory: { summary: "", tailLines: [] },
+      }),
+    ).toBeNull();
+    db.close();
+  });
+
+  test("assembleTurnPrompt is calendar then group then user, one outer wrap", () => {
+    const inner = assembleTurnPrompt({
+      wrap: "none",
+      userBody: "hello",
+      groupTitle: "standup",
+      calendarBlock: 'This turn was started by calendar event "ping" (schedule).',
+    });
+    expect(inner.indexOf("This turn was started by calendar event")).toBeLessThan(inner.indexOf('Group thread "standup"'));
+    expect(inner.endsWith("hello")).toBe(true);
+    expect(inner).not.toContain("Current message:");
+    const switched = assembleTurnPrompt({
+      wrap: "switch",
+      userBody: "hello",
+      groupTitle: "standup",
+      digest: "You are now on a different thread: group \"standup\".",
+    });
+    expect(switched.startsWith("You are now on a different thread:")).toBe(true);
+    expect(switched).toContain("Current message:");
+    expect(switched.indexOf("You are now on a different thread:")).toBeLessThan(switched.indexOf("Current message:"));
+    expect(switched.endsWith("hello")).toBe(true);
+  });
+
+  test("thread_switch live-work summarizes as Switched thread", () => {
+    expect(summarizeLiveEvent("thread_switch", { from: "a", to: "b" })).toBe("Switched thread");
   });
 
   test("promote with send_message writes a thread_summaries row", () => {
