@@ -140,6 +140,84 @@ describe("standing notes overlay freeze + skip-resume", () => {
     }
   });
 
+  test("Memory write then warm turn then idle skips resume of stale overlay", async () => {
+    const prevIdle = process.env.OPENBOT_ACP_IDLE_MS;
+    const prevResume = process.env.OPENBOT_FAKE_RESUME;
+    process.env.OPENBOT_ACP_COMMAND = fakeAgentCommand();
+    process.env.OPENBOT_ACP_IDLE_MS = "80";
+    process.env.OPENBOT_FAKE_RESUME = "1";
+    const { ctx, server, origin } = startTestServer({ home: tempHome() });
+    try {
+      const { cookie, session } = loginCookie({ ctx }, "alice");
+      const headers = { cookie, "content-type": "application/json" };
+      const ada = (await fetch(`${origin}/v1/bots`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ name: "Ada" }),
+      }).then((r) => r.json())) as { bot: { id: string }; threadId: string };
+      await fetch(`${origin}/v1/credentials/xai`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ key: "xai-memkey0006" }),
+      });
+      await fetch(`${origin}/v1/threads/${ada.threadId}/messages`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ body: "[[memory:add:self:idle-secret]]" }),
+      });
+      await waitMessages(origin, headers, (msgs) =>
+        sendBodies(msgs).some((b) => b.includes("idle-secret") && b.includes("next_spawn")),
+      );
+      await waitCompletedTurns(ctx.db, ada.bot.id, 1);
+      const runner = ctx.engine.runnerFor(session.accountId);
+      const pid = runner.acpPid(ada.bot.id);
+      expect(pid).toBeTruthy();
+      const frozen = ctx.db.get<{ overlay_hash: string | null }>(
+        "SELECT overlay_hash FROM harness_sessions WHERE bot_id = ? ORDER BY created_at DESC LIMIT 1",
+        [ada.bot.id],
+      );
+      expect(frozen?.overlay_hash).toBeTruthy();
+
+      await fetch(`${origin}/v1/threads/${ada.threadId}/messages`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ body: "[[echo-standing:idle-secret]]" }),
+      });
+      await waitMessages(origin, headers, (msgs) => sendBodies(msgs).includes("no-standing"));
+      await waitCompletedTurns(ctx.db, ada.bot.id, 2);
+      expect(runner.acpPid(ada.bot.id)).toBe(pid);
+      const afterWarm = ctx.db.get<{ overlay_hash: string | null }>(
+        "SELECT overlay_hash FROM harness_sessions WHERE bot_id = ? ORDER BY created_at DESC LIMIT 1",
+        [ada.bot.id],
+      );
+      expect(afterWarm?.overlay_hash).toBe(frozen?.overlay_hash);
+
+      await Bun.sleep(150);
+      ctx.engine.maintenance();
+      expect(runner.acpPid(ada.bot.id)).toBeUndefined();
+
+      await fetch(`${origin}/v1/threads/${ada.threadId}/messages`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ body: "[[echo-standing:idle-secret]] [[echo-prompt]]" }),
+      });
+      const messages = await waitMessages(origin, headers, (msgs) => {
+        const bodies = sendBodies(msgs);
+        return bodies.includes("got-standing") && bodies.includes("got-digest");
+      });
+      const bodies = sendBodies(messages);
+      expect(bodies).toContain("got-standing");
+      expect(bodies).toContain("got-digest");
+      expect(bodies).not.toContain("no-digest");
+    } finally {
+      server.stop(true);
+      if (prevIdle === undefined) delete process.env.OPENBOT_ACP_IDLE_MS;
+      else process.env.OPENBOT_ACP_IDLE_MS = prevIdle;
+      if (prevResume === undefined) delete process.env.OPENBOT_FAKE_RESUME;
+      else process.env.OPENBOT_FAKE_RESUME = prevResume;
+    }
+  });
+
   test("two consecutive idle+fake-resume with unchanged notes are both no-digest", async () => {
     const prevIdle = process.env.OPENBOT_ACP_IDLE_MS;
     const prevResume = process.env.OPENBOT_FAKE_RESUME;

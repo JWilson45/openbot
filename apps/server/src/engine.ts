@@ -519,7 +519,14 @@ export class TurnEngine {
         this.opts.db.run(
           `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at, roster_fingerprint, overlay_hash)
            VALUES (?, ?, ?, 'active', ?, ?, ?)`,
-          [harnessId, compute?.id ?? bot.account_id, bot.id, now(), currentFingerprint, currentOverlayHash],
+          [
+            harnessId,
+            compute?.id ?? bot.account_id,
+            bot.id,
+            now(),
+            latest?.roster_fingerprint ?? currentFingerprint,
+            latest?.overlay_hash ?? currentOverlayHash,
+          ],
         );
       }
     }
@@ -609,10 +616,13 @@ export class TurnEngine {
         botNotes,
         resumeSessionId: !warm ? resumeSessionId : undefined,
       });
-      this.opts.db.run(
-        "UPDATE harness_sessions SET acp_session_id = ?, roster_fingerprint = ?, overlay_hash = ? WHERE id = ?",
-        [harness.acpSessionId ?? null, currentFingerprint, currentOverlayHash, harnessId],
-      );
+      // Stored hash names the overlay frozen at session/new or resume, not live sqlite.
+      if (!warm) {
+        this.opts.db.run(
+          "UPDATE harness_sessions SET acp_session_id = ?, roster_fingerprint = ?, overlay_hash = ? WHERE id = ?",
+          [harness.acpSessionId ?? null, currentFingerprint, currentOverlayHash, harnessId],
+        );
+      }
 
       const userMsg = this.opts.db.get<{ origin: string; body: string }>(
         "SELECT origin, body FROM messages WHERE turn_id = ? AND role = 'user' ORDER BY created_at DESC LIMIT 1",

@@ -126,11 +126,20 @@ describe("Memory / Search MCP", () => {
       [id(), otherThread, otherBot, otherHarness, t2],
     );
     insertMsg(db, { threadId: otherThread, origin: "user", body: "other pineapple" });
+    insertMsg(db, { threadId: w.threadId, origin: "user", body: "totally hidden banana" });
     const isolated = payload((await call(db, otherToken, "SearchMessages", { query: "pineapple" })).json);
+    const otherHits = isolated.hits as Array<{ snippet: string }>;
+    expect(otherHits.some((h) => h.snippet.includes("other pineapple"))).toBe(true);
+    expect(otherHits.some((h) => h.snippet.includes("I like pineapple"))).toBe(false);
+    const homeAgain = payload((await call(db, w.token, "SearchMessages", { query: "pineapple" })).json);
+    const homeHits = homeAgain.hits as Array<{ snippet: string }>;
+    expect(homeHits.some((h) => h.snippet.includes("I like pineapple"))).toBe(true);
+    expect(homeHits.some((h) => h.snippet.includes("other pineapple"))).toBe(false);
 
     const ops = payload((await call(db, w.token, "SearchMessages", { query: 'pineapple OR "hidden"' })).json);
     const opHits = ops.hits as Array<{ snippet: string }>;
     expect(opHits.some((h) => h.snippet.includes("hidden pineapple"))).toBe(false);
+    expect(opHits.some((h) => h.snippet.includes("totally hidden banana"))).toBe(false);
 
     db.run(`UPDATE messages SET origin = 'prompt' WHERE body = 'I like pineapple pizza'`);
     const after = payload((await call(db, w.token, "SearchMessages", { query: "pineapple" })).json);
