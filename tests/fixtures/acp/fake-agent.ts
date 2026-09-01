@@ -11,6 +11,12 @@
  *   [[echo-prompt]]   SendMessage "got-digest" or "no-digest" based on ACP reset block
  *   [[echo-prefix]]   SendMessage "got-group-prefix" if the group runTurn prefix is present
  *   [[echo-cal-prefix]] SendMessage "got-calendar-prefix" if the calendar runTurn block is present
+ *   [[echo-roster]]   SendMessage names parsed from stored _meta.rules + got-rules
+ *   [[echo-compose]]  SendMessage got-compose if stored rules match /do not forward/i
+ *   [[echo-switch]]   SendMessage got-switch if the prompt has a thread-switch banner
+ *   [[echo-rules]]    SendMessage stored _meta.rules (or no-rules)
+ *   [[echo-standing:needle]] got-standing if needle appears inside a fence in stored rules
+ *   [[overflow]]      session/prompt stopReason max_tokens (no throw)
  *   [[listcal]]
  *   [[createevent:Title:Prompt:RRULE]]
  *   [[propose:Title:Prompt]]
@@ -39,7 +45,7 @@ import { join } from "node:path";
 let buf = Buffer.alloc(0);
 let nextSession = 1;
 let permRpc = 9000;
-const sessions = new Map<string, { cwd: string; mcpUrl?: string; mcpToken?: string }>();
+const sessions = new Map<string, { cwd: string; mcpUrl?: string; mcpToken?: string; rules: string }>();
 const pendingClientResponses = new Map<number, (msg: { result?: unknown; error?: { message: string } }) => void>();
 
 function write(msg: unknown): void {
@@ -48,6 +54,13 @@ function write(msg: unknown): void {
 
 function notify(method: string, params: unknown): void {
   write({ jsonrpc: "2.0", method, params });
+}
+
+function overlayRules(params: Record<string, unknown>): string {
+  const meta = params._meta;
+  if (!meta || typeof meta !== "object") return "";
+  const rules = (meta as { rules?: unknown }).rules;
+  return typeof rules === "string" ? rules : "";
 }
 
 function parseMcp(raw: unknown): { url?: string; token?: string } {
@@ -162,6 +175,7 @@ async function handle(msg: {
       cwd: String(params.cwd ?? process.cwd()),
       mcpUrl: parsed.url || process.env.OPENBOT_MCP_URL,
       mcpToken: parsed.token || process.env.OPENBOT_MCP_TOKEN,
+      rules: overlayRules(params),
     });
     write({ jsonrpc: "2.0", id, result: { sessionId } });
     return;
@@ -174,6 +188,7 @@ async function handle(msg: {
         cwd: String(params.cwd ?? process.cwd()),
         mcpUrl: parsed.url || process.env.OPENBOT_MCP_URL,
         mcpToken: parsed.token || process.env.OPENBOT_MCP_TOKEN,
+        rules: overlayRules(params),
       });
       write({ jsonrpc: "2.0", id, result: { sessionId } });
       return;
@@ -420,6 +435,38 @@ async function handle(msg: {
         if (current.includes("[[echo-prompt]]")) {
           await callSend(mcpUrl, mcpToken, /ACP session reset/.test(text) ? "got-digest" : "no-digest");
         }
+        if (current.includes("[[echo-roster]]")) {
+          const rules = sess?.rules ?? "";
+          const names = [...rules.matchAll(/^- ([^—]+?)(?: — |$)/gm)].map((m) => m[1]!.trim());
+          const parts = [...names];
+          parts.push(rules ? "got-rules" : "no-rules");
+          await callSend(mcpUrl, mcpToken, parts.join("\n"));
+        }
+        if (current.includes("[[echo-compose]]")) {
+          await callSend(mcpUrl, mcpToken, /do not forward/i.test(sess?.rules ?? "") ? "got-compose" : "no-compose");
+        }
+        if (current.includes("[[echo-switch]]")) {
+          await callSend(
+            mcpUrl,
+            mcpToken,
+            /You are now on a different thread/.test(text) ? "got-switch" : "no-switch",
+          );
+        }
+        if (current.includes("[[echo-rules]]")) {
+          const rules = sess?.rules ?? "";
+          await callSend(mcpUrl, mcpToken, rules || "no-rules");
+        }
+        const standing = /\[\[echo-standing:([^\]]+)\]\]/.exec(current);
+        if (standing) {
+          const rules = sess?.rules ?? "";
+          const needle = standing[1]!;
+          const fenced = /<<<OPENBOT_[A-Z_]+([\s\S]*?)OPENBOT_[A-Z_]+>>>/g;
+          let hit = false;
+          for (const m of rules.matchAll(fenced)) {
+            if (m[1]?.includes(needle)) hit = true;
+          }
+          await callSend(mcpUrl, mcpToken, hit ? "got-standing" : "no-standing");
+        }
         if (current.includes("[[echo-prefix]]")) {
           await callSend(
             mcpUrl,
@@ -462,6 +509,15 @@ async function handle(msg: {
           !current.includes("[[env:") &&
           !current.includes("[[readfile:") &&
           !current.includes("[[echo-prompt]]") &&
+          !current.includes("[[echo-roster]]") &&
+          !current.includes("[[echo-compose]]") &&
+          !current.includes("[[echo-switch]]") &&
+          !current.includes("[[echo-rules]]") &&
+          !current.includes("[[echo-standing:") &&
+          !current.includes("[[memory:") &&
+          !current.includes("[[search:") &&
+          !current.includes("[[searchthread:") &&
+          !current.includes("[[overflow]]") &&
           !current.includes("[[echo-prefix]]") &&
           !current.includes("[[echo-cal-prefix]]") &&
           !current.includes("[[listcal]]") &&

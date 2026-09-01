@@ -25,6 +25,7 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 - `$OPENBOT_HOME/desk` is a **shared computer**. It is **not** a security boundary **inside** an org. Every bot on the account can read and write the desk the way you can. There is **one Chromium** for the whole team (**a tab per desk bot**; cookies shared). Cross-org is messages only (hop=1).
 - Vault files (`master.key`, `org.ed25519`, credentials) live **outside** `desk/`. Grok’s `HOME` is `$OPENBOT_HOME/grok-home` (a copy of `~/.grok/auth.json`, not a symlink). ACP tools whose paths resolve outside the desk are denied. Optional `OPENBOT_SANDBOX` (macOS `sandbox-exec` / Linux `bwrap`) is best-effort and off in tests. Same-uid `0600` is not a jail; a dedicated OS user is. Do not copy secrets into the workspace Grok can see.
 - Restarting the server starts a new Grok ACP process. Chat history is in SQLite. On cold start OpenBot tries ACP `session/resume`; if that fails it injects a thread **summary + recent tail**. Idle desk children stay warm for 2 hours (override `OPENBOT_ACP_IDLE_MS`; `0` disables desk idle kill).
+- Teammates see who is on the desk (up to six names + Gateway) in their spawn overlay. Hiring someone does not kill the other Groks; each bot picks up the new roster on its next turn.
 - **Federation is off until you turn it on** on **both** sides. OpenBot does not provision Fly Machines.
 
 ---
@@ -37,9 +38,9 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 | Human DM | Each bot has a 1:1 thread with you. |
 | `SendMessage` | The **only** way a bot talks to you. Assistant rambling is a private work log unless it fails to call the tool (then you get a fallback). |
 | `SendToAgent` | Async mailbox to another bot. Does **not** write your DM. Handoffs in the UI show the A2A thread. |
-| `ListBots` / `CreateBot` | Roster and hire. Desk bots only (cap 6). Gateway does not hire. Bots must **not** mint `/auth/local` or `POST /v1/bots`. |
+| `ListBots` / `CreateBot` | Fallback roster and hire. Desk bots only (cap 6). Gateway does not hire. Bots must **not** mint `/auth/local` or `POST /v1/bots`. The spawn overlay already lists names. |
 | Parallel turns | At most one running turn **per bot**. Two bots can work at the same time on the shared desk. |
-| Warm Grok process | Each bot keeps an ACP child across turns. Model / reasoning changes respawn it on the **next** turn. |
+| Warm Grok process | Each bot keeps an ACP child across turns. Model / reasoning / roster changes respawn it on the **next** turn. |
 | Model & reasoning | Per-bot Grok model (e.g. grok-4.6) and effort (low / medium / high / extra high). Settings always; Debug composer on a human DM. |
 | Live work | Default UI is the messenger (roster + thread). **Debug** (header, or Ctrl/Cmd+Shift+Period) shows thinking and tool calls in a resizable sidebar. Activity board for the whole team. |
 | Takeover | **Desk browser** grabs the human tab of the shared Chromium (screencast + input). Esc / Close ends it; F6 from the canvas focuses Close. Desk bots keep their own tabs. |
@@ -392,7 +393,7 @@ packages/federation/  Ed25519 JWS for /fed/v1
 packages/vault/       credential encryption
 packages/auth/        GitHub / local session, allowlist
 packages/compute-protocol/  five-method host contract
-docs/design/          Phase 1–4 design notes
+docs/design/          Phase 1–5 design notes
 tests/                bun:test; fake ACP, no live xAI required
 ```
 
@@ -425,7 +426,7 @@ CI (`.github/workflows/ci.yml`) is `bun install --frozen-lockfile` then `bun tes
 - Remote runner (orchestrator on A, grok on B).
 - Mobile / desktop apps, Postgres control plane, per-bot filesystem isolation.
 
-Design background: [docs/design/phase-1-always-on-teammate-loop.md](docs/design/phase-1-always-on-teammate-loop.md), [docs/design/phase-2-team-on-one-desk.md](docs/design/phase-2-team-on-one-desk.md), [docs/design/phase-3-orgs-vms-gateway.md](docs/design/phase-3-orgs-vms-gateway.md), [docs/design/phase-4-calendar-automations.md](docs/design/phase-4-calendar-automations.md).
+Design background: [docs/design/phase-1-always-on-teammate-loop.md](docs/design/phase-1-always-on-teammate-loop.md), [docs/design/phase-2-team-on-one-desk.md](docs/design/phase-2-team-on-one-desk.md), [docs/design/phase-3-orgs-vms-gateway.md](docs/design/phase-3-orgs-vms-gateway.md), [docs/design/phase-4-calendar-automations.md](docs/design/phase-4-calendar-automations.md), [docs/design/phase-5-hermes-behavior.md](docs/design/phase-5-hermes-behavior.md).
 
 ---
 

@@ -383,6 +383,7 @@ export class OpenbotDb {
     this.ensureColumn("org_meta", "timezone", "text NOT NULL DEFAULT 'UTC'");
     this.ensureColumn("messages", "remote_org_id", "text");
     this.ensureColumn("messages", "remote_actor_name", "text");
+    this.ensureColumn("harness_sessions", "roster_fingerprint", "text");
     this.raw.exec(
       "UPDATE bots SET archived_at = created_at WHERE status = 'archived' AND archived_at IS NULL",
     );

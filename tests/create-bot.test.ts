@@ -83,6 +83,7 @@ describe("CreateBot / ListBots", () => {
     expect(rpc(missing.json).error?.data?.code).toBe("not_found");
     expect(rpc(missing.json).error?.message).toContain("CreateBot");
     expect(rpc(missing.json).error?.message).toContain("/auth/local");
+    expect(rpc(missing.json).error?.message).not.toMatch(/ListBots/i);
 
     for (const name of ["B", "C", "D", "E", "F"]) {
       const r = await call(db, w.token, "CreateBot", { name });

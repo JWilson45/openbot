@@ -41,6 +41,8 @@ test("schema applies on a fresh sqlite file", () => {
   expect(botCols).toContain("model");
   expect(botCols).toContain("reasoning_effort");
   expect(botCols).toContain("role");
+  const harnessCols = db.all<{ name: string }>("PRAGMA table_info(harness_sessions)").map((c) => c.name);
+  expect(harnessCols).toContain("roster_fingerprint");
   const roleCol = db.all<{ name: string; dflt_value: unknown }>("PRAGMA table_info(bots)").find((c) => c.name === "role");
   expect(String(roleCol?.dflt_value)).toContain("desk");
   const indexes = db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index'").map((i) => i.name);

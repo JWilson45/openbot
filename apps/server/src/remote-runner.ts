@@ -103,8 +103,18 @@ export class RemoteRunnerClient implements RunnerSession {
     model?: string,
     reasoningEffort?: string,
     permissionMode?: EnsureHarnessRequest["permissionMode"],
+    rosterFp?: string,
   ): Promise<boolean> {
-    return this.peer.request("matchesHarness", { botId, model, reasoningEffort, permissionMode }) as Promise<boolean>;
+    return this.peer.request("matchesHarness", {
+      botId,
+      model,
+      reasoningEffort,
+      permissionMode,
+      rosterFp,
+    }) as Promise<boolean>;
+  }
+  hasWarmBot(botId: string): Promise<boolean> {
+    return this.peer.request("hasWarmBot", { botId }) as Promise<boolean>;
   }
   invalidateAcp(botId: string): Promise<void> {
     return this.peer.request("invalidateAcp", { botId }) as Promise<void>;

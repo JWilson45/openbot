@@ -408,7 +408,7 @@ export function sendToAgent(
         const wanted = input.name?.trim() || input.botId || "that name";
         throw new McpError(
           "not_found",
-          `target bot not found. "${wanted}" is not on this desk. Call ListBots to see names. Call CreateBot to hire a new teammate. Do not curl OpenBot HTTP or /auth/local.`,
+          `target bot not found. "${wanted}" is not on this desk. Call CreateBot to hire a new teammate. Do not curl OpenBot HTTP or /auth/local.`,
           404,
         );
       }
@@ -690,7 +690,7 @@ export const SEND_MESSAGE_TOOL = {
 export const SEND_TO_AGENT_TOOL = {
   name: "SendToAgent",
   description:
-    "Send work to another named bot already on this desk. Async: returns immediately. Does not message the human. Use ListBots to see names. If they do not exist, CreateBot then SendToAgent. Do not curl OpenBot HTTP.",
+    "Send work to another named bot already on this desk. Compose a message for them; do not forward the human verbatim. Async: returns immediately. Does not message the human. If they do not exist, CreateBot then SendToAgent. Do not curl OpenBot HTTP.",
   inputSchema: {
     type: "object",
     properties: {
@@ -750,7 +750,7 @@ export const SEND_TO_THREAD_TOOL = {
 export const LIST_BOTS_TOOL = {
   name: "ListBots",
   description:
-    "List active desk teammates and Gateway on this org. Use this before SendToAgent. Creating a bot is CreateBot, not this tool.",
+    "Fallback roster lookup if the overlay is missing. Prefer the names already in your identity overlay. Creating a bot is CreateBot, not this tool.",
   inputSchema: { type: "object", properties: {} },
 };
 
@@ -1027,17 +1027,37 @@ function normalizeCreateBotArgs(raw: unknown): unknown {
   return args;
 }
 
+function listActiveBotRows(db: OpenbotDb, accountId: string) {
+  return db.all<{ id: string; name: string; description: string; role: string }>(
+    `SELECT id, name, description, IFNULL(role, 'desk') AS role
+     FROM bots WHERE account_id = ? AND status = 'active' ORDER BY created_at`,
+    [accountId],
+  );
+}
+
+export function loadOverlayRoster(
+  db: OpenbotDb,
+  accountId: string,
+): {
+  desks: Array<{ name: string; description: string }>;
+  gateway: { name: string; description: string } | null;
+} {
+  const rows = listActiveBotRows(db, accountId);
+  const desks = rows
+    .filter((r) => r.role !== "gateway")
+    .slice(0, MAX_ACTIVE_BOTS)
+    .map(({ name, description }) => ({ name, description }));
+  const gw = rows.find((r) => r.role === "gateway");
+  return { desks, gateway: gw ? { name: gw.name, description: gw.description } : null };
+}
+
 export function listBots(
   db: OpenbotDb,
   _inflight: McpInflight,
   bearer: string | undefined,
 ): { bots: Array<{ id: string; name: string; description: string }>; gateway: { id: string; name: string } | null } {
   const claims = verifyMcpToken(db, bearer);
-  const rows = db.all<{ id: string; name: string; description: string; role: string }>(
-    `SELECT id, name, description, IFNULL(role, 'desk') AS role
-     FROM bots WHERE account_id = ? AND status = 'active' ORDER BY created_at`,
-    [claims.accountId],
-  );
+  const rows = listActiveBotRows(db, claims.accountId);
   const bots = rows.filter((r) => r.role !== "gateway").map(({ id, name, description }) => ({ id, name, description }));
   const gw = rows.find((r) => r.role === "gateway");
   return { bots, gateway: gw ? { id: gw.id, name: gw.name } : null };

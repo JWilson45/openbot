@@ -16,6 +16,7 @@ import {
   defaultCommand,
   grokHomeDir,
   prepareIsolatedGrokHome,
+  rosterFingerprint,
 } from "@openbot/acp-grok";
 import { botProjectDir, deleteBotProject, ensureBotProject, ensureGatewayWorkspace } from "./workspace.ts";
 import { buildChromiumEnv, buildHarnessEnv, chromiumTmpDir, snapshotChildEnv, type ChildEnvSnapshot } from "./harness-env.ts";
@@ -123,6 +124,10 @@ type AcpSlot = {
   idleTtlMs: number;
   role: "desk" | "gateway";
   resumed?: boolean;
+  /** True while this client is inside prompt(). Per-slot; not runner.harness. */
+  inTurn?: boolean;
+  /** Compared in matchesHarness. Warm overlay is this fingerprint. */
+  rosterFingerprint: string;
 };
 
 type CdpConn = {
@@ -517,6 +522,10 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     return this.acps.get(botId)?.client ?? null;
   }
 
+  hasWarmBot(botId: string): boolean {
+    return this.acps.has(botId);
+  }
+
   acpPid(botId: string): number | undefined {
     return this.acps.get(botId)?.client.pid;
   }
@@ -544,20 +553,23 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     model?: string,
     reasoningEffort?: string,
     permissionMode?: EnsureHarnessRequest["permissionMode"],
+    rosterFp = "",
   ): boolean {
-    const existing = this.acps.get(botId)?.client;
+    const slot = this.acps.get(botId);
+    const existing = slot?.client;
     if (!existing || existing.closed || !existing.sessionId || this.harness === "crashed") return false;
     const wantModel = model || DEFAULT_GROK_MODEL;
     const wantEffort = reasoningEffort || DEFAULT_REASONING_EFFORT;
     if (existing.model !== wantModel || existing.reasoningEffort !== wantEffort) return false;
     if (permissionMode && existing.permissionMode !== permissionMode) return false;
+    if ((slot?.rosterFingerprint ?? "") !== rosterFp) return false;
     return true;
   }
 
   invalidateAcp(botId: string): void {
     const slot = this.acps.get(botId);
     if (!slot) return;
-    if (this.acp === slot.client && this.harness === "in_turn") return;
+    if (slot.inTurn) return;
     void slot.client.kill();
     this.acps.delete(botId);
     if (this.acp === slot.client) {
@@ -572,7 +584,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     for (const [botId, slot] of this.acps) {
       const client = slot.client;
       if (client.closed) continue;
-      if (this.acp === client && this.harness === "in_turn") continue;
+      if (slot.inTurn) continue;
       const federationKill = opts?.federationOff && slot.role === "gateway";
       // Desk OPENBOT_ACP_IDLE_MS=0 disables desk idle kill only.
       if (!federationKill && slot.idleTtlMs === 0) continue;
@@ -599,6 +611,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     const existing = this.acps.get(req.botId);
     const role = req.role === "gateway" ? "gateway" : "desk";
     const idleTtlMs = req.idleTtlMs ?? (role === "gateway" ? gatewayAcpIdleTtlMs() : acpIdleTtlMs());
+    const fp = rosterFingerprint(req.roster);
     const grokHome = grokHomeDir(this.home);
     prepareIsolatedGrokHome(this.home, process.env.HOME, req.permissionMode);
     const permissionHandler =
@@ -612,11 +625,12 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
               cwd: req.cwd,
               operatorHome: process.env.HOME,
             });
-    if (this.matchesHarness(req.botId, model, reasoningEffort, req.permissionMode)) {
+    if (this.matchesHarness(req.botId, model, reasoningEffort, req.permissionMode, fp)) {
       const client = existing!.client;
       existing!.idleTtlMs = idleTtlMs;
       existing!.role = role;
       existing!.resumed = false;
+      existing!.rosterFingerprint = fp;
       client.permissionMode = req.permissionMode;
       client.permissionHandler = permissionHandler;
       this.acp = client;
@@ -662,7 +676,14 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
         permissionHandler,
         onEvent: (ev) => this.onLiveWork?.({ ...ev, botId: req.botId }, req.botId),
       });
-      this.acps.set(req.botId, { client, botId: req.botId, idleTtlMs, role, resumed: false });
+      this.acps.set(req.botId, {
+        client,
+        botId: req.botId,
+        idleTtlMs,
+        role,
+        resumed: false,
+        rosterFingerprint: fp,
+      });
       this.acp = client;
       for (const k of Object.keys(env)) {
         delete spawnEnv[k];
@@ -698,11 +719,17 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   }
 
   async prompt(text: string, botId?: string): Promise<PromptResult> {
-    const client = botId ? this.acps.get(botId)?.client : this.acp;
+    const slot = botId
+      ? this.acps.get(botId)
+      : this.acp
+        ? [...this.acps.values()].find((s) => s.client === this.acp)
+        : undefined;
+    const client = slot?.client ?? this.acp;
     if (!client) throw new Error("harness not started");
     client.lastActivityAt = Date.now();
     this.harness = "in_turn";
     this.acp = client;
+    if (slot) slot.inTurn = true;
     try {
       const result = await client.prompt(text);
       this.harness = "idle";
@@ -716,6 +743,8 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
         /* ignore */
       }
       throw err;
+    } finally {
+      if (slot) slot.inTurn = false;
     }
   }
 

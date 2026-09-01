@@ -41,6 +41,11 @@ export interface ComputeDriver {
   wipeDesk(id: string): Promise<void>;
 }
 
+export type OverlayRoster = {
+  desks: Array<{ name: string; description: string }>;
+  gateway?: { name: string; description: string } | null;
+};
+
 export type EnsureHarnessRequest = {
   botId: string;
   env: Record<string, string>;
@@ -58,6 +63,7 @@ export type EnsureHarnessRequest = {
   idleTtlMs?: number;
   omitCdp?: boolean;
   resumeSessionId?: string;
+  roster?: OverlayRoster;
 };
 
 export type EnsureHarnessResult = {
@@ -175,7 +181,9 @@ export interface RunnerSession {
     model?: string,
     reasoningEffort?: string,
     permissionMode?: EnsureHarnessRequest["permissionMode"],
+    rosterFp?: string,
   ): MaybePromise<boolean>;
+  hasWarmBot(botId: string): MaybePromise<boolean>;
   invalidateAcp(botId: string): MaybePromise<void>;
   kill(botId: string): MaybePromise<void>;
   reapIdle(

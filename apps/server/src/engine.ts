@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { id, now, purgeExpiredArchivedBots, purgeExpiredOrgInbox, type OpenbotDb, type TurnRow } from "@openbot/db";
 import { appendLiveWork, buildThreadDigest, insertMessage, promote, wrapPromptWithDigest } from "@openbot/live-work";
-import { mintMcpToken, persistMcpToken, type McpInflight } from "@openbot/mcp-send-message";
+import { loadOverlayRoster, mintMcpToken, persistMcpToken, type McpInflight } from "@openbot/mcp-send-message";
 import { open, type Envelope } from "@openbot/vault";
 import {
   acpIdleTtlMs,
@@ -12,7 +12,7 @@ import {
 import type { RunnerSession } from "@openbot/compute-protocol";
 import { RunnerUnavailable } from "@openbot/compute-protocol";
 import type { RemoteRunnerClient, TakeoverBridge } from "./remote-runner.ts";
-import { DEFAULT_GROK_MODEL, DEFAULT_REASONING_EFFORT, grokCliSignedIn } from "@openbot/acp-grok";
+import { DEFAULT_GROK_MODEL, DEFAULT_REASONING_EFFORT, grokCliSignedIn, rosterFingerprint } from "@openbot/acp-grok";
 import { currentOrgMeta, FEDERATION_OFF_NOTICE, federationEffective } from "./org.ts";
 import { maybeEnqueueGatewayDrain } from "./inbox.ts";
 import {
@@ -429,30 +429,38 @@ export class TurnEngine {
 
     const model = bot.model || DEFAULT_GROK_MODEL;
     const reasoningEffort = bot.reasoning_effort || DEFAULT_REASONING_EFFORT;
-    const warm = await runner.matchesHarness(
-      bot.id,
-      model,
-      reasoningEffort,
-      bot.permission_mode as "ask" | "auto" | "always-approve",
-    );
+    const permissionMode = bot.permission_mode as "ask" | "auto" | "always-approve";
+    const roster = loadOverlayRoster(this.opts.db, bot.account_id);
+    const currentFingerprint = rosterFingerprint(roster);
+    const hadSlot = await runner.hasWarmBot(bot.id);
+    const warm = await runner.matchesHarness(bot.id, model, reasoningEffort, permissionMode, currentFingerprint);
     let harnessId = turn.harness_session_id;
-    let prevAcpId: string | undefined;
+    let resumeSessionId: string | undefined;
+    // Latest row including a NULL acp_session_id; do not walk older fingerprints.
+    const latest = this.opts.db.get<{
+      acp_session_id: string | null;
+      roster_fingerprint: string | null;
+    }>(
+      `SELECT acp_session_id, roster_fingerprint FROM harness_sessions
+       WHERE bot_id = ? ORDER BY created_at DESC LIMIT 1`,
+      [bot.id],
+    );
     if (!warm) {
-      prevAcpId =
-        this.opts.db.get<{ acp_session_id: string }>(
-          "SELECT acp_session_id FROM harness_sessions WHERE bot_id = ? AND acp_session_id IS NOT NULL ORDER BY created_at DESC LIMIT 1",
-          [bot.id],
-        )?.acp_session_id || undefined;
       this.opts.db.run(
         "UPDATE harness_sessions SET state = 'ended', ended_at = ? WHERE bot_id = ? AND ended_at IS NULL",
         [now(), bot.id],
       );
       harnessId = id();
       this.opts.db.run(
-        `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at)
-         VALUES (?, ?, ?, 'active', ?)`,
-        [harnessId, compute?.id ?? bot.account_id, bot.id, now()],
+        `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at, roster_fingerprint)
+         VALUES (?, ?, ?, 'active', ?, ?)`,
+        [harnessId, compute?.id ?? bot.account_id, bot.id, now(), latest?.roster_fingerprint ?? null],
       );
+      // NULL fingerprint is a mismatch so pre-PR1 rows skip resume.
+      const fpMatch =
+        latest?.roster_fingerprint != null && latest.roster_fingerprint === currentFingerprint;
+      resumeSessionId =
+        !hadSlot && latest?.acp_session_id && fpMatch ? latest.acp_session_id : undefined;
     } else if (!harnessId) {
       const existingHs = this.opts.db.get<{ id: string }>(
         "SELECT id FROM harness_sessions WHERE bot_id = ? AND state = 'active' AND ended_at IS NULL ORDER BY created_at DESC LIMIT 1",
@@ -462,9 +470,9 @@ export class TurnEngine {
       else {
         harnessId = id();
         this.opts.db.run(
-          `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at)
-           VALUES (?, ?, ?, 'active', ?)`,
-          [harnessId, compute?.id ?? bot.account_id, bot.id, now()],
+          `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at, roster_fingerprint)
+           VALUES (?, ?, ?, 'active', ?, ?)`,
+          [harnessId, compute?.id ?? bot.account_id, bot.id, now(), currentFingerprint],
         );
       }
     }
@@ -540,7 +548,7 @@ export class TurnEngine {
         cwd,
         botName: bot.name,
         botDescription: bot.description,
-        permissionMode: bot.permission_mode as "ask" | "auto" | "always-approve",
+        permissionMode,
         model,
         reasoningEffort,
         role: isGateway ? "gateway" : "desk",
@@ -548,12 +556,13 @@ export class TurnEngine {
         orgSlug: org?.slug,
         idleTtlMs: isGateway ? gatewayAcpIdleTtlMs() : acpIdleTtlMs(),
         omitCdp: isGateway,
-        resumeSessionId: !warm && prevAcpId ? prevAcpId : undefined,
+        roster,
+        resumeSessionId: !warm ? resumeSessionId : undefined,
       });
-      this.opts.db.run("UPDATE harness_sessions SET acp_session_id = ? WHERE id = ?", [
-        harness.acpSessionId ?? null,
-        harnessId,
-      ]);
+      this.opts.db.run(
+        "UPDATE harness_sessions SET acp_session_id = ?, roster_fingerprint = ? WHERE id = ?",
+        [harness.acpSessionId ?? null, currentFingerprint, harnessId],
+      );
 
       const userMsg = this.opts.db.get<{ origin: string; body: string }>(
         "SELECT origin, body FROM messages WHERE turn_id = ? AND role = 'user' ORDER BY created_at DESC LIMIT 1",

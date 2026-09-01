@@ -108,7 +108,10 @@ export async function joinRunner(opts: JoinOpts): Promise<{ stop: () => void; pi
           p.model as string | undefined,
           p.reasoningEffort as string | undefined,
           p.permissionMode as EnsureHarnessRequest["permissionMode"],
+          typeof p.rosterFp === "string" ? p.rosterFp : "",
         );
+      case "hasWarmBot":
+        return local.hasWarmBot(String(p.botId ?? ""));
       case "invalidateAcp":
         local.invalidateAcp(String(p.botId ?? ""));
         return {};
