@@ -585,8 +585,8 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     return this.acps.get(botId)?.client.pid;
   }
 
-  lastPromptThread(botId: string): string | undefined {
-    return this.acps.get(botId)?.lastThreadId;
+  lastPromptThread(botId: string): string | null {
+    return this.acps.get(botId)?.lastThreadId ?? null;
   }
 
   markPromptThread(botId: string, threadId: string): void {
@@ -602,16 +602,16 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   compactReason(
     botId: string,
     opts: { threadId?: string; innerBodyChars: number; switched: boolean },
-  ): CompactReason | undefined {
+  ): CompactReason | null {
     const slot = this.acps.get(botId);
-    if (!slot) return undefined;
+    if (!slot) return null;
     if (slot.needsCompact) return "overflow";
     if (acpCompactOnSwitch() && opts.switched) return "thread";
     const charLimit = acpCompactChars();
     if (charLimit > 0 && slot.promptChars + opts.innerBodyChars >= charLimit) return "chars";
     const turnLimit = acpCompactTurns();
     if (turnLimit > 0 && slot.turnsSinceCompact >= turnLimit) return "turns";
-    return undefined;
+    return null;
   }
 
   compactCounters(botId: string): { turns: number; chars: number } {

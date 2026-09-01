@@ -191,13 +191,13 @@ export interface RunnerSession {
   ): MaybePromise<boolean>;
   hasWarmBot(botId: string): MaybePromise<boolean>;
   listDeskSkillNames(cap?: number): MaybePromise<string[]>;
-  lastPromptThread(botId: string): MaybePromise<string | undefined>;
+  lastPromptThread(botId: string): MaybePromise<string | null>;
   markPromptThread(botId: string, threadId: string): MaybePromise<void>;
   canCompact(botId: string): MaybePromise<boolean>;
   compactReason(
     botId: string,
     opts: { threadId?: string; innerBodyChars: number; switched: boolean },
-  ): MaybePromise<CompactReason | undefined>;
+  ): MaybePromise<CompactReason | null>;
   compactSession(
     botId: string,
     req: EnsureHarnessRequest,

@@ -119,8 +119,8 @@ export class RemoteRunnerClient implements RunnerSession {
   listDeskSkillNames(cap?: number): Promise<string[]> {
     return this.peer.request("listDeskSkillNames", { cap }) as Promise<string[]>;
   }
-  lastPromptThread(botId: string): Promise<string | undefined> {
-    return this.peer.request("lastPromptThread", { botId }) as Promise<string | undefined>;
+  lastPromptThread(botId: string): Promise<string | null> {
+    return this.peer.request("lastPromptThread", { botId }) as Promise<string | null>;
   }
   markPromptThread(botId: string, threadId: string): Promise<void> {
     return this.peer.request("markPromptThread", { botId, threadId }) as Promise<void>;
@@ -131,9 +131,9 @@ export class RemoteRunnerClient implements RunnerSession {
   compactReason(
     botId: string,
     opts: { threadId?: string; innerBodyChars: number; switched: boolean },
-  ): Promise<import("@openbot/compute-protocol").CompactReason | undefined> {
+  ): Promise<import("@openbot/compute-protocol").CompactReason | null> {
     return this.peer.request("compactReason", { botId, opts }) as Promise<
-      import("@openbot/compute-protocol").CompactReason | undefined
+      import("@openbot/compute-protocol").CompactReason | null
     >;
   }
   compactSession(

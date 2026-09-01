@@ -67,7 +67,9 @@ export class JsonRpcPeer {
     } catch {
       return;
     }
-    if (msg.id != null && (msg.result !== undefined || msg.error)) {
+    // Responses have id and no method. `result: undefined` is omitted by JSON.stringify,
+    // so lastPromptThread / compactReason would hang the org process on a sibling runner.
+    if (msg.id != null && !msg.method) {
       const p = this.pending.get(msg.id);
       if (!p) return;
       this.pending.delete(msg.id);
@@ -84,7 +86,7 @@ export class JsonRpcPeer {
     const id = msg.id;
     void Promise.resolve(this.onRequest(msg.method, msg.params)).then(
       (result) => {
-        const res: RpcRes = { jsonrpc: "2.0", id, result };
+        const res: RpcRes = { jsonrpc: "2.0", id, result: result ?? null };
         this.sendText(JSON.stringify(res));
       },
       (err: unknown) => {
