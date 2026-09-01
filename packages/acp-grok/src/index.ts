@@ -1,7 +1,12 @@
 import { basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, type Subprocess } from "bun";
-import type { EnsureHarnessRequest, LiveWorkEvent, PromptResult } from "@openbot/compute-protocol";
+import type {
+  EnsureHarnessRequest,
+  LiveWorkEvent,
+  PermissionHandler,
+  PromptResult,
+} from "@openbot/compute-protocol";
 import { runMcpBridge } from "./mcp-bridge.ts";
 
 type Rpc = {
@@ -21,7 +26,7 @@ export type AcpClientOptions = {
   model?: string;
   reasoningEffort?: string;
   permissionMode?: EnsureHarnessRequest["permissionMode"];
-  permissionHandler?: (req: LiveWorkEvent) => Promise<{ allow: boolean }>;
+  permissionHandler?: PermissionHandler;
 };
 
 export function deskIdentityRules(botName: string, botDescription: string): string {
@@ -56,12 +61,17 @@ Do not curl this OpenBot process. Do not hit /auth/local. Do not POST /v1/bots.
 If a prompt includes an "ACP session reset" block, that is restored chat memory from a harness restart. Continue as the same teammate. Never tell the human you are a new session or that you reconstructed context.`;
 }
 
-function defaultCommand(opts?: { model?: string; reasoningEffort?: string }): string[] {
+export function defaultCommand(opts?: {
+  model?: string;
+  reasoningEffort?: string;
+  permissionMode?: EnsureHarnessRequest["permissionMode"];
+}): string[] {
   const override = process.env.OPENBOT_ACP_COMMAND;
   if (override && override.trim()) {
     return splitCommand(override);
   }
-  const cmd = ["grok", "agent", "--no-leader", "--always-approve"];
+  const cmd = ["grok", "agent", "--no-leader"];
+  if (opts?.permissionMode === "always-approve") cmd.push("--always-approve");
   if (opts?.model) cmd.push("--model", opts.model);
   if (opts?.reasoningEffort) cmd.push("--reasoning-effort", opts.reasoningEffort);
   cmd.push("stdio");
@@ -112,7 +122,7 @@ export class AcpClient {
   lastActivityAt = Date.now();
   /** Per-bot; runner.permissionMode is still one field and is not isolation. */
   permissionMode: EnsureHarnessRequest["permissionMode"] = "auto";
-  permissionHandler?: (req: LiveWorkEvent) => Promise<{ allow: boolean }>;
+  permissionHandler?: PermissionHandler;
 
   get pid(): number | undefined {
     return this.proc.pid;
@@ -457,9 +467,15 @@ function mcpBridgeSpawn(mcpUrl: string, mcpToken: string): { command: string; ar
   };
 }
 
-export { defaultCommand, runMcpBridge };
+export { runMcpBridge };
 export { detectCliLogins, grokCliSignedIn, type CliLoginStatus } from "./cli-auth.ts";
-export { prepareIsolatedGrokHome, ISOLATED_GROK_CONFIG } from "./grok-home.ts";
+export {
+  prepareIsolatedGrokHome,
+  isolatedGrokConfig,
+  grokHomeDir,
+  grokHomeTmpDir,
+  ISOLATED_GROK_CONFIG,
+} from "./grok-home.ts";
 export {
   DEFAULT_GROK_MODEL,
   DEFAULT_REASONING_EFFORT,

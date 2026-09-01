@@ -54,25 +54,31 @@ export class TurnEngine {
         if (ev.kind === "permission_request") {
           const reqId = String((ev.payload as { reqId?: string }).reqId ?? "");
           const client = botId ? r.acpFor(botId) : r.acp;
+          const askOrAuto = () => {
+            const mode = client?.permissionMode ?? r.permissionMode;
+            if (mode === "ask") {
+              this.opts.onPush(accountId, {
+                type: "permission_request",
+                turnId: turn.id,
+                reqId,
+                payload: ev.payload,
+              });
+            } else {
+              r.respondPermission(reqId, true);
+            }
+          };
           const handler = client?.permissionHandler;
           if (handler) {
             void Promise.resolve(handler(ev)).then(
-              (res) => r.respondPermission(reqId, res.allow),
+              (res) => {
+                if ("defer" in res && res.defer) askOrAuto();
+                else r.respondPermission(reqId, res.allow);
+              },
               () => r.respondPermission(reqId, false),
             );
             return;
           }
-          const mode = client?.permissionMode ?? r.permissionMode;
-          if (mode === "ask") {
-            this.opts.onPush(accountId, {
-              type: "permission_request",
-              turnId: turn.id,
-              reqId,
-              payload: ev.payload,
-            });
-          } else {
-            r.respondPermission(reqId, true);
-          }
+          askOrAuto();
         }
       };
       this.runners.set(accountId, r);
@@ -293,7 +299,12 @@ export class TurnEngine {
 
     const model = bot.model || DEFAULT_GROK_MODEL;
     const reasoningEffort = bot.reasoning_effort || DEFAULT_REASONING_EFFORT;
-    const warm = runner.matchesHarness(bot.id, model, reasoningEffort);
+    const warm = runner.matchesHarness(
+      bot.id,
+      model,
+      reasoningEffort,
+      bot.permission_mode as "ask" | "auto" | "always-approve",
+    );
     let harnessId = turn.harness_session_id;
     if (!warm) {
       this.opts.db.run(

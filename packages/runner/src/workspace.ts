@@ -6,10 +6,14 @@ export function botProjectDir(desk: string, botId: string): string {
   return join(desk, "projects", botId);
 }
 
-export function isInsideDesk(desk: string, path: string): boolean {
-  const root = resolve(desk);
+export function isInsideDir(root: string, path: string): boolean {
+  const base = resolve(root);
   const target = resolve(path);
-  return target === root || target.startsWith(root.endsWith(sep) ? root : root + sep);
+  return target === base || target.startsWith(base.endsWith(sep) ? base : base + sep);
+}
+
+export function isInsideDesk(desk: string, path: string): boolean {
+  return isInsideDir(desk, path);
 }
 
 function resolvedBotProject(desk: string, botId: string): string {

@@ -29,8 +29,11 @@
  *   [[cwd]]           SendMessage with process.cwd()
  *   [[shell:cmd]]     run a shell command in cwd
  *   [[permission]]    JSON-RPC session/request_permission and wait for the client result
+ *   [[permission-path:p]]  request_permission with toolCall.path = p
+ *   [[env:VAR]]       SendMessage VAR=value (empty if unset)
+ *   [[readfile:p]]    SendMessage the file contents or an error
  */
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 let buf = Buffer.alloc(0);
@@ -194,15 +197,19 @@ async function handle(msg: {
       await proc.exited;
     }
 
-    if (current.includes("[[permission]]")) {
+    const permPath = /\[\[permission-path:([^\]]+)\]\]/.exec(current);
+    if (current.includes("[[permission]]") || permPath) {
       const rpcId = permRpc++;
+      const toolCall = permPath
+        ? { toolCallId: "tc1", title: `read ${permPath[1]}`, kind: "read", path: permPath[1] }
+        : { toolCallId: "tc1", title: "run a command", kind: "execute" };
       write({
         jsonrpc: "2.0",
         id: rpcId,
         method: "session/request_permission",
         params: {
           sessionId,
-          toolCall: { toolCallId: "tc1", title: "run a command", kind: "execute" },
+          toolCall,
         },
       });
       await new Promise<{ result?: unknown; error?: { message: string } }>((resolve, reject) => {
@@ -409,6 +416,21 @@ async function handle(msg: {
           await callSend(mcpUrl, mcpToken, calBeforeGroup ? "got-calendar-prefix" : "no-calendar-prefix");
         }
 
+        for (const envVar of current.matchAll(/\[\[env:([A-Za-z_][A-Za-z0-9_]*)\]\]/g)) {
+          const name = envVar[1]!;
+          const value = process.env[name] ?? "";
+          await callSend(mcpUrl, mcpToken, `${name}=${value}`);
+        }
+
+        const readfile = /\[\[readfile:([^\]]+)\]\]/.exec(current);
+        if (readfile) {
+          try {
+            await callSend(mcpUrl, mcpToken, readFileSync(readfile[1]!.trim(), "utf8"));
+          } catch (err) {
+            await callSend(mcpUrl, mcpToken, `readfile_error:${String(err)}`);
+          }
+        }
+
         const send = /\[\[send:([\s\S]*?)\]\]/.exec(current);
         const sendCwd = current.includes("[[cwd]]");
         if (send || sendCwd) {
@@ -417,6 +439,9 @@ async function handle(msg: {
         } else if (
           !current.includes("[[ramble]]") &&
           !current.includes("[[permission]]") &&
+          !current.includes("[[permission-path:") &&
+          !current.includes("[[env:") &&
+          !current.includes("[[readfile:") &&
           !current.includes("[[echo-prompt]]") &&
           !current.includes("[[echo-prefix]]") &&
           !current.includes("[[echo-cal-prefix]]") &&

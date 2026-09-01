@@ -4,6 +4,7 @@ import { provisionOrgGateway } from "./gateway.ts";
 
 export function startTestServer(cfg: Partial<HomeConfig> & { home: string; port?: number }) {
   process.env.OPENBOT_ACP_IDLE_MS = process.env.OPENBOT_ACP_IDLE_MS ?? "0";
+  process.env.OPENBOT_SANDBOX = process.env.OPENBOT_SANDBOX ?? "none";
   const port = cfg.port ?? 0;
   const created = createApp({
     home: cfg.home,

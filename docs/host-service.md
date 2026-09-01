@@ -4,7 +4,7 @@ OpenBot is a process on a machine you run. That process **is** the desk **and** 
 
 This document is how to run that process as a **user** service (systemd `--user` or a launchd LaunchAgent) and how to federate **two** such hosts. `openbot install` never requires root. Do not run Chromium as root.
 
-Version: `openbot version` prints `{"openbot":"0.4.0","grokPin":"1.0.5","grok":"…"}`. Pin lives in `packages/acp-grok/src/pin.ts`.
+Version: `openbot version` prints `{"openbot":"0.4.1","grokPin":"1.0.5","grok":"…"}`. Pin lives in `packages/acp-grok/src/pin.ts`.
 
 ---
 
@@ -15,7 +15,7 @@ Version: `openbot version` prints `{"openbot":"0.4.0","grokPin":"1.0.5","grok":"
 - **Stopping the VM makes that org unreachable.** Peers get timeouts. There is no hosted retry queue. sqlite, `org.ed25519`, and inbox rows stay on disk (`held` / `pending`).
 - **Laptop-closed:** the **service host** must stay powered and reachable. A sleeping laptop is a stopped desk. Use a VPS, home server, or a Mac/PC that does not sleep.
 - **The calendar clock is the process.** Calendar fire does not survive a stopped unit, a stopped VM, or a closed laptop: the 9am did not happen. At most one catch-up if you were down less than a day; OpenBot will not replay a weekend of missed summaries. Closing the tab does not stop a turn the calendar already queued. Stopping the process stops the clock **and** the turn.
-- `$OPENBOT_HOME/desk` is a shared computer, not a security boundary **inside** an org. Cross-org is messages only (one hop: A→B). Ada on A cannot spawn Grok on B.
+- `$OPENBOT_HOME/desk` is a shared computer, not a security boundary **inside** an org. Cross-org is messages only (one hop: A→B). Ada on A cannot spawn Grok on B. Grok’s process `HOME` is `$OPENBOT_HOME/grok-home`, not the service user’s home. Vault files are outside `desk/` and blocked by the ACP path guard (and by `OPENBOT_SANDBOX` when a backend is present). That is not Ada-vs-Bob isolation and not a dedicated-user jail.
 - Bind defaults to **127.0.0.1**. OpenBot does **not** implement TLS. Put Caddy or nginx in front if you need a hostname. Caddy **must** 404 `/mcp/v1`; `/fed/v1` is the public federation surface.
 - **Federation is off until you turn it on** (`openbot gateway on` on **both** sides). Off does not delete the Gateway row or `org.ed25519`.
 - OpenBot does **not** provision Fly Machines or any cloud VM API. You bring the hosts.
@@ -128,8 +128,21 @@ loginctl enable-linger "$USER"
 | `OPENBOT_GATEWAY_ACP_IDLE_MS` | Gateway ACP idle TTL. Default 1800000 (30 minutes). `0` disables Gateway idle kill only. |
 | `OPENBOT_FEDERATION` | Panic **off:** `0` makes federation effective-off even if the DB flag is on. Unset/`1` does **not** force on. Restart the unit so the process sees env. `GET /fed/v1/info` still works. |
 | `OPENBOT_FED_ALLOW_HTTP` | `1` allows RFC1918 `http://` peer URLs (LAN). Default is https, plus loopback `http://127.0.0.1` / `localhost`. |
+| `OPENBOT_SANDBOX` | Optional Grok-child sandbox (`auto` / `none` / `bwrap` / `seatbelt` / `required`). Default `auto`. The **server** process is not sandboxed. |
 
-Units from `install` bind `--host 127.0.0.1` and snapshot `PATH` so `grok` is found. Do not point `HOME` at `OPENBOT_HOME`; Grok CLI auth lives in `~/.grok` of the **service user**.
+Units from `install` bind `--host 127.0.0.1` and snapshot `PATH` so `grok` is found. Do not point the **unit** `HOME` at `OPENBOT_HOME` or at `grok-home`; the server still reads `~/.grok/auth.json` of the **service user** and copies it into `grok-home/`. Only the Grok child gets `HOME=grok-home`.
+
+### Dedicated OS user (real unix isolation)
+
+`openbot install --user` means a systemd **user** unit / LaunchAgent, not a dedicated account. Same-uid `0600` on `master.key` does not stop Grok from reading it. To isolate the desk from your login:
+
+1. Create a user (needs root once): `sudo useradd --create-home --home-dir /var/lib/openbot openbot` (or a macOS user with a home you control).
+2. As that user: `grok login`, `openbot org init acme`, `openbot install --user --org acme --start`.
+3. Linux linger so the user instance survives logout: `sudo loginctl enable-linger openbot`.
+
+Git-over-SSH from your agent socket will not work; put remotes/keys **on the desk** or use HTTPS. Do not run Chromium as root.
+
+---
 
 Put GitHub secrets in a systemd drop-in or launchd environment, not in the Caddyfile.
 

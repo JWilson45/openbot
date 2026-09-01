@@ -8,8 +8,18 @@ import type {
   LiveWorkEvent,
   PromptResult,
 } from "@openbot/compute-protocol";
-import { AcpClient, DEFAULT_GROK_MODEL, DEFAULT_REASONING_EFFORT, prepareIsolatedGrokHome } from "@openbot/acp-grok";
+import {
+  AcpClient,
+  DEFAULT_GROK_MODEL,
+  DEFAULT_REASONING_EFFORT,
+  defaultCommand,
+  grokHomeDir,
+  prepareIsolatedGrokHome,
+} from "@openbot/acp-grok";
 import { botProjectDir, deleteBotProject, ensureBotProject, ensureGatewayWorkspace } from "./workspace.ts";
+import { buildChromiumEnv, buildHarnessEnv, chromiumTmpDir, snapshotChildEnv, type ChildEnvSnapshot } from "./harness-env.ts";
+import { denyGatewayExec, deskPathGuard } from "./permissions.ts";
+import { wrapSandboxCommand, type SandboxWrap } from "./sandbox.ts";
 
 export const DEFAULT_ACP_IDLE_MS = 10 * 60 * 1000;
 export const DEFAULT_GATEWAY_ACP_IDLE_MS = 30 * 60 * 1000;
@@ -135,14 +145,6 @@ export type BrowserHandle = {
 
 export type PermissionHandler = (req: LiveWorkEvent) => Promise<{ allow: boolean }>;
 
-/** Gateway spike: deny execute/shell. Not isolation; ACP-native bash can still exist. */
-export function denyGatewayExec(ev: LiveWorkEvent): Promise<{ allow: boolean }> {
-  const toolCall = ev.payload.toolCall as { kind?: string } | undefined;
-  const kind = String(toolCall?.kind ?? "").toLowerCase();
-  if (kind === "execute" || kind === "shell") return Promise.resolve({ allow: false });
-  return Promise.resolve({ allow: false });
-}
-
 export class LocalHostRunner implements ComputeContract, ComputeDriver {
   harness: "down" | "starting" | "idle" | "in_turn" | "crashed" = "down";
   acp: AcpClient | null = null;
@@ -152,6 +154,8 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   harnessSessionId?: string;
   acpSessionId?: string;
   lastEnv: Record<string, string> = {};
+  lastChildEnv: ChildEnvSnapshot | null = null;
+  lastSandbox: Pick<SandboxWrap, "backend" | "reason"> | null = null;
   injectedKey = false;
   permissionMode: "ask" | "auto" | "always-approve" = "auto";
   lastDispatchedInput: Record<string, unknown> | null = null;
@@ -447,8 +451,9 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     if (this.browser?.cdpUrl) return this.browser;
     const userDataDir = join(this.desk, ".openbot", "chromium");
     mkdirSync(userDataDir, { recursive: true });
+    mkdirSync(chromiumTmpDir(this.desk), { recursive: true });
     const port = await freePort();
-    const launched = await launchChromium(port, userDataDir);
+    const launched = await launchChromium(port, userDataDir, buildChromiumEnv({ desk: this.desk }));
     this.browser = {
       ...launched,
       cdpPort: port,
@@ -505,12 +510,19 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     return this.acps.get(botId)?.client.pid;
   }
 
-  matchesHarness(botId: string, model?: string, reasoningEffort?: string): boolean {
+  matchesHarness(
+    botId: string,
+    model?: string,
+    reasoningEffort?: string,
+    permissionMode?: EnsureHarnessRequest["permissionMode"],
+  ): boolean {
     const existing = this.acps.get(botId)?.client;
     if (!existing || existing.closed || !existing.sessionId || this.harness === "crashed") return false;
     const wantModel = model || DEFAULT_GROK_MODEL;
     const wantEffort = reasoningEffort || DEFAULT_REASONING_EFFORT;
-    return existing.model === wantModel && existing.reasoningEffort === wantEffort;
+    if (existing.model !== wantModel || existing.reasoningEffort !== wantEffort) return false;
+    if (permissionMode && existing.permissionMode !== permissionMode) return false;
+    return true;
   }
 
   invalidateAcp(botId: string): void {
@@ -556,8 +568,20 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     const existing = this.acps.get(req.botId);
     const role = req.role === "gateway" ? "gateway" : "desk";
     const idleTtlMs = req.idleTtlMs ?? (role === "gateway" ? gatewayAcpIdleTtlMs() : acpIdleTtlMs());
-    const permissionHandler = role === "gateway" ? denyGatewayExec : undefined;
-    if (this.matchesHarness(req.botId, model, reasoningEffort)) {
+    const grokHome = grokHomeDir(this.home);
+    prepareIsolatedGrokHome(this.home, process.env.HOME, req.permissionMode);
+    const permissionHandler =
+      role === "gateway"
+        ? denyGatewayExec
+        : (ev: LiveWorkEvent) =>
+            deskPathGuard(ev, {
+              desk: this.desk,
+              grokHome,
+              openbotHome: this.home,
+              cwd: req.cwd,
+              operatorHome: process.env.HOME,
+            });
+    if (this.matchesHarness(req.botId, model, reasoningEffort, req.permissionMode)) {
       const client = existing!.client;
       existing!.idleTtlMs = idleTtlMs;
       existing!.role = role;
@@ -573,25 +597,30 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     this.harness = "starting";
     try {
       if (existing) await existing.client.kill();
-      const grokHome = prepareIsolatedGrokHome(this.home);
-      const spawnEnv: Record<string, string> = {
-        ...processEnvSansSecrets(),
+      const extras: Record<string, string> = {
         ...env,
-        HOME: process.env.HOME ?? this.home,
-        GROK_HOME: grokHome,
-        GROK_DISABLE_AUTOUPDATER: "1",
-        GROK_CURSOR_MCPS_ENABLED: "0",
-        GROK_CLAUDE_MCPS_ENABLED: "0",
-        GROK_SUBAGENTS: "0",
         OPENBOT_MCP_URL: req.mcpUrl,
-        OPENBOT_MCP_TOKEN: req.mcpToken,
         GROK_CONFIG: JSON.stringify({
           models: { default: model, default_reasoning_effort: reasoningEffort },
         }),
       };
-      if (req.omitCdp) delete spawnEnv.OPENBOT_CDP_URL;
-      else spawnEnv.OPENBOT_CDP_URL = this.browser?.cdpUrl ?? "";
+      if (req.omitCdp) extras.OPENBOT_CDP_URL = "";
+      else extras.OPENBOT_CDP_URL = this.browser?.cdpUrl ?? "";
+      const spawnEnv = buildHarnessEnv({ openbotHome: this.home, extras });
+      this.lastChildEnv = snapshotChildEnv(spawnEnv);
+      const command = defaultCommand({
+        model,
+        reasoningEffort,
+        permissionMode: req.permissionMode,
+      });
+      const sandboxed = wrapSandboxCommand(command, {
+        openbotHome: this.home,
+        desk: this.desk,
+        grokHome,
+      });
+      this.lastSandbox = { backend: sandboxed.backend, reason: sandboxed.reason };
       const client = AcpClient.launch({
+        command: sandboxed.cmd,
         cwd: req.cwd,
         env: spawnEnv,
         model,
@@ -926,16 +955,6 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   }
 }
 
-function processEnvSansSecrets(): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (v == null) continue;
-    if (/KEY|TOKEN|SECRET|PASSWORD/i.test(k)) continue;
-    env[k] = v;
-  }
-  return env;
-}
-
 export async function freePort(): Promise<number> {
   const server = Bun.listen({
     hostname: "127.0.0.1",
@@ -956,6 +975,7 @@ const TAKEOVER_HOME =
 async function launchChromium(
   port: number,
   userDataDir: string,
+  env: Record<string, string>,
 ): Promise<{ proc?: ReturnType<typeof spawn>; pid?: number }> {
   const exe = await findChrome();
   if (!exe) {
@@ -971,9 +991,12 @@ async function launchChromium(
       "--disable-gpu",
       "--no-first-run",
       "--disable-extensions",
+      "--use-mock-keychain",
+      "--password-store=basic",
       `--window-size=${BROWSER_VIEWPORT_MAX.width},${BROWSER_VIEWPORT_MAX.height}`,
       "about:blank",
     ],
+    env,
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -1210,4 +1233,26 @@ export {
   ensureGatewayWorkspace,
   gatewayWorkspaceDir,
   isInsideDesk,
+  isInsideDir,
 } from "./workspace.ts";
+export {
+  denyGatewayExec,
+  deskPathGuard,
+  extractPermissionPaths,
+  pathIsDenied,
+  resolvePermissionPath,
+} from "./permissions.ts";
+export {
+  buildHarnessEnv,
+  buildChromiumEnv,
+  snapshotChildEnv,
+  CHILD_ENV_PASSTHROUGH,
+  chromiumTmpDir,
+} from "./harness-env.ts";
+export {
+  wrapSandboxCommand,
+  sandboxModeFromEnv,
+  seatbeltProfile,
+  bwrapArgs,
+  SandboxRequiredError,
+} from "./sandbox.ts";
