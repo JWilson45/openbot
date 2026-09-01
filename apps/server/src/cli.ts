@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { addAllowlist, loadAllowlist } from "@openbot/auth";
 import { detectGrokCliVersion, grokCliPinStatus, PINNED_GROK_CLI, runMcpBridge } from "@openbot/acp-grok";
 import pkg from "../../../package.json" with { type: "json" };
@@ -9,10 +9,12 @@ import launchdTemplate from "../../../contrib/launchd/ai.openbot.plist" with { t
 import systemdTemplate from "../../../contrib/systemd/openbot.service" with { type: "text" };
 import { OpenbotDb } from "@openbot/db";
 import { loadOrCreateMasterKey } from "@openbot/vault";
+import { joinRunner, readMachineToken } from "@openbot/runner";
 import { createApp } from "./app.ts";
 import {
   currentOrgMeta,
   deleteOrgPeer,
+  ensureOrgAccount,
   ensureOrgKeypair,
   ensureOrgMeta,
   insertOrgPeer,
@@ -23,6 +25,7 @@ import {
   setFederationEnabled,
   writeOrgJson,
 } from "./org.ts";
+import { enrollAccount, getRunnerRow, publicRunnerSnapshot, revokeAccount } from "./runner-admin.ts";
 import { findActiveGateway } from "./gateway.ts";
 import {
   listProfiles,
@@ -52,6 +55,8 @@ const VALUE_FLAGS = new Set([
   "--pubkey",
   "--org-id",
   "--id",
+  "--token",
+  "--runner-home",
 ]);
 
 function firstPositional(reserved: string[] = []): string | undefined {
@@ -199,6 +204,11 @@ Usage:
   openbot version | -v | --version
   openbot allowlist add <github-login>
   openbot allowlist
+  openbot runner enroll [--origin URL] [--port 8787] [--home DIR]
+  openbot runner join <origin> --token TOKEN [--home|--runner-home DIR]
+  openbot runner leave [--home|--runner-home DIR]
+  openbot runner revoke [--port 8787] [--home DIR]
+  openbot runner status [--home DIR]
 
   demo      same desk as server, with loopback sign-in as "demo". --fake = scripted ACP.
   server    bind the desk (default 127.0.0.1). GitHub OAuth + allowlist. --origin overrides OPENBOT_PUBLIC_ORIGIN.
@@ -210,6 +220,7 @@ Usage:
   gateway   write org_meta.federation_enabled. Env OPENBOT_FEDERATION=0 still wins. Does not delete Gateway.
   peers     list, add, or remove federation peers.
   version   print {"openbot","grokPin","grok"} JSON.
+  runner    enroll / join / leave / revoke / status a computer (desk on another process).
 
 Named orgs live in ~/.openbot/orgs/<slug>/ (registry: ~/.openbot/profiles.json).
 --home / OPENBOT_HOME pin a path (units snapshot this) and skip the current org.
@@ -500,6 +511,174 @@ function install(): void {
   console.log(`# systemd user dest: ${join(userHome(), ".config/systemd/user/openbot.service")}\n${linuxRendered}`);
 }
 
+function isConnRefused(err: unknown): boolean {
+  const e = err as { code?: string; message?: string; cause?: { code?: string } };
+  const code = e.code ?? e.cause?.code ?? "";
+  const msg = e.message ?? "";
+  return (
+    code === "ConnectionRefused" ||
+    code === "ECONNREFUSED" ||
+    /unable to connect|connection refused/i.test(msg)
+  );
+}
+
+function resolveRunnerHome(): string {
+  return (
+    process.env.OPENBOT_RUNNER_HOME?.trim() ||
+    arg("--runner-home") ||
+    arg("--home") ||
+    join(userHome(), ".openbot-runner")
+  );
+}
+
+async function runnerCommand(): Promise<void> {
+  const sub = process.argv[3];
+  const port = arg("--port", process.env.PORT ?? "8787") ?? "8787";
+  if (sub === "enroll") {
+    const originFlag = arg("--origin")?.trim();
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/v1/runner/enroll`, {
+        method: "POST",
+        headers: { Host: `127.0.0.1:${port}` },
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        console.error(JSON.stringify(body));
+        process.exit(1);
+      }
+      console.log(JSON.stringify(body));
+    } catch (err) {
+      if (!isConnRefused(err)) {
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exit(1);
+      }
+      const inv = mustInvocation();
+      const db = OpenbotDb.open(join(inv.home, "openbot.sqlite"));
+      try {
+        ensureOrgMeta(db, {
+          env: process.env,
+          file: join(inv.home, "org.json"),
+          publicOrigin: originFlag ?? process.env.OPENBOT_PUBLIC_ORIGIN,
+          advertisedOrigin: `http://127.0.0.1:${port}`,
+        });
+        ensureOrgAccount(db);
+        const accountId = currentOrgMeta(db)?.account_id;
+        if (!accountId) {
+          console.error("no_account");
+          process.exit(1);
+        }
+        const origin =
+          originFlag || currentOrgMeta(db)?.public_origin || `http://127.0.0.1:${port}`;
+        console.log(JSON.stringify(enrollAccount(db, accountId, origin)));
+      } finally {
+        db.close();
+      }
+    }
+    return;
+  }
+  if (sub === "revoke") {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/v1/runner/revoke`, {
+        method: "POST",
+        headers: { Host: `127.0.0.1:${port}` },
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        console.error(JSON.stringify(body));
+        process.exit(1);
+      }
+      console.log(JSON.stringify(body));
+    } catch (err) {
+      if (!isConnRefused(err)) {
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exit(1);
+      }
+      const inv = mustInvocation();
+      const db = OpenbotDb.open(join(inv.home, "openbot.sqlite"));
+      try {
+        const accountId = currentOrgMeta(db)?.account_id;
+        if (!accountId) {
+          console.error("no_account");
+          process.exit(1);
+        }
+        revokeAccount(db, accountId);
+        console.log(JSON.stringify({ ok: true, sqlite: true }));
+      } finally {
+        db.close();
+      }
+    }
+    return;
+  }
+  if (sub === "join") {
+    let origin: string | undefined;
+    for (let i = 4; i < process.argv.length; i++) {
+      const a = process.argv[i]!;
+      if (a.startsWith("-")) {
+        if (VALUE_FLAGS.has(a)) i += 1;
+        continue;
+      }
+      origin = a;
+      break;
+    }
+    const token = arg("--token") ?? process.env.OPENBOT_ENROLL_TOKEN;
+    if (!origin) {
+      console.error("usage: openbot runner join <origin> --token TOKEN [--home DIR]");
+      process.exit(1);
+    }
+    const home = resolveRunnerHome();
+    try {
+      const joined = await joinRunner({
+        origin,
+        token,
+        home,
+        version: openbotVersion(),
+      });
+      const halt = (): void => joined.stop();
+      process.on("SIGINT", halt);
+      process.on("SIGTERM", halt);
+      await joined.closed;
+    } catch (err) {
+      const e = err as { code?: number; message?: string };
+      console.error(JSON.stringify({ error: e.message ?? String(err), code: e.code }));
+      process.exit(1);
+    }
+    return;
+  }
+  if (sub === "leave") {
+    const home = resolveRunnerHome();
+    const tokenPath = join(home, "machine.token");
+    if (existsSync(tokenPath)) unlinkSync(tokenPath);
+    console.log(JSON.stringify({ ok: true, home }));
+    return;
+  }
+  if (sub === "status") {
+    const out: Record<string, unknown> = {};
+    try {
+      const inv = invocation();
+      const sqlite = join(inv.home, "openbot.sqlite");
+      if (existsSync(sqlite)) {
+        const db = OpenbotDb.open(sqlite);
+        try {
+          const accountId = currentOrgMeta(db)?.account_id;
+          out.org = accountId ? publicRunnerSnapshot(getRunnerRow(db, accountId)) : null;
+          out.orgHome = inv.home;
+        } finally {
+          db.close();
+        }
+      }
+    } catch {
+      /* no org home */
+    }
+    const home = resolveRunnerHome();
+    out.runnerHome = home;
+    out.machineToken = Boolean(readMachineToken(home));
+    console.log(JSON.stringify(out));
+    return;
+  }
+  console.error("usage: openbot runner enroll|join|leave|revoke|status");
+  process.exit(1);
+}
+
 const cmd = process.argv[2] ?? "help";
 
 if (cmd === "version" || cmd === "-v" || cmd === "--version") {
@@ -681,6 +860,8 @@ if (cmd === "version" || cmd === "-v" || cmd === "--version") {
   await runMcpBridge(url, token);
 } else if (cmd === "install") {
   install();
+} else if (cmd === "runner") {
+  await runnerCommand();
 } else {
   printHelp();
 }

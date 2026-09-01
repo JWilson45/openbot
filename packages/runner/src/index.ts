@@ -181,6 +181,14 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     return join(this.home, "desk");
   }
 
+  get connected(): boolean {
+    return true;
+  }
+
+  get workspacePath(): string {
+    return this.desk;
+  }
+
   projectDir(botId: string): string {
     return botProjectDir(this.desk, botId);
   }
@@ -511,6 +519,24 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
 
   acpPid(botId: string): number | undefined {
     return this.acps.get(botId)?.client.pid;
+  }
+
+  async kill(botId: string): Promise<void> {
+    const slot = this.acps.get(botId);
+    if (!slot) return;
+    await slot.client.kill();
+    this.acps.delete(botId);
+    if (this.acp === slot.client) {
+      this.acp = null;
+      this.acpSessionId = undefined;
+      this.harness = "down";
+    }
+  }
+
+  async cancel(botId: string): Promise<void> {
+    const slot = this.acps.get(botId);
+    if (!slot) return;
+    await slot.client.cancel();
   }
 
   matchesHarness(
@@ -1279,3 +1305,6 @@ export {
   bwrapArgs,
   SandboxRequiredError,
 } from "./sandbox.ts";
+export { JsonRpcPeer, RpcError } from "./rpc.ts";
+export { startMcpProxy } from "./mcp-proxy.ts";
+export { joinRunner, readMachineToken, writeMachineToken, machineTokenPath } from "./join.ts";

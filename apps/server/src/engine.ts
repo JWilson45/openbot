@@ -9,6 +9,9 @@ import {
   gatewayAcpIdleTtlMs,
   LocalHostRunner,
 } from "@openbot/runner";
+import type { RunnerSession } from "@openbot/compute-protocol";
+import { RunnerUnavailable } from "@openbot/compute-protocol";
+import type { RemoteRunnerClient, TakeoverBridge } from "./remote-runner.ts";
 import { DEFAULT_GROK_MODEL, DEFAULT_REASONING_EFFORT, grokCliSignedIn } from "@openbot/acp-grok";
 import { currentOrgMeta, FEDERATION_OFF_NOTICE, federationEffective } from "./org.ts";
 import { maybeEnqueueGatewayDrain } from "./inbox.ts";
@@ -30,6 +33,9 @@ export type EngineOpts = {
 
 export class TurnEngine {
   runners = new Map<string, LocalHostRunner>();
+  remotes = new Map<string, RemoteRunnerClient>();
+  takeoverBridges = new Map<string, TakeoverBridge>();
+  takeoverByAccount = new Map<string, TakeoverBridge>();
   busy = false;
   private looping = false;
   private loopAgain = false;
@@ -37,7 +43,74 @@ export class TurnEngine {
 
   constructor(public readonly opts: EngineOpts) {}
 
-  runnerFor(accountId: string): LocalHostRunner {
+  enrolledRow(accountId: string): { status: string; machine_token_hash: string | null } | undefined {
+    const row = this.opts.db.get<{ status: string; machine_token_hash: string | null }>(
+      "SELECT status, machine_token_hash FROM runners WHERE account_id = ?",
+      [accountId],
+    );
+    if (!row || row.status === "revoked") return undefined;
+    return row;
+  }
+
+  markRunnersDisconnectedOnBoot(): void {
+    this.opts.db.run(
+      "UPDATE runners SET status = 'disconnected', last_disconnect_at = ?, updated_at = ? WHERE status = 'connected'",
+      [now(), now()],
+    );
+  }
+
+  async detachLocal(accountId: string): Promise<void> {
+    const r = this.runners.get(accountId);
+    if (!r) return;
+    try {
+      await r.lifecycle({ op: "stop" });
+    } catch {
+      /* ignore */
+    }
+    this.runners.delete(accountId);
+  }
+
+  revokeRemote(accountId: string): void {
+    const live = this.remotes.get(accountId);
+    if (live) {
+      live.connected = false;
+      live.close();
+      this.remotes.delete(accountId);
+    }
+  }
+
+  /** True when this socket was the live client (last-hello-wins must not mark the replacement disconnected). */
+  disconnectRemote(accountId: string, client: RemoteRunnerClient): boolean {
+    const live = this.remotes.get(accountId);
+    if (live !== client) return false;
+    client.connected = false;
+    this.remotes.delete(accountId);
+    return true;
+  }
+
+  attachRemote(accountId: string, client: RemoteRunnerClient): void {
+    const prev = this.remotes.get(accountId);
+    if (prev && prev !== client) {
+      prev.connected = false;
+      prev.close();
+    }
+    this.bindLiveWork(client, accountId);
+    this.remotes.set(accountId, client);
+  }
+
+  runnerFor(accountId: string): RunnerSession {
+    const row = this.enrolledRow(accountId);
+    const live = this.remotes.get(accountId);
+    if (row == null && live) {
+      live.close();
+      this.remotes.delete(accountId);
+    }
+    if (live?.connected && row != null) return live;
+    if (row) throw new RunnerUnavailable();
+    return this.localHostRunnerFor(accountId);
+  }
+
+  localHostRunnerFor(accountId: string): LocalHostRunner {
     let r = this.runners.get(accountId);
     if (!r) {
       r = new LocalHostRunner(this.opts.home, accountId);
@@ -84,6 +157,37 @@ export class TurnEngine {
       this.runners.set(accountId, r);
     }
     return r;
+  }
+
+  bindLiveWork(session: RunnerSession, accountId: string): void {
+    session.onLiveWork = (ev, botId) => {
+      const turn = this.opts.db.get<TurnRow>(
+        botId
+          ? "SELECT * FROM turns WHERE status = 'running' AND bot_id = ? ORDER BY created_at DESC LIMIT 1"
+          : "SELECT * FROM turns WHERE status = 'running' AND bot_id IN (SELECT id FROM bots WHERE account_id = ?) ORDER BY created_at DESC LIMIT 1",
+        [botId ?? accountId],
+      );
+      if (!turn) return;
+      appendLiveWork(this.opts.db, turn.id, ev.kind, ev.payload);
+      this.opts.onPush(accountId, { type: "live_work", turnId: turn.id, event: ev });
+      if (ev.kind === "permission_request") {
+        const reqId = String((ev.payload as { reqId?: string }).reqId ?? "");
+        const bot = botId
+          ? this.opts.db.get<{ permission_mode: string }>("SELECT permission_mode FROM bots WHERE id = ?", [botId])
+          : undefined;
+        const mode = bot?.permission_mode ?? "auto";
+        if (mode === "ask") {
+          this.opts.onPush(accountId, {
+            type: "permission_request",
+            turnId: turn.id,
+            reqId,
+            payload: ev.payload,
+          });
+        } else {
+          void session.respondPermission(reqId, true);
+        }
+      }
+    };
   }
 
   kick(): void {
@@ -140,14 +244,20 @@ export class TurnEngine {
     )) {
       skipBotIds.add(row.bot_id);
     }
-    for (const runner of this.runners.values()) {
-      const killed = runner.reapIdle(Date.now(), { federationOff, skipBotIds });
+    const apply = (killed: string[]) => {
       for (const botId of killed) {
         this.opts.db.run(
           "UPDATE harness_sessions SET state = 'ended', ended_at = ? WHERE bot_id = ? AND ended_at IS NULL",
           [now(), botId],
         );
       }
+    };
+    for (const runner of this.runners.values()) {
+      apply(runner.reapIdle(Date.now(), { federationOff, skipBotIds }));
+    }
+    for (const remote of this.remotes.values()) {
+      if (!remote.connected) continue;
+      void Promise.resolve(remote.reapIdle(Date.now(), { federationOff, skipBotIds })).then(apply, () => undefined);
     }
   }
 
@@ -157,6 +267,8 @@ export class TurnEngine {
     );
     for (const row of rows) {
       this.runners.get(row.account_id)?.invalidateAcp(row.id);
+      const remote = this.remotes.get(row.account_id);
+      if (remote?.connected) void remote.invalidateAcp(row.id);
     }
   }
 
@@ -263,13 +375,9 @@ export class TurnEngine {
     );
     const isGateway = bot.role === "gateway";
     const org = currentOrgMeta(this.opts.db);
-    const runner = this.runnerFor(bot.account_id);
-    runner.permissionMode = (bot.permission_mode as typeof runner.permissionMode) || "auto";
-    await runner.ensure(bot.account_id);
-    const cwd = isGateway ? runner.ensureGatewayWorkspace() : runner.ensureProject(bot.id, bot.name);
 
     if (isGateway && !federationEffective(org)) {
-      runner.invalidateAcp(bot.id);
+      this.runners.get(bot.account_id)?.invalidateAcp(bot.id);
       this.opts.db.run("UPDATE turns SET status = 'running', started_at = ? WHERE id = ?", [
         now(),
         turn.id,
@@ -298,6 +406,22 @@ export class TurnEngine {
       return;
     }
 
+    let runner: RunnerSession;
+    try {
+      runner = this.runnerFor(bot.account_id);
+    } catch (err) {
+      if (err instanceof RunnerUnavailable) return;
+      throw err;
+    }
+    if ("permissionMode" in runner) {
+      (runner as LocalHostRunner).permissionMode =
+        (bot.permission_mode as LocalHostRunner["permissionMode"]) || "auto";
+    }
+    await runner.ensure(bot.account_id);
+    const cwd = isGateway
+      ? await runner.ensureGatewayWorkspace()
+      : await runner.ensureProject(bot.id, bot.name);
+
     const cred = this.opts.db.get<{ ciphertext: Uint8Array; dek_wrapped: Uint8Array; key_id: string }>(
       "SELECT ciphertext, dek_wrapped, key_id FROM credentials WHERE account_id = ? AND kind = 'xai_api_key'",
       [bot.account_id],
@@ -305,7 +429,7 @@ export class TurnEngine {
 
     const model = bot.model || DEFAULT_GROK_MODEL;
     const reasoningEffort = bot.reasoning_effort || DEFAULT_REASONING_EFFORT;
-    const warm = runner.matchesHarness(
+    const warm = await runner.matchesHarness(
       bot.id,
       model,
       reasoningEffort,
@@ -403,7 +527,9 @@ export class TurnEngine {
     }
 
     const mcpUrl = `http://127.0.0.1:${this.opts.mcpPort()}/mcp/v1`;
-    runner.harnessSessionId = harnessId;
+    if ("harnessSessionId" in runner) {
+      (runner as LocalHostRunner).harnessSessionId = harnessId;
+    }
 
     try {
       const harness = await runner.ensureHarness({
@@ -464,7 +590,11 @@ export class TurnEngine {
       });
       reconcileCalendarInstance(this.opts.db, turn.id);
     } catch (err) {
-      const stderr = runner.acpFor(bot.id)?.lastStderr ?? "";
+      const local = this.runners.get(bot.account_id);
+      const stderr =
+        (err && typeof err === "object" && "stderr" in err ? String((err as { stderr?: string }).stderr ?? "") : "") ||
+        local?.acpFor(bot.id)?.lastStderr ||
+        "";
       const text = (err instanceof Error ? err.message : String(err)) + (stderr ? `\n${stderr.slice(-1500)}` : "");
       this.opts.db.run("UPDATE turns SET error = ? WHERE id = ?", [text, turn.id]);
       this.opts.db.run("UPDATE turns SET status = 'running' WHERE id = ?", [turn.id]);

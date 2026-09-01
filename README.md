@@ -47,6 +47,7 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 | Calendar / schedules / Learn this | Org-local sqlite (not Google Calendar: no sync, no invites). Schedules and learned routines are two products on the same grid. **Learn this** drafts a proposed event from a thread — not a recording. The clock is the process. |
 | OpenAI-compatible API | Open WebUI (and similar) can use a bot as `openbot/<Name>` with a `sk-ob_…` key. Two connections = two orgs (mint the key on that VM). |
 | Org / Gateway | One process is one org. Auto-provisioned **Gateway** diplomat (not a seventh desk slot). Federation **off** until `openbot gateway on` on both peers. |
+| Remote computer | Optional enrolled runner (`openbot runner join`) holds Grok and Chromium. The org process stays up if that computer sleeps. Default is still in-process on the server host. |
 | Auth | Local demo login on loopback, or GitHub OAuth + allowlist. Optional vaulted `XAI_API_KEY`; `grok login` is enough. |
 
 ---
@@ -89,7 +90,7 @@ cd openbot
 bun install
 ```
 
-The CLI is `bun run openbot -- <command>` (or `bun run apps/server/src/cli.ts`). Current version is **0.5.0**. `openbot version` prints `{ openbot, grokPin, grok }`. OpenBot pins **Grok CLI 1.0.5** (warns if missing or older; does not refuse to start).
+The CLI is `bun run openbot -- <command>` (or `bun run apps/server/src/cli.ts`). Current version is **0.6.0**. `openbot version` prints `{ openbot, grokPin, grok }`. OpenBot pins **Grok CLI 1.0.5** (warns if missing or older; does not refuse to start).
 
 Merging to `main` with a **new** `package.json` version creates tag `vX.Y.Z` and publishes GitHub Release binaries. Pull requests run tests. Other branches do not. A version that already has a tag is not re-released.
 
@@ -120,6 +121,11 @@ openbot peers remove --id <orgId>
 openbot version | -v | --version
 openbot allowlist add <github-login>
 openbot allowlist
+openbot runner enroll [--origin URL] [--port 8787] [--home DIR]
+openbot runner join <origin> --token TOKEN [--home DIR]
+openbot runner leave [--home DIR]
+openbot runner revoke [--port 8787] [--home DIR]
+openbot runner status [--home DIR]
 ```
 
 Bind defaults to **127.0.0.1**. OpenBot does not terminate TLS — put Caddy or nginx in front (see [docs/host-service.md](docs/host-service.md) and `contrib/caddy/Caddyfile.example`).

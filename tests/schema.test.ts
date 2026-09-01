@@ -31,6 +31,8 @@ test("schema applies on a fresh sqlite file", () => {
     "thread_bridges",
     "calendar_series",
     "calendar_instances",
+    "runners",
+    "runner_enroll_tokens",
   ]) {
     expect(names).toContain(required);
   }
@@ -184,6 +186,30 @@ test("schema applies on a fresh sqlite file", () => {
   expect(moreIndexes).toContain("calendar_instances_series_when");
   expect(moreIndexes).toContain("calendar_instances_status_when");
   expect(moreIndexes).toContain("calendar_instances_turn");
+  const runnerCols = db.all<{ name: string }>("PRAGMA table_info(runners)").map((c) => c.name);
+  for (const col of [
+    "id",
+    "account_id",
+    "hostname",
+    "platform",
+    "runner_version",
+    "workspace_path",
+    "machine_token_hash",
+    "status",
+    "grok_cli_signed_in",
+    "last_hello_at",
+    "last_heartbeat_at",
+    "last_disconnect_at",
+    "created_at",
+    "updated_at",
+  ]) {
+    expect(runnerCols).toContain(col);
+  }
+  const enrollCols = db.all<{ name: string }>("PRAGMA table_info(runner_enroll_tokens)").map((c) => c.name);
+  for (const col of ["id", "account_id", "token_hash", "expires_at", "used_at", "created_at"]) {
+    expect(enrollCols).toContain(col);
+  }
+  expect(moreIndexes).toContain("runner_enroll_account");
 });
 
 test("migrate adds bots.role on a pre-gateway sqlite", () => {
