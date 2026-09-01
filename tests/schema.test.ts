@@ -48,6 +48,8 @@ test("schema applies on a fresh sqlite file", () => {
   const harnessCols = db.all<{ name: string }>("PRAGMA table_info(harness_sessions)").map((c) => c.name);
   expect(harnessCols).toContain("roster_fingerprint");
   expect(harnessCols).toContain("overlay_hash");
+  expect(harnessCols).toContain("compact_turns");
+  expect(harnessCols).toContain("compact_chars");
   const memCols = db.all<{ name: string }>("PRAGMA table_info(memory_notes)").map((c) => c.name);
   for (const col of [
     "id",

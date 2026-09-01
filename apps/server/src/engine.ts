@@ -25,6 +25,8 @@ import {
   deleteBotProject,
   gatewayAcpIdleTtlMs,
   LocalHostRunner,
+  overflowErrorText,
+  overflowStopReason,
 } from "@openbot/runner";
 import type { RunnerSession } from "@openbot/compute-protocol";
 import { RunnerUnavailable } from "@openbot/compute-protocol";
@@ -481,8 +483,11 @@ export class TurnEngine {
       acp_session_id: string | null;
       roster_fingerprint: string | null;
       overlay_hash: string | null;
+      compact_turns: number | null;
+      compact_chars: number | null;
     }>(
-      `SELECT acp_session_id, roster_fingerprint, overlay_hash FROM harness_sessions
+      `SELECT acp_session_id, roster_fingerprint, overlay_hash, compact_turns, compact_chars
+       FROM harness_sessions
        WHERE bot_id = ? ORDER BY created_at DESC LIMIT 1`,
       [bot.id],
     );
@@ -493,8 +498,8 @@ export class TurnEngine {
       );
       harnessId = id();
       this.opts.db.run(
-        `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at, roster_fingerprint, overlay_hash)
-         VALUES (?, ?, ?, 'active', ?, ?, ?)`,
+        `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at, roster_fingerprint, overlay_hash, compact_turns, compact_chars)
+         VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
         [
           harnessId,
           compute?.id ?? bot.account_id,
@@ -502,6 +507,8 @@ export class TurnEngine {
           now(),
           latest?.roster_fingerprint ?? null,
           latest?.overlay_hash ?? null,
+          latest?.compact_turns ?? 0,
+          latest?.compact_chars ?? 0,
         ],
       );
       // NULL overlay_hash is a mismatch so pre-PR5 rows skip resume.
@@ -517,8 +524,8 @@ export class TurnEngine {
       else {
         harnessId = id();
         this.opts.db.run(
-          `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at, roster_fingerprint, overlay_hash)
-           VALUES (?, ?, ?, 'active', ?, ?, ?)`,
+          `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at, roster_fingerprint, overlay_hash, compact_turns, compact_chars)
+           VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
           [
             harnessId,
             compute?.id ?? bot.account_id,
@@ -526,6 +533,8 @@ export class TurnEngine {
             now(),
             latest?.roster_fingerprint ?? currentFingerprint,
             latest?.overlay_hash ?? currentOverlayHash,
+            latest?.compact_turns ?? 0,
+            latest?.compact_chars ?? 0,
           ],
         );
       }
@@ -593,56 +602,115 @@ export class TurnEngine {
       (runner as LocalHostRunner).harnessSessionId = harnessId;
     }
 
+    const userMsg = this.opts.db.get<{ origin: string; body: string }>(
+      "SELECT origin, body FROM messages WHERE turn_id = ? AND role = 'user' ORDER BY created_at DESC LIMIT 1",
+      [turn.id],
+    );
+    const lastThreadId =
+      (await runner.lastPromptThread(bot.id)) ?? lastFinishedThread(this.opts.db, bot.id, turn.id);
+    const switched = Boolean(lastThreadId) && lastThreadId !== turn.thread_id;
+    const inner = assembleTurnPrompt({
+      wrap: "none",
+      userBody: userMsg?.body ?? "",
+      groupTitle: thread.kind === "group" ? thread.title : null,
+      calendarBlock: userMsg?.origin === "calendar" ? calendarTurnBlock(this.opts.db, turn.id) : null,
+    });
+    const harnessReq = {
+      botId: bot.id,
+      env: apiKey ? { XAI_API_KEY: apiKey } : {},
+      mcpUrl,
+      mcpToken: token,
+      cwd,
+      botName: bot.name,
+      botDescription: bot.description,
+      permissionMode,
+      model,
+      reasoningEffort,
+      role: (isGateway ? "gateway" : "desk") as "gateway" | "desk",
+      orgId: org?.org_id,
+      orgSlug: org?.slug,
+      idleTtlMs: isGateway ? gatewayAcpIdleTtlMs() : acpIdleTtlMs(),
+      omitCdp: isGateway,
+      roster,
+      skillNames,
+      orgNotes,
+      botNotes,
+    };
+
+    let wrap: TurnPromptWrap = "none";
+    let didCompact = false;
+
     try {
+      if (warm && (await runner.canCompact(bot.id))) {
+        const reason = await runner.compactReason(bot.id, {
+          threadId: turn.thread_id,
+          innerBodyChars: inner.length,
+          switched,
+        });
+        if (reason) {
+          const minted = mintMcpToken();
+          token = minted.token;
+          persistMcpToken(
+            this.opts.db,
+            {
+              accountId: bot.account_id,
+              botId: bot.id,
+              threadId: turn.thread_id,
+              harnessSessionId: harnessId,
+            },
+            minted.hash,
+          );
+          const compacted = await runner.compactSession(bot.id, { ...harnessReq, mcpToken: token });
+          if (compacted.compacted) {
+            didCompact = true;
+            wrap = "compact";
+            appendLiveWork(this.opts.db, turn.id, "harness_session_reset", {
+              reason: "compacted",
+              trigger: reason,
+              ...(compacted.fallback ? { fallback: compacted.fallback } : {}),
+            });
+          }
+        }
+      }
+
       const harness = await runner.ensureHarness({
-        botId: bot.id,
-        env: apiKey ? { XAI_API_KEY: apiKey } : {},
-        mcpUrl,
+        ...harnessReq,
         mcpToken: token,
-        cwd,
-        botName: bot.name,
-        botDescription: bot.description,
-        permissionMode,
-        model,
-        reasoningEffort,
-        role: isGateway ? "gateway" : "desk",
-        orgId: org?.org_id,
-        orgSlug: org?.slug,
-        idleTtlMs: isGateway ? gatewayAcpIdleTtlMs() : acpIdleTtlMs(),
-        omitCdp: isGateway,
-        roster,
-        skillNames,
-        orgNotes,
-        botNotes,
         resumeSessionId: !warm ? resumeSessionId : undefined,
       });
       // Stored hash names the overlay frozen at session/new or resume, not live sqlite.
-      if (!warm) {
+      if (!warm || didCompact) {
         this.opts.db.run(
           "UPDATE harness_sessions SET acp_session_id = ?, roster_fingerprint = ?, overlay_hash = ? WHERE id = ?",
           [harness.acpSessionId ?? null, currentFingerprint, currentOverlayHash, harnessId],
         );
+        if (harness.resumed && !didCompact) {
+          const copied = this.opts.db.get<{ compact_turns: number | null; compact_chars: number | null }>(
+            "SELECT compact_turns, compact_chars FROM harness_sessions WHERE id = ?",
+            [harnessId],
+          );
+          await runner.setCompactCounters(bot.id, copied?.compact_turns ?? 0, copied?.compact_chars ?? 0);
+        } else {
+          this.opts.db.run(
+            "UPDATE harness_sessions SET compact_turns = 0, compact_chars = 0 WHERE id = ?",
+            [harnessId],
+          );
+          await runner.setCompactCounters(bot.id, 0, 0);
+        }
       }
 
-      const userMsg = this.opts.db.get<{ origin: string; body: string }>(
-        "SELECT origin, body FROM messages WHERE turn_id = ? AND role = 'user' ORDER BY created_at DESC LIMIT 1",
-        [turn.id],
-      );
-      const lastThreadId =
-        (await runner.lastPromptThread(bot.id)) ?? lastFinishedThread(this.opts.db, bot.id, turn.id);
-      const switched = Boolean(lastThreadId) && lastThreadId !== turn.thread_id;
-      // PR6 adds wrap: "compact" as an alias of cold.
-      let wrap: TurnPromptWrap = "none";
-      if (!warm) {
-        if (harness.resumed) {
-          appendLiveWork(this.opts.db, turn.id, "harness_session_reset", { reason: "resumed" });
-          if (switched) wrap = "switch";
-        } else {
-          appendLiveWork(this.opts.db, turn.id, "harness_session_reset", { reason: "cold_start" });
-          wrap = "cold";
+      if (!didCompact) {
+        if (!warm) {
+          if (harness.resumed) {
+            appendLiveWork(this.opts.db, turn.id, "harness_session_reset", { reason: "resumed" });
+            if (switched) wrap = "switch";
+          } else {
+            appendLiveWork(this.opts.db, turn.id, "harness_session_reset", { reason: "cold_start" });
+            wrap = "cold";
+          }
+        } else if (switched) {
+          wrap = "switch";
         }
-      } else if (switched) {
-        wrap = "switch";
       }
       if (wrap === "switch" && lastThreadId) {
         appendLiveWork(this.opts.db, turn.id, "thread_switch", {
@@ -673,6 +741,14 @@ export class TurnEngine {
       });
       await runner.markPromptThread(bot.id, turn.thread_id);
       const result = await runner.prompt(prompt, bot.id);
+      if (overflowStopReason(result.stopReason) || (await runner.didOverflow(bot.id))) {
+        this.opts.db.run("UPDATE harness_sessions SET acp_session_id = NULL WHERE id = ?", [harnessId]);
+      }
+      const counts = await runner.noteSuccessfulPrompt(bot.id, prompt.length);
+      this.opts.db.run(
+        "UPDATE harness_sessions SET compact_turns = ?, compact_chars = ? WHERE id = ?",
+        [counts.turns, counts.chars, harnessId],
+      );
       markCalendarPendingAsSend(this.opts.db, turn.id);
       promote(this.opts.db, turn.id, {
         kind: "acp_done",
@@ -688,6 +764,9 @@ export class TurnEngine {
         local?.acpFor(bot.id)?.lastStderr ||
         "";
       const text = (err instanceof Error ? err.message : String(err)) + (stderr ? `\n${stderr.slice(-1500)}` : "");
+      if ((await runner.didOverflow(bot.id)) || overflowErrorText(text)) {
+        this.opts.db.run("UPDATE harness_sessions SET acp_session_id = NULL WHERE id = ?", [harnessId]);
+      }
       this.opts.db.run("UPDATE turns SET error = ? WHERE id = ?", [text, turn.id]);
       this.opts.db.run("UPDATE turns SET status = 'running' WHERE id = ?", [turn.id]);
       markCalendarPendingAsSend(this.opts.db, turn.id);
@@ -712,10 +791,109 @@ export class TurnEngine {
     }
     if (isGateway) this.maybeKickGatewayDrain(bot.id, turn.id);
   }
+
+  /** Test/explicit compact between turns. Remints MCP; refuses slot.inTurn. */
+  async compactSession(botId: string): Promise<{
+    compacted: boolean;
+    acpSessionId?: string;
+    resumed: boolean;
+    fallback?: "respawn";
+  }> {
+    const bot = this.opts.db.get<{
+      id: string;
+      account_id: string;
+      name: string;
+      description: string;
+      permission_mode: string;
+      model: string | null;
+      reasoning_effort: string | null;
+      role: string | null;
+    }>("SELECT * FROM bots WHERE id = ?", [botId]);
+    if (!bot) return { compacted: false, resumed: false };
+    const runner = this.runnerFor(bot.account_id);
+    if (!(await runner.canCompact(botId))) return { compacted: false, resumed: false };
+    const isGateway = bot.role === "gateway";
+    const org = currentOrgMeta(this.opts.db);
+    const roster = loadOverlayRoster(this.opts.db, bot.account_id);
+    const currentFingerprint = rosterFingerprint(roster);
+    const skillNames = isGateway ? [] : await runner.listDeskSkillNames(32);
+    const notes = readNotes(this.opts.db, bot.account_id, bot.id);
+    const orgNotes = standingForOverlay(notes.org, this.opts.log);
+    const botNotes = standingForOverlay(notes.bot, this.opts.log);
+    const currentOverlayHash = overlayHashV1(currentFingerprint, skillNames, orgNotes, botNotes);
+    const hs = this.opts.db.get<{ id: string }>(
+      "SELECT id FROM harness_sessions WHERE bot_id = ? AND ended_at IS NULL ORDER BY created_at DESC LIMIT 1",
+      [botId],
+    );
+    const threadId =
+      runner.lastPromptThread(botId) ??
+      this.opts.db.get<{ id: string }>(
+        "SELECT id FROM threads WHERE bot_id = ? AND IFNULL(kind,'human') = 'human'",
+        [botId],
+      )?.id;
+    const cwd = isGateway ? runner.ensureGatewayWorkspace() : runner.ensureProject(bot.id, bot.name);
+    const cred = this.opts.db.get<{ ciphertext: Uint8Array; dek_wrapped: Uint8Array; key_id: string }>(
+      "SELECT ciphertext, dek_wrapped, key_id FROM credentials WHERE account_id = ? AND kind = 'xai_api_key'",
+      [bot.account_id],
+    );
+    let apiKey = "";
+    if (cred) {
+      const envelope: Envelope = {
+        ciphertext: Buffer.from(cred.ciphertext),
+        dekWrapped: Buffer.from(cred.dek_wrapped),
+        keyId: cred.key_id,
+        lastFour: "",
+      };
+      apiKey = open(this.opts.master, envelope);
+    }
+    let token = "";
+    if (hs && threadId) {
+      const minted = mintMcpToken();
+      token = minted.token;
+      persistMcpToken(
+        this.opts.db,
+        {
+          accountId: bot.account_id,
+          botId: bot.id,
+          threadId,
+          harnessSessionId: hs.id,
+        },
+        minted.hash,
+      );
+    }
+    const result = await runner.compactSession(botId, {
+      botId: bot.id,
+      env: apiKey ? { XAI_API_KEY: apiKey } : {},
+      mcpUrl: `http://127.0.0.1:${this.opts.mcpPort()}/mcp/v1`,
+      mcpToken: token,
+      cwd,
+      botName: bot.name,
+      botDescription: bot.description,
+      permissionMode: bot.permission_mode as "ask" | "auto" | "always-approve",
+      model: bot.model || DEFAULT_GROK_MODEL,
+      reasoningEffort: bot.reasoning_effort || DEFAULT_REASONING_EFFORT,
+      role: isGateway ? "gateway" : "desk",
+      orgId: org?.org_id,
+      orgSlug: org?.slug,
+      idleTtlMs: isGateway ? gatewayAcpIdleTtlMs() : acpIdleTtlMs(),
+      omitCdp: isGateway,
+      roster,
+      skillNames,
+      orgNotes,
+      botNotes,
+    });
+    if (result.compacted && hs) {
+      this.opts.db.run(
+        "UPDATE harness_sessions SET acp_session_id = ?, roster_fingerprint = ?, overlay_hash = ?, compact_turns = 0, compact_chars = 0 WHERE id = ?",
+        [result.acpSessionId ?? null, currentFingerprint, currentOverlayHash, hs.id],
+      );
+    }
+    return result;
+  }
 }
 
-/** PR6 adds 'compact' alias of cold. */
-export type TurnPromptWrap = "none" | "cold" | "switch";
+/** wrap "compact" is an alias of "cold" (same ACP session reset banner). */
+export type TurnPromptWrap = "none" | "cold" | "switch" | "compact";
 
 export function assembleTurnPrompt(opts: {
   wrap: TurnPromptWrap;

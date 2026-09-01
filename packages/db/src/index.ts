@@ -429,6 +429,8 @@ export class OpenbotDb {
     this.ensureColumn("messages", "remote_actor_name", "text");
     this.ensureColumn("harness_sessions", "roster_fingerprint", "text");
     this.ensureColumn("harness_sessions", "overlay_hash", "text");
+    this.ensureColumn("harness_sessions", "compact_turns", "integer NOT NULL DEFAULT 0");
+    this.ensureColumn("harness_sessions", "compact_chars", "integer NOT NULL DEFAULT 0");
     this.ensureColumn("bots", "require_memory_approval", "integer NOT NULL DEFAULT 0");
     this.raw.exec(FTS_SCHEMA);
     this.backfillFts();

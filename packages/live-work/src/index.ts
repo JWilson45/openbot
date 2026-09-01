@@ -492,7 +492,9 @@ export function summarizeLiveEvent(kind: string, payload: unknown): string | nul
   }
   if (kind === "user_message_chunk") return "Reading your message";
   if (kind === "permission_request") return "Needs permission";
-  if (kind === "harness_session_reset") return "Harness restarted";
+  if (kind === "harness_session_reset") {
+    return p.reason === "compacted" ? "Context refreshed" : "Harness restarted";
+  }
   if (kind === "thread_switch") return "Switched thread";
   if (kind === "acp_notify") {
     const method = String(p.method ?? "");

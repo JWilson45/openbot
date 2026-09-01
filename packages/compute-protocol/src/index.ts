@@ -75,6 +75,8 @@ export type EnsureHarnessResult = {
   resumed: boolean;
 };
 
+export type CompactReason = "turns" | "chars" | "thread" | "overflow";
+
 export type PromptResult = {
   stopReason: string;
   assistantText: string;
@@ -191,6 +193,18 @@ export interface RunnerSession {
   listDeskSkillNames(cap?: number): MaybePromise<string[]>;
   lastPromptThread(botId: string): MaybePromise<string | undefined>;
   markPromptThread(botId: string, threadId: string): MaybePromise<void>;
+  canCompact(botId: string): MaybePromise<boolean>;
+  compactReason(
+    botId: string,
+    opts: { threadId?: string; innerBodyChars: number; switched: boolean },
+  ): MaybePromise<CompactReason | undefined>;
+  compactSession(
+    botId: string,
+    req: EnsureHarnessRequest,
+  ): Promise<EnsureHarnessResult & { compacted: boolean; fallback?: "respawn" }>;
+  setCompactCounters(botId: string, turns: number, chars: number): MaybePromise<void>;
+  noteSuccessfulPrompt(botId: string, sentChars: number): MaybePromise<{ turns: number; chars: number }>;
+  didOverflow(botId: string): MaybePromise<boolean>;
   invalidateAcp(botId: string): MaybePromise<void>;
   kill(botId: string): MaybePromise<void>;
   reapIdle(

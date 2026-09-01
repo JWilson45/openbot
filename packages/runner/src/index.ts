@@ -26,6 +26,8 @@ import { DESK_SKILL_NAME_CAP, ensureDeskSkills, listDeskSkillNames as scanDeskSk
 
 export const DEFAULT_ACP_IDLE_MS = 2 * 60 * 60 * 1000;
 export const DEFAULT_GATEWAY_ACP_IDLE_MS = 30 * 60 * 1000;
+export const DEFAULT_ACP_COMPACT_TURNS = 20;
+export const DEFAULT_ACP_COMPACT_CHARS = 48_000;
 export const BROWSER_SNAPSHOT_MAX_CHARS = 12_000;
 export const BROWSER_VIEWPORT_MIN = { width: 640, height: 400 };
 export const BROWSER_VIEWPORT_MAX = { width: 2560, height: 1440 };
@@ -119,6 +121,45 @@ export function gatewayAcpIdleTtlMs(): number {
   return envTtlMs(process.env.OPENBOT_GATEWAY_ACP_IDLE_MS, DEFAULT_GATEWAY_ACP_IDLE_MS);
 }
 
+export function acpCompactTurns(): number {
+  return envTtlMs(process.env.OPENBOT_ACP_COMPACT_TURNS, DEFAULT_ACP_COMPACT_TURNS);
+}
+
+export function acpCompactChars(): number {
+  return envTtlMs(process.env.OPENBOT_ACP_COMPACT_CHARS, DEFAULT_ACP_COMPACT_CHARS);
+}
+
+export function acpCompactOnSwitch(): boolean {
+  return envTtlMs(process.env.OPENBOT_ACP_COMPACT_ON_SWITCH, 0) === 1;
+}
+
+/** "explicit" is a compactSession() caller, not a compactReason() return. */
+export type CompactReason = "turns" | "chars" | "thread" | "overflow";
+
+export function overflowStopReason(reason: string): boolean {
+  return /max_tokens|max_length|context_length|overflow/i.test(reason);
+}
+
+export function overflowErrorText(text: string): boolean {
+  return /context length|context window|prompt too long|maximum context/i.test(text);
+}
+
+function usageOccupancy(payload: Record<string, unknown>): number | undefined {
+  const nodes: unknown[] = [payload, payload.update, payload.usage];
+  const update = payload.update;
+  if (update && typeof update === "object") nodes.push((update as Record<string, unknown>).usage);
+  for (const node of nodes) {
+    if (!node || typeof node !== "object") continue;
+    const rec = node as Record<string, unknown>;
+    const used = Number(rec.used ?? rec.input_tokens ?? rec.prompt_tokens ?? rec.tokens ?? rec.occupied);
+    const max = Number(rec.total ?? rec.max_tokens ?? rec.context_window ?? rec.limit ?? rec.max);
+    if (Number.isFinite(used) && Number.isFinite(max) && max > 0) return used / max;
+    const occ = Number(rec.occupancy ?? rec.percent);
+    if (Number.isFinite(occ)) return occ > 1 ? occ / 100 : occ;
+  }
+  return undefined;
+}
+
 type AcpSlot = {
   client: AcpClient;
   botId: string;
@@ -129,8 +170,11 @@ type AcpSlot = {
   inTurn?: boolean;
   /** Compared in matchesHarness. Warm overlay is this fingerprint. */
   rosterFingerprint: string;
-  /** Last thread this child session/prompt'd. Cleared on kill/spawn. */
+  /** Last thread this child session/prompt'd. Cleared on kill/spawn. Compact resets then re-marks. */
   lastThreadId?: string;
+  turnsSinceCompact: number;
+  promptChars: number;
+  needsCompact?: boolean;
 };
 
 type CdpConn = {
@@ -548,6 +592,98 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     if (slot) slot.lastThreadId = threadId;
   }
 
+  canCompact(botId: string): boolean {
+    const slot = this.acps.get(botId);
+    return Boolean(slot && !slot.client.closed && slot.client.sessionId && !slot.inTurn);
+  }
+
+  compactReason(
+    botId: string,
+    opts: { threadId?: string; innerBodyChars: number; switched: boolean },
+  ): CompactReason | undefined {
+    const slot = this.acps.get(botId);
+    if (!slot) return undefined;
+    if (slot.needsCompact) return "overflow";
+    if (acpCompactOnSwitch() && opts.switched) return "thread";
+    const charLimit = acpCompactChars();
+    if (charLimit > 0 && slot.promptChars + opts.innerBodyChars >= charLimit) return "chars";
+    const turnLimit = acpCompactTurns();
+    if (turnLimit > 0 && slot.turnsSinceCompact >= turnLimit) return "turns";
+    return undefined;
+  }
+
+  compactCounters(botId: string): { turns: number; chars: number } {
+    const slot = this.acps.get(botId);
+    return { turns: slot?.turnsSinceCompact ?? 0, chars: slot?.promptChars ?? 0 };
+  }
+
+  setCompactCounters(botId: string, turns: number, chars: number): void {
+    const slot = this.acps.get(botId);
+    if (!slot) return;
+    slot.turnsSinceCompact = turns;
+    slot.promptChars = chars;
+  }
+
+  didOverflow(botId: string): boolean {
+    return Boolean(this.acps.get(botId)?.needsCompact);
+  }
+
+  noteSuccessfulPrompt(botId: string, sentChars: number): { turns: number; chars: number } {
+    const slot = this.acps.get(botId);
+    if (!slot) return { turns: 0, chars: 0 };
+    slot.turnsSinceCompact += 1;
+    slot.promptChars += sentChars;
+    return { turns: slot.turnsSinceCompact, chars: slot.promptChars };
+  }
+
+  async compactSession(
+    botId: string,
+    req: EnsureHarnessRequest,
+  ): Promise<EnsureHarnessResult & { compacted: boolean; fallback?: "respawn" }> {
+    if (!this.canCompact(botId)) {
+      return { compacted: false, resumed: false };
+    }
+    const slot = this.acps.get(botId)!;
+    const prevId = slot.client.sessionId;
+    slot.lastThreadId = undefined;
+    try {
+      const acpSessionId = await slot.client.newSession(req);
+      // session/new restamps overlay. Cancel the previous id so Grok does not keep
+      // both sessions; ignore -32601 (Grok 1.0.5 has no session/compact).
+      if (prevId && prevId !== acpSessionId) {
+        await slot.client.cancelSession(prevId);
+      }
+      slot.turnsSinceCompact = 0;
+      slot.promptChars = 0;
+      slot.needsCompact = false;
+      slot.resumed = false;
+      slot.rosterFingerprint = rosterFingerprint(req.roster);
+      this.acp = slot.client;
+      this.acpSessionId = acpSessionId;
+      this.lastResume = false;
+      this.harness = "idle";
+      return { compacted: true, acpSessionId, resumed: false };
+    } catch {
+      try {
+        await slot.client.kill();
+      } catch {
+        /* ignore */
+      }
+      this.acps.delete(botId);
+      if (this.acp === slot.client) {
+        this.acp = null;
+        this.acpSessionId = undefined;
+      }
+      const spawned = await this.ensureHarness({ ...req, resumeSessionId: undefined });
+      return {
+        compacted: true,
+        acpSessionId: spawned.acpSessionId,
+        resumed: false,
+        fallback: "respawn",
+      };
+    }
+  }
+
   async kill(botId: string): Promise<void> {
     const slot = this.acps.get(botId);
     if (!slot) return;
@@ -575,7 +711,8 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   ): boolean {
     const slot = this.acps.get(botId);
     const existing = slot?.client;
-    if (!existing || existing.closed || !existing.sessionId || this.harness === "crashed") return false;
+    // Crash is per-slot (closed / missing). Process-global harness=crashed would poison Ada when Bob overflows.
+    if (!existing || existing.closed || !existing.sessionId) return false;
     const wantModel = model || DEFAULT_GROK_MODEL;
     const wantEffort = reasoningEffort || DEFAULT_REASONING_EFFORT;
     if (existing.model !== wantModel || existing.reasoningEffort !== wantEffort) return false;
@@ -694,7 +831,10 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
         reasoningEffort,
         permissionMode: req.permissionMode,
         permissionHandler,
-        onEvent: (ev) => this.onLiveWork?.({ ...ev, botId: req.botId }, req.botId),
+        onEvent: (ev) => {
+          this.observeAcpEvent(req.botId, ev);
+          this.onLiveWork?.({ ...ev, botId: req.botId }, req.botId);
+        },
       });
       this.acps.set(req.botId, {
         client,
@@ -703,6 +843,8 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
         role,
         resumed: false,
         rosterFingerprint: fp,
+        turnsSinceCompact: 0,
+        promptChars: 0,
       });
       this.acp = client;
       for (const k of Object.keys(env)) {
@@ -754,11 +896,25 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
       const result = await client.prompt(text);
       this.harness = "idle";
       client.lastActivityAt = Date.now();
+      if (slot && overflowStopReason(result.stopReason)) slot.needsCompact = true;
       return result;
     } catch (err) {
-      this.harness = "crashed";
+      const dump = `${err instanceof Error ? err.message : String(err)}\n${client.lastStderr}`;
+      if (slot && !client.closed && overflowErrorText(dump)) {
+        slot.needsCompact = true;
+        this.harness = "idle";
+        throw err;
+      }
+      if (slot) {
+        this.acps.delete(slot.botId);
+        if (this.acp === client) {
+          this.acp = null;
+          this.acpSessionId = undefined;
+        }
+      }
+      this.harness = "idle";
       try {
-        await client.kill();
+        if (!client.closed) await client.kill();
       } catch {
         /* ignore */
       }
@@ -766,6 +922,18 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     } finally {
       if (slot) slot.inTurn = false;
     }
+  }
+
+  private observeAcpEvent(botId: string, ev: LiveWorkEvent): void {
+    const slot = this.acps.get(botId);
+    if (!slot) return;
+    const blob = JSON.stringify(ev.payload ?? {});
+    if (/auto_compact/i.test(blob)) {
+      slot.needsCompact = true;
+      return;
+    }
+    const occ = usageOccupancy((ev.payload ?? {}) as Record<string, unknown>);
+    if (occ != null && occ >= 0.85) slot.needsCompact = true;
   }
 
   private tabOwner(owner?: string): string {

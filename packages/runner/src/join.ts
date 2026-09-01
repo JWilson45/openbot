@@ -119,6 +119,25 @@ export async function joinRunner(opts: JoinOpts): Promise<{ stop: () => void; pi
       case "markPromptThread":
         local.markPromptThread(String(p.botId ?? ""), String(p.threadId ?? ""));
         return {};
+      case "canCompact":
+        return local.canCompact(String(p.botId ?? ""));
+      case "compactReason":
+        return local.compactReason(
+          String(p.botId ?? ""),
+          (p.opts as { threadId?: string; innerBodyChars: number; switched: boolean }) ?? {
+            innerBodyChars: 0,
+            switched: false,
+          },
+        );
+      case "compactSession":
+        return local.compactSession(String(p.botId ?? ""), p.req as EnsureHarnessRequest);
+      case "setCompactCounters":
+        local.setCompactCounters(String(p.botId ?? ""), Number(p.turns ?? 0), Number(p.chars ?? 0));
+        return {};
+      case "noteSuccessfulPrompt":
+        return local.noteSuccessfulPrompt(String(p.botId ?? ""), Number(p.sentChars ?? 0));
+      case "didOverflow":
+        return local.didOverflow(String(p.botId ?? ""));
       case "invalidateAcp":
         local.invalidateAcp(String(p.botId ?? ""));
         return {};

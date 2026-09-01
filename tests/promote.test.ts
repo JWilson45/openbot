@@ -491,10 +491,28 @@ describe("thread digest", () => {
     expect(switched).toContain("Current message:");
     expect(switched.indexOf("You are now on a different thread:")).toBeLessThan(switched.indexOf("Current message:"));
     expect(switched.endsWith("hello")).toBe(true);
+    const compacted = assembleTurnPrompt({
+      wrap: "compact",
+      userBody: "hello",
+      digest: "ACP session reset. You are still Ada, same human, same desk.",
+    });
+    const cold = assembleTurnPrompt({
+      wrap: "cold",
+      userBody: "hello",
+      digest: "ACP session reset. You are still Ada, same human, same desk.",
+    });
+    expect(compacted).toBe(cold);
+    expect(compacted).toContain("ACP session reset");
+    expect(compacted).not.toContain("You are now on a different thread");
   });
+
 
   test("thread_switch live-work summarizes as Switched thread", () => {
     expect(summarizeLiveEvent("thread_switch", { from: "a", to: "b" })).toBe("Switched thread");
+    expect(summarizeLiveEvent("harness_session_reset", { reason: "compacted", trigger: "turns" })).toBe(
+      "Context refreshed",
+    );
+    expect(summarizeLiveEvent("harness_session_reset", { reason: "cold_start" })).toBe("Harness restarted");
   });
 
   test("promote with send_message writes a thread_summaries row", () => {

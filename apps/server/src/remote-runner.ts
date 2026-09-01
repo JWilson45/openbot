@@ -125,6 +125,37 @@ export class RemoteRunnerClient implements RunnerSession {
   markPromptThread(botId: string, threadId: string): Promise<void> {
     return this.peer.request("markPromptThread", { botId, threadId }) as Promise<void>;
   }
+  canCompact(botId: string): Promise<boolean> {
+    return this.peer.request("canCompact", { botId }) as Promise<boolean>;
+  }
+  compactReason(
+    botId: string,
+    opts: { threadId?: string; innerBodyChars: number; switched: boolean },
+  ): Promise<import("@openbot/compute-protocol").CompactReason | undefined> {
+    return this.peer.request("compactReason", { botId, opts }) as Promise<
+      import("@openbot/compute-protocol").CompactReason | undefined
+    >;
+  }
+  compactSession(
+    botId: string,
+    req: EnsureHarnessRequest,
+  ): Promise<EnsureHarnessResult & { compacted: boolean; fallback?: "respawn" }> {
+    return this.peer.request("compactSession", { botId, req }) as Promise<
+      EnsureHarnessResult & { compacted: boolean; fallback?: "respawn" }
+    >;
+  }
+  setCompactCounters(botId: string, turns: number, chars: number): Promise<void> {
+    return this.peer.request("setCompactCounters", { botId, turns, chars }) as Promise<void>;
+  }
+  noteSuccessfulPrompt(botId: string, sentChars: number): Promise<{ turns: number; chars: number }> {
+    return this.peer.request("noteSuccessfulPrompt", { botId, sentChars }) as Promise<{
+      turns: number;
+      chars: number;
+    }>;
+  }
+  didOverflow(botId: string): Promise<boolean> {
+    return this.peer.request("didOverflow", { botId }) as Promise<boolean>;
+  }
   invalidateAcp(botId: string): Promise<void> {
     return this.peer.request("invalidateAcp", { botId }) as Promise<void>;
   }

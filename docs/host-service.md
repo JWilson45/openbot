@@ -138,6 +138,9 @@ loginctl enable-linger "$USER"
 | `OPENBOT_CHROME` | Chromium/Chrome binary if not on PATH. |
 | `OPENBOT_ACP_IDLE_MS` | Kill idle **desk** Grok ACP children after this many ms. Default 7200000 (2 hours). `0` disables **desk** idle kill only — it does **not** disable Gateway. |
 | `OPENBOT_GATEWAY_ACP_IDLE_MS` | Gateway ACP idle TTL. Default 1800000 (30 minutes). `0` disables Gateway idle kill only. |
+| `OPENBOT_ACP_COMPACT_TURNS` | Warm compact after this many successful ACP turns on the session. Default 20. `0` disables this trigger. Desk and Gateway share the knob. |
+| `OPENBOT_ACP_COMPACT_CHARS` | Warm compact when accumulated sent prompt chars plus the next inner body is `>=` this. Default 48000. `0` disables this trigger only. |
+| `OPENBOT_ACP_COMPACT_ON_SWITCH` | `1` compact (`session/new` + cold digest) on thread switch instead of a switch-banner prefix. Default `0`. |
 | `OPENBOT_FEDERATION` | Panic **off:** `0` makes federation effective-off even if the DB flag is on. Unset/`1` does **not** force on. Restart the unit so the process sees env. `GET /fed/v1/info` still works. |
 | `OPENBOT_FED_ALLOW_HTTP` | `1` allows RFC1918 `http://` peer URLs (LAN). Default is https, plus loopback `http://127.0.0.1` / `localhost`. |
 | `OPENBOT_SANDBOX` | Optional Grok-child sandbox (`auto` / `none` / `bwrap` / `seatbelt` / `required`). Default `auto`. The **server** process is not sandboxed. |

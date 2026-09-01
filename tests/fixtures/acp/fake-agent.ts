@@ -571,7 +571,11 @@ async function handle(msg: {
       }
     }
 
-    write({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+    write({
+      jsonrpc: "2.0",
+      id,
+      result: { stopReason: current.includes("[[overflow]]") ? "max_tokens" : "end_turn" },
+    });
     return;
   }
 
