@@ -4,7 +4,7 @@ OpenBot is a process on a machine you run. That process **is** the desk **and** 
 
 This document is how to run that process as a **user** service (systemd `--user` or a launchd LaunchAgent) and how to federate **two** such hosts. `openbot install` never requires root. Do not run Chromium as root.
 
-Version: `openbot version` prints `{"openbot":"0.6.0","grokPin":"1.0.5","grok":"…"}`. Pin lives in `packages/acp-grok/src/pin.ts`.
+Version: `openbot version` prints `{"openbot":"0.7.0","grokPin":"1.0.5","grok":"…"}`. Pin lives in `packages/acp-grok/src/pin.ts`.
 
 ---
 

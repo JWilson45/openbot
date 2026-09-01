@@ -534,7 +534,7 @@ describe("thread digest", () => {
 });
 
 describe("SendToThread + group promote", () => {
-  test("tools/list includes SendToThread and server is 0.6.0", async () => {
+  test("tools/list includes SendToThread and server is 0.7.0", async () => {
     const db = openDb();
     seedWorld(db);
     const inflight = new McpInflight();
@@ -545,7 +545,7 @@ describe("SendToThread + group promote", () => {
     });
     expect(
       (init.json as { result: { serverInfo: { version: string } } }).result.serverInfo.version,
-    ).toBe("0.6.0");
+    ).toBe("0.7.0");
     const list = await handleMcpJsonRpc(db, inflight, undefined, {
       jsonrpc: "2.0",
       id: 2,

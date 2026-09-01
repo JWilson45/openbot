@@ -94,7 +94,7 @@ cd openbot
 bun install
 ```
 
-The CLI is `bun run openbot -- <command>` (or `bun run apps/server/src/cli.ts`). Current version is **0.6.0**. `openbot version` prints `{ openbot, grokPin, grok }`. OpenBot pins **Grok CLI 1.0.5** (warns if missing or older; does not refuse to start).
+The CLI is `bun run openbot -- <command>` (or `bun run apps/server/src/cli.ts`). Current version is **0.7.0**. `openbot version` prints `{ openbot, grokPin, grok }`. OpenBot pins **Grok CLI 1.0.5** (warns if missing or older; does not refuse to start).
 
 Merging to `main` with a **new** `package.json` version creates tag `vX.Y.Z` and publishes GitHub Release binaries. Pull requests run tests. Other branches do not. A version that already has a tag is not re-released.
 
