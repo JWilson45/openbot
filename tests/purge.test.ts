@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   OpenbotDb,
@@ -10,6 +11,7 @@ import {
   sha256Hex,
 } from "@openbot/db";
 import { persistMcpToken } from "@openbot/mcp-send-message";
+import { deleteBotProject, ensureBotProject, ensureDeskSkills } from "@openbot/runner";
 import { seedWorld, tempHome } from "./helpers.ts";
 
 function openDb() {
@@ -320,5 +322,20 @@ describe("deleteBotPermanently", () => {
     expect(db.get<{ status: string }>("SELECT status FROM calendar_series WHERE id = ?", [pausedId])?.status).toBe(
       "paused",
     );
+  });
+});
+
+describe("desk skills survive bot delete", () => {
+  test("deleteBotProject does not touch desk/skills", () => {
+    const desk = join(tempHome(), "desk");
+    ensureDeskSkills(desk);
+    const botId = "11111111-1111-4111-8111-111111111111";
+    ensureBotProject(desk, botId, "Ada");
+    const confirm = join(desk, "skills", "confirm-series", "SKILL.md");
+    expect(existsSync(confirm)).toBe(true);
+    deleteBotProject(desk, botId);
+    expect(existsSync(join(desk, "projects", botId))).toBe(false);
+    expect(existsSync(confirm)).toBe(true);
+    expect(existsSync(join(desk, "skills", "shared-chromium", "SKILL.md"))).toBe(true);
   });
 });

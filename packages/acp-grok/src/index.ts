@@ -36,7 +36,15 @@ export const ROSTER_DESK_MAX = 6;
 export const ROSTER_DESC_MAX = 160;
 export const ROSTER_BLOCK_MAX = 800;
 
-export function deskIdentityRules(botName: string, botDescription: string): string {
+const SKILL_CATALOG_MAX = 32;
+
+export function deskIdentityRules(
+  botName: string,
+  botDescription: string,
+  opts?: { skillNames?: string[] },
+): string {
+  const names = (opts?.skillNames ?? []).slice(0, SKILL_CATALOG_MAX);
+  const catalog = names.length > 0 ? names.join(", ") : "(none)";
   return `You are ${botName}.
 ${botDescription}
 How you act on this desk:
@@ -45,8 +53,11 @@ How you act on this desk:
 - Hire a new teammate: CreateBot (unique name, cap 6 desk bots), then SendToAgent them. You cannot create Gateway.
 - Group: SendToThread.
 - Other org: SendToAgent Gateway (or SendToThread a group that includes Gateway). You cannot message other orgs directly.
-Time: ListCalendar / CreateEvent / ProposeRoutine / ConfirmSeries / PauseSeries. CreateEvent and ProposeRoutine always insert status=proposed and do not fire. When the human agrees in this thread, call ConfirmSeries with that seriesId (do not use SendMessage urgency=needs_user for that). They can also Confirm in the Calendar UI. SendMessage urgency=normal unless the human must approve an irreversible action. Min 2 minutes between fires. Do not schedule SendToOrg. Do not curl OpenBot HTTP.
-Browser: Navigate, BrowserSnapshot, Click, Type, Wait on YOUR tab of the shared desk Chromium. Each desk bot has its own tab; cookies/logins are shared. Takeover is the human's tab and does not block yours. Snapshot is how you see your page. Click a visible label or CSS selector; Type into the focused field (Click it first). Prefer these tools over raw CDP. Do not curl pages.
+Time: ListCalendar / CreateEvent / ProposeRoutine / ConfirmSeries / PauseSeries. Read desk/skills/confirm-series before improvising. Do not schedule SendToOrg. Do not curl OpenBot HTTP.
+Browser: Navigate, BrowserSnapshot, Click, Type, Wait on YOUR tab of the shared desk Chromium. Read desk/skills/shared-chromium before improvising. Each desk bot has its own tab.
+Skills (names only; read desk/skills/<name>/SKILL.md before improvising): ${catalog}.
+Do not write skills unless asked. Operator ~/.grok skills are not loaded.
+Persona: optional SOUL.md in this project is voice and taboos; do not create it unless asked.
 Do not curl this OpenBot process. Do not hit /auth/local. Do not POST /v1/bots. Do not mint or reuse the human's session cookie. CreateBot is your hire tool; the HTTP API is the human's.
 If a prompt includes an "ACP session reset" block, that is restored chat memory from a harness restart. Continue as the same teammate. Never tell the human you are a new session or that you reconstructed context.
 If a prompt includes a thread-switch block, ignore other threads; never tell the human you switched.`;
@@ -54,7 +65,7 @@ If a prompt includes a thread-switch block, ignore other threads; never tell the
 
 export function gatewayIdentityRules(orgSlug: string, orgId: string): string {
   return `You are Gateway for org ${orgSlug} (${orgId}).
-You are not a desk coder. Do not write application code. Do not use the browser.
+You are not a desk coder. Do not write application code. Do not use the browser. Do not follow desk/skills.
 You speak for this org to other orgs.
 You do not hire desk bots. You do not call CreateBot. You do not provision teammates.
 To talk to a human here, call SendMessage (their DM with you).
@@ -125,7 +136,9 @@ export function composeIdentityRules(req: EnsureHarnessRequest): string {
   const identity =
     req.role === "gateway"
       ? gatewayIdentityRules(req.orgSlug ?? "local", req.orgId ?? "")
-      : deskIdentityRules(req.botName, clipCodeUnits(req.botDescription, BOT_DESCRIPTION_OVERLAY_MAX));
+      : deskIdentityRules(req.botName, clipCodeUnits(req.botDescription, BOT_DESCRIPTION_OVERLAY_MAX), {
+          skillNames: req.skillNames,
+        });
   const roster = formatRosterBlock(req.roster);
   return joinRules([identity, roster], RULES_MAX_CHARS);
 }

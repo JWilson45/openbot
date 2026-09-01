@@ -116,6 +116,9 @@ export class RemoteRunnerClient implements RunnerSession {
   hasWarmBot(botId: string): Promise<boolean> {
     return this.peer.request("hasWarmBot", { botId }) as Promise<boolean>;
   }
+  listDeskSkillNames(cap?: number): Promise<string[]> {
+    return this.peer.request("listDeskSkillNames", { cap }) as Promise<string[]>;
+  }
   lastPromptThread(botId: string): Promise<string | undefined> {
     return this.peer.request("lastPromptThread", { botId }) as Promise<string | undefined>;
   }

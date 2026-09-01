@@ -22,6 +22,7 @@ import { botProjectDir, deleteBotProject, ensureBotProject, ensureGatewayWorkspa
 import { buildChromiumEnv, buildHarnessEnv, chromiumTmpDir, snapshotChildEnv, type ChildEnvSnapshot } from "./harness-env.ts";
 import { denyGatewayExec, deskPathGuard } from "./permissions.ts";
 import { wrapSandboxCommand, type SandboxWrap } from "./sandbox.ts";
+import { DESK_SKILL_NAME_CAP, ensureDeskSkills, listDeskSkillNames as scanDeskSkillNames } from "./desk-skills.ts";
 
 export const DEFAULT_ACP_IDLE_MS = 2 * 60 * 60 * 1000;
 export const DEFAULT_GATEWAY_ACP_IDLE_MS = 30 * 60 * 1000;
@@ -215,11 +216,17 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   async ensure(_accountId: string): Promise<{ id: string; workspacePath: string }> {
     mkdirSync(join(this.desk, "projects"), { recursive: true });
     mkdirSync(join(this.desk, ".openbot", "chromium"), { recursive: true });
+    ensureDeskSkills(this.desk);
     writeFileSync(
       join(this.desk, ".openbot", "runner-state.json"),
       JSON.stringify({ driver: "localhost", updatedAt: Date.now() }),
     );
     return { id: this.accountId, workspacePath: this.desk };
+  }
+
+  /** ASCII-sorted kebab names; cap after sort. Does not seed. */
+  listDeskSkillNames(cap = DESK_SKILL_NAME_CAP): string[] {
+    return scanDeskSkillNames(this.desk, cap);
   }
 
   async describe(): Promise<{
@@ -614,6 +621,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
 
   async ensureHarness(req: EnsureHarnessRequest): Promise<EnsureHarnessResult> {
     await this.ensure(this.accountId);
+    // Overlay catalog is req.skillNames as passed; readdir order is not a stable catalog.
     const env = { ...req.env };
     this.lastEnv = { ...env };
     this.injectedKey = Boolean(env.XAI_API_KEY);
@@ -1316,6 +1324,15 @@ async function cdpInput(cdpHttp: string, event: Record<string, unknown>): Promis
 }
 
 export { findChrome };
+export {
+  DESK_SKILL_NAME_CAP,
+  DESK_SKILL_NAME_RE,
+  CONFIRM_SERIES_SKILL_MD,
+  DESK_SKILLS_README_MD,
+  SHARED_CHROMIUM_SKILL_MD,
+  ensureDeskSkills,
+  listDeskSkillNames,
+} from "./desk-skills.ts";
 export {
   botProjectDir,
   deleteBotProject,

@@ -23,6 +23,7 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 - **This is not Google Calendar.** No sync. No invites. Org-local sqlite.
 - **Schedules and learned routines are two products** on the same grid.
 - `$OPENBOT_HOME/desk` is a **shared computer**. It is **not** a security boundary **inside** an org. Every bot on the account can read and write the desk the way you can. There is **one Chromium** for the whole team (**a tab per desk bot**; cookies shared). Cross-org is messages only (hop=1).
+- Skills are procedures on a **shared** desk (`desk/skills/<name>/SKILL.md`). Overlay lists names only; Grok reads bodies via the filesystem. Learn this / ProposeRoutine are calendar jobs. Operator `~/.grok/skills` are not loaded. Optional `desk/projects/<botId>/SOUL.md` is never auto-created.
 - Vault files (`master.key`, `org.ed25519`, credentials) live **outside** `desk/`. Grok’s `HOME` is `$OPENBOT_HOME/grok-home` (a copy of `~/.grok/auth.json`, not a symlink). ACP tools whose paths resolve outside the desk are denied. Optional `OPENBOT_SANDBOX` (macOS `sandbox-exec` / Linux `bwrap`) is best-effort and off in tests. Same-uid `0600` is not a jail; a dedicated OS user is. Do not copy secrets into the workspace Grok can see.
 - Restarting the server starts a new Grok ACP process. Chat history is in SQLite. On cold start OpenBot tries ACP `session/resume`; if that fails it injects a thread **summary + recent tail**. Idle desk children stay warm for 2 hours (override `OPENBOT_ACP_IDLE_MS`; `0` disables desk idle kill). A warm teammate hopping to another thread gets that thread's summary + tail prefixed; that is **not** a new session.
 - Teammates see who is on the desk (up to six names + Gateway) in their spawn overlay. Hiring someone does not kill the other Groks; each bot picks up the new roster on its next turn.
@@ -269,8 +270,10 @@ Control dir is `~/.openbot`. Each org profile is its own data root (`$OPENBOT_HO
 | `master.key` | Vault master (mode 0600). Not under `desk/` |
 | `allowlist` | GitHub logins, one per line |
 | `desk/` | Shared computer. Chromium profile under `desk/.openbot/chromium`. Gateway cwd `desk/.openbot/gateway/`. |
+| `desk/skills/<name>/SKILL.md` | Shared procedures (seeded `confirm-series`, `shared-chromium`, write-if-absent). Overlay lists names only. |
 | `desk/projects/<botId>/` | That bot's ACP cwd. Purge deletes this folder only. Bots can still `../` into siblings. |
-| `grok-home/` | Isolated Grok config (no user MCP servers) and the Grok child `HOME`. Auth is a **copy** of `~/.grok/auth.json`, refreshed on each `ensureHarness`. |
+| `desk/projects/<botId>/SOUL.md` | Optional voice/taboos. Never auto-created. |
+| `grok-home/` | Isolated Grok config (no user MCP servers) and the Grok child `HOME`. Auth is a **copy** of `~/.grok/auth.json`, refreshed on each `ensureHarness`. Operator `~/.grok/skills` are not loaded. |
 
 `--home` / `OPENBOT_HOME` relocate one org's data. Wiping the desk does not delete the sqlite DB or vault. Grok CLI login stays in `~/.grok/auth.json`.
 

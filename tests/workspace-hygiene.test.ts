@@ -32,17 +32,25 @@ describe("bot project workspace", () => {
     expect(meta.updatedAt).toBeGreaterThan(0);
     const readme = readFileSync(join(dir, "README.md"), "utf8").trim();
     expect(readme).toBe("Workspace for bot Ada. Shared desk is the parent. Not a security boundary.");
+    expect(existsSync(join(dir, "SOUL.md"))).toBe(false);
+    mkdirSync(join(dir, ".grok", "skills"), { recursive: true });
+    writeFileSync(join(dir, ".grok", "skills", "leak.md"), "nope\n");
     writeFileSync(join(dir, "README.md"), "keep me\n");
     ensureBotProject(desk, botId, "Ada");
     expect(readFileSync(join(dir, "README.md"), "utf8")).toBe("keep me\n");
+    expect(existsSync(join(dir, ".grok", "skills"))).toBe(false);
+    expect(existsSync(join(dir, "SOUL.md"))).toBe(false);
 
     const sibling = ensureBotProject(desk, "22222222-2222-4222-8222-222222222222", "Bob");
     writeFileSync(join(dir, "notes.txt"), "ada");
     writeFileSync(join(desk, "shared.txt"), "desk");
+    mkdirSync(join(desk, "skills", "confirm-series"), { recursive: true });
+    writeFileSync(join(desk, "skills", "confirm-series", "SKILL.md"), "keep-skill\n");
     deleteBotProject(desk, botId);
     expect(existsSync(dir)).toBe(false);
     expect(existsSync(sibling)).toBe(true);
     expect(existsSync(join(desk, "shared.txt"))).toBe(true);
+    expect(readFileSync(join(desk, "skills", "confirm-series", "SKILL.md"), "utf8")).toBe("keep-skill\n");
   });
 
   test("deleteBotProject refuses path traversal and does not delete the desk", () => {
@@ -118,6 +126,8 @@ describe("purge deletes only the bot project dir", () => {
     expect(existsSync(adaDir)).toBe(true);
     expect(existsSync(bobDir)).toBe(true);
     writeFileSync(join(adaDir, "notes.txt"), "keep until purge");
+    const skillPath = join(home, "desk", "skills", "confirm-series", "SKILL.md");
+    expect(existsSync(skillPath)).toBe(true);
 
     const arch = await fetch(`${origin}/v1/bots/${ada.bot.id}/archive`, { method: "POST", headers });
     expect(arch.status).toBe(200);
@@ -131,6 +141,7 @@ describe("purge deletes only the bot project dir", () => {
     expect(purged.status).toBe(200);
     expect(existsSync(adaDir)).toBe(false);
     expect(existsSync(bobDir)).toBe(true);
+    expect(existsSync(skillPath)).toBe(true);
 
     await fetch(`${origin}/v1/bots/${bob.bot.id}/archive`, { method: "POST", headers });
     ctx.db.run("UPDATE bots SET archived_at = ? WHERE id = ?", [now() - ARCHIVE_TTL_MS - 1000, bob.bot.id]);

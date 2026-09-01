@@ -112,6 +112,8 @@ export async function joinRunner(opts: JoinOpts): Promise<{ stop: () => void; pi
         );
       case "hasWarmBot":
         return local.hasWarmBot(String(p.botId ?? ""));
+      case "listDeskSkillNames":
+        return local.listDeskSkillNames(typeof p.cap === "number" ? p.cap : undefined);
       case "lastPromptThread":
         return local.lastPromptThread(String(p.botId ?? ""));
       case "markPromptThread":

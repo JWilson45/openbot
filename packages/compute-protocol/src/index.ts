@@ -64,6 +64,8 @@ export type EnsureHarnessRequest = {
   omitCdp?: boolean;
   resumeSessionId?: string;
   roster?: OverlayRoster;
+  /** Desk only. Engine lists; ensureHarness must not re-scan. */
+  skillNames?: string[];
 };
 
 export type EnsureHarnessResult = {
@@ -184,6 +186,7 @@ export interface RunnerSession {
     rosterFp?: string,
   ): MaybePromise<boolean>;
   hasWarmBot(botId: string): MaybePromise<boolean>;
+  listDeskSkillNames(cap?: number): MaybePromise<string[]>;
   lastPromptThread(botId: string): MaybePromise<string | undefined>;
   markPromptThread(botId: string, threadId: string): MaybePromise<void>;
   invalidateAcp(botId: string): MaybePromise<void>;

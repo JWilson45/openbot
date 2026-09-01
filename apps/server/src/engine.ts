@@ -443,6 +443,7 @@ export class TurnEngine {
     const permissionMode = bot.permission_mode as "ask" | "auto" | "always-approve";
     const roster = loadOverlayRoster(this.opts.db, bot.account_id);
     const currentFingerprint = rosterFingerprint(roster);
+    const skillNames = isGateway ? [] : await runner.listDeskSkillNames(32);
     const hadSlot = await runner.hasWarmBot(bot.id);
     const warm = await runner.matchesHarness(bot.id, model, reasoningEffort, permissionMode, currentFingerprint);
     let harnessId = turn.harness_session_id;
@@ -568,6 +569,7 @@ export class TurnEngine {
         idleTtlMs: isGateway ? gatewayAcpIdleTtlMs() : acpIdleTtlMs(),
         omitCdp: isGateway,
         roster,
+        skillNames,
         resumeSessionId: !warm ? resumeSessionId : undefined,
       });
       this.opts.db.run(

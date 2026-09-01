@@ -231,6 +231,11 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     expect(desk).toContain("Type");
     expect(desk).toContain("Wait");
     expect(desk).toContain("own tab");
+    expect(desk).toContain("confirm-series");
+    expect(desk).toContain("shared-chromium");
+    expect(gw).not.toContain("Skills (names only");
+    expect(gw).not.toContain("confirm-series");
+    expect(gw).toMatch(/do not follow desk\/skills/i);
     expect(gw).not.toContain("ListCalendar");
     expect(gw).not.toContain("CreateEvent");
     expect(gw).not.toContain("BrowserSnapshot");
@@ -267,6 +272,7 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
       "Type",
       "Wait",
     ]);
+    expect(deskNames).not.toContain("ListSkills");
     expect(mcpToolsForRole("desk").map((t) => (t as { name: string }).name)).toEqual([
       "SendMessage",
       "SendToAgent",
