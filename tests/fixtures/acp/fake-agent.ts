@@ -467,6 +467,31 @@ async function handle(msg: {
           }
           await callSend(mcpUrl, mcpToken, hit ? "got-standing" : "no-standing");
         }
+
+        const echoTool = async (name: string, args: Record<string, unknown>) => {
+          try {
+            const result = await callTool(mcpUrl, mcpToken, name, args);
+            await callSend(mcpUrl, mcpToken, typeof result === "string" ? result : JSON.stringify(result));
+          } catch (err) {
+            const s = String(err);
+            const code = /: ([a-z_]+)$/.exec(s)?.[1] ?? s;
+            await callSend(mcpUrl, mcpToken, `mcp_error:${code}`);
+          }
+        };
+        const memoryDir = /\[\[memory:(read|add|replace|remove):(self|org)(?::([\s\S]*?))?\]\]/.exec(current);
+        if (memoryDir) {
+          const args: Record<string, unknown> = { action: memoryDir[1], scope: memoryDir[2] };
+          if (memoryDir[3] != null) args.text = memoryDir[3];
+          await echoTool("Memory", args);
+        }
+        const searchThreadDir = /\[\[searchthread:([^\]]+)\]\]/.exec(current);
+        if (searchThreadDir) {
+          await echoTool("SearchThreads", { query: searchThreadDir[1]! });
+        }
+        const searchDir = /\[\[search:([^\]]+)\]\]/.exec(current);
+        if (searchDir) {
+          await echoTool("SearchMessages", { query: searchDir[1]! });
+        }
         if (current.includes("[[echo-prefix]]")) {
           await callSend(
             mcpUrl,

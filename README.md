@@ -27,6 +27,7 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 - Vault files (`master.key`, `org.ed25519`, credentials) live **outside** `desk/`. Grok’s `HOME` is `$OPENBOT_HOME/grok-home` (a copy of `~/.grok/auth.json`, not a symlink). ACP tools whose paths resolve outside the desk are denied. Optional `OPENBOT_SANDBOX` (macOS `sandbox-exec` / Linux `bwrap`) is best-effort and off in tests. Same-uid `0600` is not a jail; a dedicated OS user is. Do not copy secrets into the workspace Grok can see.
 - Restarting the server starts a new Grok ACP process. Chat history is in SQLite. On cold start OpenBot tries ACP `session/resume`; if that fails it injects a thread **summary + recent tail**. Idle desk children stay warm for 2 hours (override `OPENBOT_ACP_IDLE_MS`; `0` disables desk idle kill). A warm teammate hopping to another thread gets that thread's summary + tail prefixed; that is **not** a new session.
 - Teammates see who is on the desk (up to six names + Gateway) in their spawn overlay. Hiring someone does not kill the other Groks; each bot picks up the new roster on its next turn.
+- Standing notes freeze at spawn (idle ~2h, compact, model/roster respawn, or Save which kills the child if it is not in a turn). They do not appear on the current warm child. `Memory.read` sees sqlite immediately. Search is a tool over this org’s log, not prompt stuffing.
 - **Federation is off until you turn it on** on **both** sides. OpenBot does not provision Fly Machines.
 - **SendToAgent is queued, not done.** Completions sit on the A2A thread as a system line; the sender is not auto-woken.
 
@@ -331,7 +332,9 @@ Cookie session (`openbot_session`) or `Authorization: Bearer` (session token or 
 | `GET` | `/v1/bots` | Desk `bots[]` + archived; Gateway is a sidecar, not a seventh slot |
 | `POST` | `/v1/bots/:id/archive` `/restore` | Soft-delete / undo |
 | `POST` | `/v1/bots/:id/purge` | Body `{ confirm: "DELETE" }`. Archived only |
-| `PATCH` | `/v1/bots/:id/settings` | `permissionMode`, `requireHumanApproval`, `model`, `reasoningEffort` |
+| `PATCH` | `/v1/bots/:id/settings` | `permissionMode`, `requireHumanApproval`, `requireMemoryApproval`, `model`, `reasoningEffort` |
+| `GET`/`PATCH` | `/v1/memory` `/v1/bots/:id/memory` | Standing org/bot notes. Human Save kills the child if it is not in a turn. |
+| `POST` | `/v1/memory/pending/:id/approve` `/reject` | Parked agent Memory writes |
 | `GET` | `/v1/inference-models` | Grok catalog + effort menus |
 | `GET` | `/v1/threads?botId=&kind=human\|a2a` | Human DM or A2A list |
 | `POST` | `/v1/threads/:id/messages` | Queue a turn (`202`) |

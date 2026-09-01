@@ -2424,7 +2424,21 @@
         <option value="always-approve">Always-approve</option>
       </select>
       <label><input type="checkbox" id="approve" /> Require approval for SendMessage</label>
+      <label><input type="checkbox" id="mem-approve" /> Require approval for Memory writes</label>
       </div>
+      <h2 style="margin-top:16px;font-size:1rem">Standing notes</h2>
+      <p class="muted">Frozen at next <code>session/new</code> (idle ~2h, compact, model/roster respawn, or Save which kills the child <strong>if it is not in a turn</strong>). This warm session is unchanged. <code>Memory.read</code> sees sqlite now.</p>
+      <label for="org-notes">Org notes</label>
+      <textarea id="org-notes" maxlength="1200" rows="4"></textarea>
+      <label for="bot-notes">This bot</label>
+      <textarea id="bot-notes" maxlength="2000" rows="4"></textarea>
+      <div id="pending-notes" hidden>
+        <p class="muted" id="pending-caption">Pending agent write</p>
+        <pre id="pending-body" class="md-pre"></pre>
+        <button type="button" id="pending-approve">Approve</button>
+        <button type="button" id="pending-reject">Reject</button>
+      </div>
+      <p class="err" id="mem-err" hidden></p>
       <h2 style="margin-top:16px;font-size:1rem">OpenAI-compatible keys</h2>
       <p class="muted">For Open WebUI or any OpenAI client. Base URL <code>${location.origin}/v1</code>, model <code>openbot/${escapeHtml(state.bot?.name || 'Ada')}</code>.</p>
       <p class="muted">Each OpenBot process is one org. Switch org in Open WebUI by adding another connection (that VM’s base URL + a <code>sk-ob_…</code> key minted there). There is no OpenAI organization field. Models include <code>openbot/Gateway</code> when present. Federation is off until you turn it on.</p>
@@ -2465,7 +2479,52 @@
     if (state.bot && !gwView) {
       overlay.querySelector('#mode').value = state.bot.permission_mode || 'auto';
       overlay.querySelector('#approve').checked = Boolean(Number(state.bot.require_human_approval));
+      overlay.querySelector('#mem-approve').checked = Boolean(Number(state.bot.require_memory_approval));
     }
+    let pendingNoteId = null;
+    async function loadStandingNotes() {
+      const err = overlay.querySelector('#mem-err');
+      try {
+        const mem = await api('/v1/memory');
+        overlay.querySelector('#org-notes').value = mem.org || '';
+        const mine = (mem.bots || []).find((b) => b.botId === state.bot?.id);
+        overlay.querySelector('#bot-notes').value = mine ? (mine.body || '') : '';
+        const pending = (mine && mine.pendingBody) || mem.orgPending;
+        pendingNoteId = (mine && mine.pendingBody && mine.id) || (mem.orgPending ? mem.orgNoteId : null);
+        const box = overlay.querySelector('#pending-notes');
+        if (pending) {
+          box.hidden = false;
+          overlay.querySelector('#pending-body').textContent = pending;
+        } else {
+          box.hidden = true;
+        }
+        err.hidden = true;
+      } catch (e) {
+        err.hidden = false;
+        err.textContent = e.message || 'Memory load failed';
+      }
+    }
+    overlay.querySelector('#pending-approve').onclick = async () => {
+      if (!pendingNoteId) return;
+      try {
+        await api('/v1/memory/pending/' + encodeURIComponent(pendingNoteId) + '/approve', { method:'POST', body: '{}' });
+        await loadStandingNotes();
+      } catch (e) {
+        overlay.querySelector('#mem-err').hidden = false;
+        overlay.querySelector('#mem-err').textContent = e.message || 'Approve failed';
+      }
+    };
+    overlay.querySelector('#pending-reject').onclick = async () => {
+      if (!pendingNoteId) return;
+      try {
+        await api('/v1/memory/pending/' + encodeURIComponent(pendingNoteId) + '/reject', { method:'POST', body: '{}' });
+        await loadStandingNotes();
+      } catch (e) {
+        overlay.querySelector('#mem-err').hidden = false;
+        overlay.querySelector('#mem-err').textContent = e.message || 'Reject failed';
+      }
+    };
+    void loadStandingNotes();
     function paintFedState() {
       const on = Boolean(state.org && state.org.federationEnabled);
       overlay.querySelector('#fed-on').setAttribute('aria-pressed', on ? 'true' : 'false');
@@ -2657,8 +2716,13 @@
         if (!isGatewayBot(state.bot)) {
           payload.permissionMode = overlay.querySelector('#mode').value;
           payload.requireHumanApproval = overlay.querySelector('#approve').checked;
+          payload.requireMemoryApproval = overlay.querySelector('#mem-approve').checked;
         }
         await api('/v1/bots/' + state.bot.id + '/settings', { method:'PATCH', body: JSON.stringify(payload) });
+        await api('/v1/memory', { method:'PATCH', body: JSON.stringify({ org: overlay.querySelector('#org-notes').value }) });
+        if (!isGatewayBot(state.bot)) {
+          await api('/v1/bots/' + state.bot.id + '/memory', { method:'PATCH', body: JSON.stringify({ body: overlay.querySelector('#bot-notes').value }) });
+        }
         state.bot.model = payload.model || state.bot.model;
         state.bot.reasoning_effort = payload.reasoningEffort || state.bot.reasoning_effort;
         if (isGatewayBot(state.bot)) state.gateway = state.bot;

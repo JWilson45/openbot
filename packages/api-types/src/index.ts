@@ -57,7 +57,40 @@ export const patchBotInput = z.object({
 export const botSettingsInput = z.object({
   permissionMode: z.enum(["ask", "auto", "always-approve"]).optional(),
   requireHumanApproval: z.boolean().optional(),
+  requireMemoryApproval: z.boolean().optional(),
   harness: z.enum(["grok", "codex"]).optional(),
+});
+
+export const memoryInput = z.object({
+  action: z.enum(["read", "replace", "add", "remove"]),
+  scope: z.enum(["self", "org"]),
+  text: z.string().max(2000).optional(),
+});
+
+export type MemoryInput = z.infer<typeof memoryInput>;
+
+export const searchMessagesInput = z.object({
+  query: z.string().min(1).max(500),
+  threadId: z.string().optional(),
+  limit: z.number().int().min(1).max(20).optional(),
+  since: z.number().int().optional(),
+});
+
+export type SearchMessagesInput = z.infer<typeof searchMessagesInput>;
+
+export const searchThreadsInput = z.object({
+  query: z.string().min(1).max(500),
+  limit: z.number().int().min(1).max(20).optional(),
+});
+
+export type SearchThreadsInput = z.infer<typeof searchThreadsInput>;
+
+export const patchOrgMemoryInput = z.object({
+  org: z.string().max(1200).optional(),
+});
+
+export const patchBotMemoryInput = z.object({
+  body: z.string().max(2000),
 });
 
 export const postMessageInput = z.object({

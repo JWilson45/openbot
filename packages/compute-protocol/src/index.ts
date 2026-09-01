@@ -66,6 +66,8 @@ export type EnsureHarnessRequest = {
   roster?: OverlayRoster;
   /** Desk only. Engine lists; ensureHarness must not re-scan. */
   skillNames?: string[];
+  orgNotes?: string;
+  botNotes?: string;
 };
 
 export type EnsureHarnessResult = {

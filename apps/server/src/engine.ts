@@ -1,5 +1,15 @@
 import { join } from "node:path";
-import { id, now, purgeExpiredArchivedBots, purgeExpiredOrgInbox, type OpenbotDb, type TurnRow } from "@openbot/db";
+import {
+  id,
+  now,
+  purgeExpiredArchivedBots,
+  purgeExpiredOrgInbox,
+  readNotes,
+  scanMemoryText,
+  sha256Hex,
+  type OpenbotDb,
+  type TurnRow,
+} from "@openbot/db";
 import {
   appendLiveWork,
   buildThreadMemory,
@@ -36,7 +46,21 @@ export type EngineOpts = {
   master: Buffer;
   mcpPort: () => number;
   onPush: (accountId: string, event: unknown) => void;
+  log?: { error(msg: string, extra?: Record<string, unknown>): void };
 };
+
+function overlayHashV1(rosterFp: string, skillNames: string[], orgNotes: string, botNotes: string): string {
+  return sha256Hex(["v1", rosterFp, skillNames.join(","), orgNotes, botNotes].join("\n"));
+}
+
+function standingForOverlay(raw: string, log?: EngineOpts["log"]): string {
+  const scanned = scanMemoryText(raw);
+  if (!scanned.ok) {
+    log?.error("dropped unsafe standing notes", { reason: scanned.reason });
+    return "";
+  }
+  return scanned.text;
+}
 
 export class TurnEngine {
   runners = new Map<string, LocalHostRunner>();
@@ -444,6 +468,10 @@ export class TurnEngine {
     const roster = loadOverlayRoster(this.opts.db, bot.account_id);
     const currentFingerprint = rosterFingerprint(roster);
     const skillNames = isGateway ? [] : await runner.listDeskSkillNames(32);
+    const notes = readNotes(this.opts.db, bot.account_id, bot.id);
+    const orgNotes = standingForOverlay(notes.org, this.opts.log);
+    const botNotes = standingForOverlay(notes.bot, this.opts.log);
+    const currentOverlayHash = overlayHashV1(currentFingerprint, skillNames, orgNotes, botNotes);
     const hadSlot = await runner.hasWarmBot(bot.id);
     const warm = await runner.matchesHarness(bot.id, model, reasoningEffort, permissionMode, currentFingerprint);
     let harnessId = turn.harness_session_id;
@@ -452,8 +480,9 @@ export class TurnEngine {
     const latest = this.opts.db.get<{
       acp_session_id: string | null;
       roster_fingerprint: string | null;
+      overlay_hash: string | null;
     }>(
-      `SELECT acp_session_id, roster_fingerprint FROM harness_sessions
+      `SELECT acp_session_id, roster_fingerprint, overlay_hash FROM harness_sessions
        WHERE bot_id = ? ORDER BY created_at DESC LIMIT 1`,
       [bot.id],
     );
@@ -464,15 +493,21 @@ export class TurnEngine {
       );
       harnessId = id();
       this.opts.db.run(
-        `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at, roster_fingerprint)
-         VALUES (?, ?, ?, 'active', ?, ?)`,
-        [harnessId, compute?.id ?? bot.account_id, bot.id, now(), latest?.roster_fingerprint ?? null],
+        `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at, roster_fingerprint, overlay_hash)
+         VALUES (?, ?, ?, 'active', ?, ?, ?)`,
+        [
+          harnessId,
+          compute?.id ?? bot.account_id,
+          bot.id,
+          now(),
+          latest?.roster_fingerprint ?? null,
+          latest?.overlay_hash ?? null,
+        ],
       );
-      // NULL fingerprint is a mismatch so pre-PR1 rows skip resume.
-      const fpMatch =
-        latest?.roster_fingerprint != null && latest.roster_fingerprint === currentFingerprint;
+      // NULL overlay_hash is a mismatch so pre-PR5 rows skip resume.
+      const hashMatch = latest?.overlay_hash != null && latest.overlay_hash === currentOverlayHash;
       resumeSessionId =
-        !hadSlot && latest?.acp_session_id && fpMatch ? latest.acp_session_id : undefined;
+        !hadSlot && latest?.acp_session_id && hashMatch ? latest.acp_session_id : undefined;
     } else if (!harnessId) {
       const existingHs = this.opts.db.get<{ id: string }>(
         "SELECT id FROM harness_sessions WHERE bot_id = ? AND state = 'active' AND ended_at IS NULL ORDER BY created_at DESC LIMIT 1",
@@ -482,9 +517,9 @@ export class TurnEngine {
       else {
         harnessId = id();
         this.opts.db.run(
-          `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at, roster_fingerprint)
-           VALUES (?, ?, ?, 'active', ?, ?)`,
-          [harnessId, compute?.id ?? bot.account_id, bot.id, now(), currentFingerprint],
+          `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at, roster_fingerprint, overlay_hash)
+           VALUES (?, ?, ?, 'active', ?, ?, ?)`,
+          [harnessId, compute?.id ?? bot.account_id, bot.id, now(), currentFingerprint, currentOverlayHash],
         );
       }
     }
@@ -570,11 +605,13 @@ export class TurnEngine {
         omitCdp: isGateway,
         roster,
         skillNames,
+        orgNotes,
+        botNotes,
         resumeSessionId: !warm ? resumeSessionId : undefined,
       });
       this.opts.db.run(
-        "UPDATE harness_sessions SET acp_session_id = ?, roster_fingerprint = ? WHERE id = ?",
-        [harness.acpSessionId ?? null, currentFingerprint, harnessId],
+        "UPDATE harness_sessions SET acp_session_id = ?, roster_fingerprint = ?, overlay_hash = ? WHERE id = ?",
+        [harness.acpSessionId ?? null, currentFingerprint, currentOverlayHash, harnessId],
       );
 
       const userMsg = this.opts.db.get<{ origin: string; body: string }>(

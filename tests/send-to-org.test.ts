@@ -260,6 +260,9 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
       "SendToAgent",
       "SendToThread",
       "ListBots",
+      "Memory",
+      "SearchMessages",
+      "SearchThreads",
       "CreateBot",
       "ListCalendar",
       "CreateEvent",
@@ -278,6 +281,9 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
       "SendToAgent",
       "SendToThread",
       "ListBots",
+      "Memory",
+      "SearchMessages",
+      "SearchThreads",
       "CreateBot",
       "ListCalendar",
       "CreateEvent",
@@ -300,7 +306,17 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     const gwNames = (
       (gwList.json as { result: { tools: Array<{ name: string }> } }).result.tools ?? []
     ).map((t) => t.name);
-    expect(gwNames).toEqual(["SendMessage", "SendToAgent", "SendToThread", "ListBots", "SendToOrg", "Inbox"]);
+    expect(gwNames).toEqual([
+      "SendMessage",
+      "SendToAgent",
+      "SendToThread",
+      "ListBots",
+      "Memory",
+      "SearchMessages",
+      "SearchThreads",
+      "SendToOrg",
+      "Inbox",
+    ]);
 
     const init = await handleMcpJsonRpc(db, inflight, undefined, {
       jsonrpc: "2.0",

@@ -139,9 +139,25 @@ describe("deleteBotPermanently", () => {
 
     const { a2aId, keepA2aTurn } = graph(db, w.botId, peer.botId, peer.threadId, peer.harnessSessionId);
 
+    db.run(
+      `INSERT INTO memory_notes (id, account_id, scope, bot_id, body, updated_by, updated_at, created_at)
+       VALUES (?, ?, 'bot', ?, 'bot-note', 'human', ?, ?)`,
+      [id(), w.accountId, w.botId, now(), now()],
+    );
+    db.run(
+      `INSERT INTO memory_notes (id, account_id, scope, bot_id, body, updated_by, updated_at, created_at)
+       VALUES (?, ?, 'org', NULL, 'org-note', 'human', ?, ?)`,
+      [id(), w.accountId, now(), now()],
+    );
+
     deleteBotPermanently(db, w.botId);
 
     expect(db.get("SELECT id FROM bots WHERE id = ?", [w.botId])).toBeNull();
+    expect(db.get("SELECT id FROM memory_notes WHERE bot_id = ?", [w.botId])).toBeNull();
+    expect(
+      db.get<{ body: string }>("SELECT body FROM memory_notes WHERE account_id = ? AND scope = 'org'", [w.accountId])
+        ?.body,
+    ).toBe("org-note");
     expect(db.get<{ id: string }>("SELECT id FROM bots WHERE id = ?", [peer.botId])?.id).toBe(peer.botId);
     expect(db.get("SELECT id FROM threads WHERE bot_id = ?", [w.botId])).toBeNull();
     expect(db.get("SELECT id FROM turns WHERE bot_id = ?", [w.botId])).toBeNull();

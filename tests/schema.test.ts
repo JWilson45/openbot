@@ -1,8 +1,8 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { join } from "node:path";
-import { OpenbotDb } from "@openbot/db";
-import { tempHome } from "./helpers.ts";
+import { OpenbotDb, id, now } from "@openbot/db";
+import { seedWorld, tempHome } from "./helpers.ts";
 
 test("schema applies on a fresh sqlite file", () => {
   const db = OpenbotDb.open(join(tempHome(), "openbot.sqlite"));
@@ -33,6 +33,9 @@ test("schema applies on a fresh sqlite file", () => {
     "calendar_instances",
     "runners",
     "runner_enroll_tokens",
+    "memory_notes",
+    "messages_fts",
+    "threads_fts",
   ]) {
     expect(names).toContain(required);
   }
@@ -41,12 +44,31 @@ test("schema applies on a fresh sqlite file", () => {
   expect(botCols).toContain("model");
   expect(botCols).toContain("reasoning_effort");
   expect(botCols).toContain("role");
+  expect(botCols).toContain("require_memory_approval");
   const harnessCols = db.all<{ name: string }>("PRAGMA table_info(harness_sessions)").map((c) => c.name);
   expect(harnessCols).toContain("roster_fingerprint");
+  expect(harnessCols).toContain("overlay_hash");
+  const memCols = db.all<{ name: string }>("PRAGMA table_info(memory_notes)").map((c) => c.name);
+  for (const col of [
+    "id",
+    "account_id",
+    "scope",
+    "bot_id",
+    "body",
+    "pending_body",
+    "updated_by",
+    "source_turn_id",
+    "updated_at",
+    "created_at",
+  ]) {
+    expect(memCols).toContain(col);
+  }
   const roleCol = db.all<{ name: string; dflt_value: unknown }>("PRAGMA table_info(bots)").find((c) => c.name === "role");
   expect(String(roleCol?.dflt_value)).toContain("desk");
   const indexes = db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index'").map((i) => i.name);
   expect(indexes).toContain("bots_one_active_gateway");
+  expect(indexes).toContain("memory_notes_org");
+  expect(indexes).toContain("memory_notes_bot");
   expect(db.all<{ name: string }>("PRAGMA table_info(threads)").map((c) => c.name)).toContain("kind");
   const apiKeyCols = db.all<{ name: string }>("PRAGMA table_info(api_keys)").map((c) => c.name);
   for (const col of [
@@ -273,5 +295,34 @@ test("migrate adds org_meta.timezone and calendar tables on a pre-calendar sqlit
   expect(indexes).toContain("calendar_instances_series_when");
   expect(indexes).toContain("calendar_instances_status_when");
   expect(indexes).toContain("calendar_instances_turn");
+  db.close();
+});
+
+test("FTS5 CREATE and MATCH work (fail closed, no LIKE fallback)", () => {
+  const db = OpenbotDb.open(join(tempHome(), "openbot.sqlite"));
+  const w = seedWorld(db);
+  const t = now();
+  db.run(
+    `INSERT INTO messages (id, thread_id, turn_id, role, origin, body, urgency, created_at)
+     VALUES (?, ?, NULL, 'user', 'user', 'I like pineapple pizza', 'normal', ?)`,
+    [id(), w.threadId, t],
+  );
+  db.run(
+    `INSERT INTO messages (id, thread_id, turn_id, role, origin, body, urgency, created_at)
+     VALUES (?, ?, NULL, 'user', 'prompt', 'secret pineapple prompt', 'normal', ?)`,
+    [id(), w.threadId, t],
+  );
+  const hits = db.all<{ body: string }>(
+    `SELECT body FROM messages_fts WHERE account_id = ? AND messages_fts MATCH ?`,
+    [w.accountId, "pineapple*"],
+  );
+  expect(hits.some((h) => h.body.includes("I like pineapple"))).toBe(true);
+  expect(hits.some((h) => h.body.includes("secret pineapple prompt"))).toBe(false);
+  db.run(`UPDATE messages SET origin = 'prompt' WHERE body = 'I like pineapple pizza'`);
+  const after = db.all<{ body: string }>(
+    `SELECT body FROM messages_fts WHERE account_id = ? AND messages_fts MATCH ?`,
+    [w.accountId, "pineapple*"],
+  );
+  expect(after.some((h) => h.body.includes("I like pineapple pizza"))).toBe(false);
   db.close();
 });

@@ -5,15 +5,22 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import {
   ARCHIVE_TTL_MS,
+  BOT_NOTES_MAX,
   MAX_ACTIVE_BOTS,
+  MemoryTextError,
+  ORG_NOTES_MAX,
   OpenbotDb,
+  applyMemoryWrite,
+  approvePendingMemory,
   deleteBotPermanently,
   humanThread,
   id,
   isGatewayRole,
+  listAccountMemory,
   now,
   nonCancelledSeriesCount,
   pauseCalendarSeriesForAssignee,
+  rejectPendingMemory,
   rematerializeScheduledInstances,
   suppressOpenCalendarInstances,
   type MessageRow,
@@ -45,7 +52,9 @@ import {
   createCalendarSeriesInput,
   createGroupThreadInput,
   learnRoutineInput,
+  patchBotMemoryInput,
   patchCalendarSeriesInput,
+  patchOrgMemoryInput,
   postMessageInput,
 } from "@openbot/api-types";
 import { insertMessage, notifyA2aSender, parseLivePayload, promote, summarizeLiveEvent } from "@openbot/live-work";
@@ -228,6 +237,7 @@ export function createApp(cfg: HomeConfig): {
     master,
     mcpPort: () => ctx.port,
     onPush,
+    log,
   });
   ctx.engine.markRunnersDisconnectedOnBoot();
   ctx.maintenanceTimer = setInterval(() => {
@@ -1368,7 +1378,10 @@ export function createApp(cfg: HomeConfig): {
     if (!bot) return c.json({ error: "not_found" }, 404);
     if (
       isGatewayRole(bot.role) &&
-      (body.permissionMode != null || body.harness != null || body.requireHumanApproval != null)
+      (body.permissionMode != null ||
+        body.harness != null ||
+        body.requireHumanApproval != null ||
+        body.requireMemoryApproval != null)
     ) {
       return c.json({ error: "gateway_protected" }, 409);
     }
@@ -1409,10 +1422,158 @@ export function createApp(cfg: HomeConfig): {
         bot.id,
       ]);
     }
+    if (body.requireMemoryApproval != null) {
+      db.run("UPDATE bots SET require_memory_approval = ? WHERE id = ?", [
+        body.requireMemoryApproval ? 1 : 0,
+        bot.id,
+      ]);
+    }
     if (body.harness) {
       db.run("UPDATE bots SET harness = ? WHERE id = ?", [String(body.harness), bot.id]);
     }
     return c.json({ ok: true, model, reasoningEffort, applies: "next_turn" });
+  });
+
+  function memoryHttpError(err: unknown) {
+    if (err instanceof MemoryTextError) {
+      return { status: 400 as const, json: { error: err.code, message: err.message } };
+    }
+    throw err;
+  }
+
+  function invalidateDeskBots(accountId: string, botId?: string): void {
+    const runner = ctx.engine.runnerFor(accountId);
+    if (botId) {
+      runner.invalidateAcp(botId);
+      return;
+    }
+    const bots = db.all<{ id: string }>(
+      `SELECT id FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'desk'`,
+      [accountId],
+    );
+    for (const b of bots) runner.invalidateAcp(b.id);
+  }
+
+  app.get("/v1/memory", (c) => {
+    const s = requireSession(c);
+    const listed = listAccountMemory(db, s.accountId);
+    return c.json({
+      org: listed.org.body,
+      orgPending: listed.org.pending_body,
+      orgNoteId: listed.org.id,
+      bots: listed.bots.map((b) => ({
+        botId: b.bot_id,
+        name: b.name,
+        body: b.body,
+        pendingBody: b.pending_body,
+        cap: BOT_NOTES_MAX,
+        id: b.id,
+      })),
+      cap: ORG_NOTES_MAX,
+    });
+  });
+
+  app.patch("/v1/memory", async (c) => {
+    const s = requireSession(c);
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      return c.json({ error: "bad_request" }, 400);
+    }
+    const parsed = patchOrgMemoryInput.safeParse(raw);
+    if (!parsed.success) return c.json({ error: "bad_request" }, 400);
+    if (parsed.data.org == null) return c.json({ ok: true });
+    try {
+      db.immediate(() => {
+        applyMemoryWrite(db, {
+          accountId: s.accountId,
+          scope: "org",
+          action: "replace",
+          text: parsed.data.org,
+          actor: "human",
+        });
+      });
+    } catch (err) {
+      const fail = memoryHttpError(err);
+      return c.json(fail.json, fail.status);
+    }
+    invalidateDeskBots(s.accountId);
+    return c.json({ ok: true, applies: "next_spawn" });
+  });
+
+  app.get("/v1/bots/:id/memory", (c) => {
+    const s = requireSession(c);
+    const bot = db.get<{ id: string; name: string }>(
+      "SELECT id, name FROM bots WHERE id = ? AND account_id = ?",
+      [c.req.param("id"), s.accountId],
+    );
+    if (!bot) return c.json({ error: "not_found" }, 404);
+    const listed = listAccountMemory(db, s.accountId);
+    const row = listed.bots.find((b) => b.bot_id === bot.id);
+    return c.json({
+      botId: bot.id,
+      name: bot.name,
+      body: row?.body ?? "",
+      pendingBody: row?.pending_body ?? null,
+      cap: BOT_NOTES_MAX,
+      id: row?.id ?? null,
+    });
+  });
+
+  app.patch("/v1/bots/:id/memory", async (c) => {
+    const s = requireSession(c);
+    const bot = db.get<{ id: string; role: string | null }>(
+      "SELECT id, role FROM bots WHERE id = ? AND account_id = ?",
+      [c.req.param("id"), s.accountId],
+    );
+    if (!bot) return c.json({ error: "not_found" }, 404);
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      return c.json({ error: "bad_request" }, 400);
+    }
+    const parsed = patchBotMemoryInput.safeParse(raw);
+    if (!parsed.success) return c.json({ error: "bad_request" }, 400);
+    try {
+      db.immediate(() => {
+        applyMemoryWrite(db, {
+          accountId: s.accountId,
+          botId: bot.id,
+          scope: "bot",
+          action: "replace",
+          text: parsed.data.body,
+          actor: "human",
+        });
+      });
+    } catch (err) {
+      const fail = memoryHttpError(err);
+      return c.json(fail.json, fail.status);
+    }
+    ctx.engine.runnerFor(s.accountId).invalidateAcp(bot.id);
+    return c.json({ ok: true, applies: "next_spawn" });
+  });
+
+  app.post("/v1/memory/pending/:id/approve", (c) => {
+    const s = requireSession(c);
+    try {
+      const row = db.immediate(() => approvePendingMemory(db, s.accountId, c.req.param("id")));
+      if (!row) return c.json({ error: "not_found" }, 404);
+      if (row.scope === "org") invalidateDeskBots(s.accountId);
+      else if (row.bot_id) ctx.engine.runnerFor(s.accountId).invalidateAcp(row.bot_id);
+      return c.json({ ok: true, applies: "next_spawn" });
+    } catch (err) {
+      const fail = memoryHttpError(err);
+      return c.json(fail.json, fail.status);
+    }
+  });
+
+  app.post("/v1/memory/pending/:id/reject", (c) => {
+    const s = requireSession(c);
+    const row = db.immediate(() => rejectPendingMemory(db, s.accountId, c.req.param("id")));
+    if (!row) return c.json({ error: "not_found" }, 404);
+    return c.json({ ok: true });
   });
 
   app.get("/v1/inference-models", (c) => {
