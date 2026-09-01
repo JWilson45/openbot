@@ -23,12 +23,12 @@ async function runOpenbot(
 }
 
 describe("openbot version / help / install", () => {
-  test("openbot version and --version include 0.4.1 and grokPin 1.0.5", async () => {
+  test("openbot version and --version include 0.5.0 and grokPin 1.0.5", async () => {
     for (const args of [["version"], ["--version"], ["-v"]]) {
       const { stdout, code } = await runOpenbot(args);
       expect(code).toBe(0);
       const json = JSON.parse(stdout.trim()) as { openbot: string; grokPin: string; grok: string | null };
-      expect(json.openbot).toBe("0.4.1");
+      expect(json.openbot).toBe("0.5.0");
       expect(json.grokPin).toBe("1.0.5");
       expect(json.grok === null || typeof json.grok === "string").toBe(true);
     }

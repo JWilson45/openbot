@@ -238,7 +238,7 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     expect(gw).not.toMatch(/Hire a new teammate: CreateBot/);
   });
 
-  test("tools/list is role-aware; serverInfo is 0.4.1", async () => {
+  test("tools/list is role-aware; serverInfo is 0.5.0", async () => {
     const db = OpenbotDb.open(join(tempHome(), "openbot.sqlite"));
     const w = seedWorld(db);
     const inflight = new McpInflight();
@@ -304,7 +304,7 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     });
     expect(
       (init.json as { result: { serverInfo: { version: string } } }).result.serverInfo.version,
-    ).toBe("0.4.1");
+    ).toBe("0.5.0");
     db.close();
   });
 
