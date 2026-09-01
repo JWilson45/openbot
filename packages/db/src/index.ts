@@ -313,6 +313,33 @@ CREATE INDEX IF NOT EXISTS calendar_instances_status_when
   ON calendar_instances(status, scheduled_at);
 CREATE INDEX IF NOT EXISTS calendar_instances_turn
   ON calendar_instances(turn_id) WHERE turn_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS runners (
+  id text PRIMARY KEY,
+  account_id text NOT NULL UNIQUE REFERENCES accounts(id),
+  hostname text,
+  platform text,
+  runner_version text,
+  workspace_path text,
+  machine_token_hash text UNIQUE,
+  status text NOT NULL,
+  grok_cli_signed_in integer NOT NULL DEFAULT 0,
+  last_hello_at integer,
+  last_heartbeat_at integer,
+  last_disconnect_at integer,
+  created_at integer NOT NULL,
+  updated_at integer NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS runner_enroll_tokens (
+  id text PRIMARY KEY,
+  account_id text NOT NULL REFERENCES accounts(id),
+  token_hash text NOT NULL UNIQUE,
+  expires_at integer NOT NULL,
+  used_at integer,
+  created_at integer NOT NULL
+);
+CREATE INDEX IF NOT EXISTS runner_enroll_account ON runner_enroll_tokens(account_id, expires_at);
 `;
 
 export type SqlValue = string | number | bigint | boolean | null | Uint8Array;

@@ -36,6 +36,7 @@ import {
   McpInflight,
   queueGroupMentions,
   rejectMessage,
+  type McpHooks,
 } from "@openbot/mcp-send-message";
 import {
   McpError,
@@ -90,6 +91,32 @@ import {
 } from "./org.ts";
 import { findActiveGateway, provisionOrgGateway } from "./gateway.ts";
 import { handleFedInbound, parseContentLength, readCappedBody } from "./inbox.ts";
+import {
+  RunnerUnavailable,
+  RPC_PROTOCOL,
+  RPC_RUNNER_ATTACHED,
+  RPC_UNAUTHORIZED,
+  RUNNER_PROTOCOL,
+  type RunnerHeartbeat,
+  type RunnerHello,
+  type RunnerHelloAck,
+} from "@openbot/compute-protocol";
+import { JsonRpcPeer, RpcError } from "@openbot/runner";
+import { RemoteRunnerClient, type TakeoverBridge } from "./remote-runner.ts";
+import {
+  consumeEnrollToken,
+  enrollAccount,
+  getRunnerRow,
+  lookupEnrollToken,
+  lookupMachineToken,
+  mintRunnerSecret,
+  persistDisconnect,
+  persistHeartbeat,
+  persistHello,
+  publicRunnerSnapshot,
+  revokeAccount,
+  unauthenticatedRunnerAdminAllowed,
+} from "./runner-admin.ts";
 
 export type HomeConfig = {
   home: string;
@@ -201,6 +228,7 @@ export function createApp(cfg: HomeConfig): {
     mcpPort: () => ctx.port,
     onPush,
   });
+  ctx.engine.markRunnersDisconnectedOnBoot();
   ctx.maintenanceTimer = setInterval(() => {
     ctx.engine.tickCalendar();
     ctx.engine.kick();
@@ -218,6 +246,9 @@ export function createApp(cfg: HomeConfig): {
   });
 
   app.onError((err, c) => {
+    if (err instanceof RunnerUnavailable) {
+      return c.json({ error: "computer_offline" }, 503);
+    }
     if (err instanceof McpError) {
       const status = err.httpStatus as 401;
       return c.json({ error: err.code, message: err.message }, status);
@@ -233,6 +264,125 @@ export function createApp(cfg: HomeConfig): {
     return s;
   }
 
+  function requireRunnerAdmin(c: {
+    req: { header: (n: string) => string | undefined; raw: Request };
+    env: unknown;
+  }): SessionInfo | { accountId: string } {
+    const s =
+      sessionFromToken(db, cookies(c)) ?? sessionFromToken(db, parseBearer(c.req.header("authorization")));
+    if (s) return s;
+    const peer = bunRequestIp(c.env, c.req.raw);
+    if (!unauthenticatedRunnerAdminAllowed(peer, c.req.header("host"))) {
+      throw new McpError("forbidden", "forbidden", 403);
+    }
+    const accountId = currentOrgMeta(db)?.account_id;
+    if (!accountId) throw new McpError("no_account", "no_account", 400);
+    return { accountId };
+  }
+
+  function enrollJoinOrigin(): string {
+    const meta = currentOrgMeta(db);
+    const advertised = (meta?.public_origin && meta.public_origin.trim()) || "";
+    if (advertised && !advertised.endsWith(":0") && !advertised.includes("://127.0.0.1:0")) return advertised;
+    return `http://127.0.0.1:${ctx.port}`;
+  }
+
+  function emitMcpSideEffects(result: { status: number; json: unknown }): void {
+    const json = result.json as { result?: { content?: unknown[] } };
+    if (result.status === 200 && json?.result?.content) {
+      const parsed = JSON.parse(String((json.result.content as { text?: string }[])[0]?.text ?? "{}")) as {
+        messageId?: string;
+      };
+      if (parsed.messageId) {
+        const msg = db.get("SELECT * FROM messages WHERE id = ?", [parsed.messageId]);
+        if (msg) {
+          const thread = db.get<{ account_id: string }>("SELECT account_id FROM threads WHERE id = ?", [
+            (msg as { thread_id: string }).thread_id,
+          ]);
+          if (thread) onPush(thread.account_id, { type: "message.created", message: msg });
+        }
+      }
+    }
+  }
+
+  function mcpHooks(): McpHooks {
+    const browserOff = { ok: false as const, error: "browser_unavailable" };
+    return {
+      onKick: () => ctx.engine.kick(),
+      federationEffective: () => federationEffective(currentOrgMeta(db)),
+      orgPrivateKey: () => loadOrgKeypair(ctx.home, ctx.master).privateKey,
+      onCreateBot: async ({ accountId, botId, name }) => {
+        try {
+          const runner = ctx.engine.runnerFor(accountId);
+          await runner.ensure(accountId);
+          await runner.ensureProject(botId, name);
+          onPush(accountId, { type: "bots.updated" });
+        } catch (err) {
+          if (err instanceof RunnerUnavailable) throw new McpError("computer_offline", "computer_offline", 503);
+          throw err;
+        }
+      },
+      onCalendarDue: () => {
+        ctx.engine.tickCalendar();
+        ctx.engine.kick();
+      },
+      browserNavigate: async (accountId, botId, url) => {
+        try {
+          return await ctx.engine.runnerFor(accountId).navigate(url, { owner: botId });
+        } catch (err) {
+          if (err instanceof RunnerUnavailable) return browserOff;
+          throw err;
+        }
+      },
+      browserSnapshot: async (accountId, botId) => {
+        try {
+          return await ctx.engine.runnerFor(accountId).pageText(botId);
+        } catch (err) {
+          if (err instanceof RunnerUnavailable) return browserOff;
+          throw err;
+        }
+      },
+      browserClick: async (accountId, botId, input) => {
+        try {
+          return await ctx.engine.runnerFor(accountId).click(input, botId);
+        } catch (err) {
+          if (err instanceof RunnerUnavailable) return browserOff;
+          throw err;
+        }
+      },
+      browserType: async (accountId, botId, input) => {
+        try {
+          return await ctx.engine.runnerFor(accountId).typeText(input, botId);
+        } catch (err) {
+          if (err instanceof RunnerUnavailable) return browserOff;
+          throw err;
+        }
+      },
+      browserWait: async (accountId, _botId, ms) => {
+        try {
+          return await ctx.engine.runnerFor(accountId).waitFor(ms);
+        } catch (err) {
+          if (err instanceof RunnerUnavailable) return { ok: false, ms: 0, error: "browser_unavailable" };
+          throw err;
+        }
+      },
+    };
+  }
+
+  async function forwardMcp(params: unknown): Promise<{ status: number; json: unknown }> {
+    const p = (params ?? {}) as { bearer?: string; body?: unknown };
+    try {
+      const result = await handleMcpJsonRpc(db, inflight, p.bearer, p.body ?? {}, mcpHooks());
+      emitMcpSideEffects(result);
+      return { status: result.status, json: result.json };
+    } catch (err) {
+      if (err instanceof McpError) {
+        return { status: err.httpStatus, json: { error: err.code, message: err.message } };
+      }
+      throw err;
+    }
+  }
+
   mountOpenAiCompat(app, ctx, requireSession);
 
   app.get("/v1/healthz", (c) => c.json({ ok: true, process: "openbot-server" }));
@@ -244,6 +394,34 @@ export function createApp(cfg: HomeConfig): {
     } catch (err) {
       return c.json({ ok: false, error: String(err) }, 503);
     }
+  });
+
+  app.post("/v1/runner/enroll", async (c) => {
+    const admin = requireRunnerAdmin(c);
+    try {
+      const result = enrollAccount(db, admin.accountId, enrollJoinOrigin());
+      await ctx.engine.detachLocal(admin.accountId);
+      ctx.log.info("runner.enroll", { accountId: admin.accountId });
+      return c.json(result);
+    } catch (err) {
+      if ((err as { code?: string }).code === "runner_attached") {
+        return c.json({ error: "runner_attached" }, 409);
+      }
+      throw err;
+    }
+  });
+
+  app.post("/v1/runner/revoke", (c) => {
+    const admin = requireRunnerAdmin(c);
+    revokeAccount(db, admin.accountId);
+    ctx.engine.revokeRemote(admin.accountId);
+    ctx.log.info("runner.revoke", { accountId: admin.accountId });
+    return c.json({ ok: true });
+  });
+
+  app.get("/v1/runner", (c) => {
+    const s = requireSession(c);
+    return c.json({ runner: publicRunnerSnapshot(getRunnerRow(db, s.accountId)) });
   });
 
   app.get("/fed/v1/info", (c) => {
@@ -612,7 +790,7 @@ export function createApp(cfg: HomeConfig): {
     });
     const runner = ctx.engine.runnerFor(s.accountId);
     await runner.ensure(s.accountId);
-    runner.ensureProject(botId, normalized);
+    await runner.ensureProject(botId, normalized);
     return c.json({
       bot: {
         id: botId,
@@ -658,7 +836,7 @@ export function createApp(cfg: HomeConfig): {
     });
   });
 
-  app.post("/v1/bots/:id/archive", (c) => {
+  app.post("/v1/bots/:id/archive", async (c) => {
     const s = requireSession(c);
     const bot = db.get<{ id: string; name: string; status: string; role: string | null }>(
       "SELECT id, name, status, role FROM bots WHERE id = ? AND account_id = ?",
@@ -680,8 +858,7 @@ export function createApp(cfg: HomeConfig): {
     )) {
       suppressOpenCalendarInstances(db, row.id, "pause");
     }
-    const runner = ctx.engine.runnerFor(s.accountId);
-    void runner.acpFor(bot.id)?.kill();
+    await ctx.engine.runnerFor(s.accountId).kill(bot.id);
     return c.json({ ok: true, archivedAt: t, deleteAfter: t + ARCHIVE_TTL_MS });
   });
 
@@ -1064,7 +1241,8 @@ export function createApp(cfg: HomeConfig): {
     try {
       const display = await ctx.engine.runnerFor(s.accountId).display();
       pageUrl = display.pageUrl ?? "";
-    } catch {
+    } catch (err) {
+      if (err instanceof RunnerUnavailable) throw err;
       pageUrl = "";
     }
     const { prompt, captureSummary } = stitchLearnPrompt({ messages, liveWork, pageUrl });
@@ -1116,10 +1294,10 @@ export function createApp(cfg: HomeConfig): {
     if (!bot) return { status: 404 as const, json: { error: "not_found" } };
     if (isGatewayRole(bot.role)) return { status: 409 as const, json: { error: "gateway_protected" } };
     if (bot.status !== "archived") return { status: 409 as const, json: { error: "archive_first" } };
-    void ctx.engine.runnerFor(accountId).acpFor(bot.id)?.kill();
+    await ctx.engine.runnerFor(accountId).kill(bot.id);
     deleteBotPermanently(db, bot.id);
     try {
-      ctx.engine.runnerFor(accountId).deleteProject(bot.id);
+      await ctx.engine.runnerFor(accountId).deleteProject(bot.id);
     } catch (err) {
       ctx.log.error("delete bot project failed", { botId: bot.id, error: String(err) });
     }
@@ -1198,7 +1376,13 @@ export function createApp(cfg: HomeConfig): {
       ]);
       model = inference.model;
       reasoningEffort = inference.reasoningEffort;
-      if (changed) ctx.engine.runnerFor(s.accountId).invalidateAcp(bot.id);
+      if (changed) {
+        try {
+          await ctx.engine.runnerFor(s.accountId).invalidateAcp(bot.id);
+        } catch (err) {
+          if (!(err instanceof RunnerUnavailable)) throw err;
+        }
+      }
     }
     if (body.permissionMode) {
       db.run("UPDATE bots SET permission_mode = ? WHERE id = ?", [String(body.permissionMode), bot.id]);
@@ -1538,7 +1722,7 @@ export function createApp(cfg: HomeConfig): {
     }
   });
 
-  app.post("/v1/turns/:id/cancel", (c) => {
+  app.post("/v1/turns/:id/cancel", async (c) => {
     const s = requireSession(c);
     const turn = db.get<TurnRow>(
       `SELECT t.* FROM turns t JOIN threads th ON th.id = t.thread_id
@@ -1548,7 +1732,7 @@ export function createApp(cfg: HomeConfig): {
     if (!turn) return c.json({ error: "not_found" }, 404);
     let cancelled = false;
     if (turn.status === "running") {
-      void ctx.engine.runnerFor(s.accountId).acpFor(turn.bot_id)?.cancel();
+      await ctx.engine.runnerFor(s.accountId).cancel(turn.bot_id);
       promote(db, turn.id, { kind: "cancel" });
       cancelled = true;
     } else if (turn.status === "queued") {
@@ -1569,7 +1753,7 @@ export function createApp(cfg: HomeConfig): {
     const s = requireSession(c);
     const body = await c.req.json();
     const allow = Boolean(body.allow);
-    const ok = ctx.engine.runnerFor(s.accountId).respondPermission(c.req.param("reqId"), allow);
+    const ok = await ctx.engine.runnerFor(s.accountId).respondPermission(c.req.param("reqId"), allow);
     onPush(s.accountId, {
       type: "permission_response",
       reqId: c.req.param("reqId"),
@@ -1692,7 +1876,12 @@ export function createApp(cfg: HomeConfig): {
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [id(), s.accountId, compute.id, s.sessionId, sha256Hex(ticket), now() + 10 * 60 * 1000, now()],
     );
-    await ctx.engine.runnerFor(s.accountId).takeoverUrl();
+    const { screencastNonce } = await ctx.engine.runnerFor(s.accountId).takeoverUrl();
+    const prev = ctx.engine.takeoverByAccount.get(s.accountId);
+    if (prev) ctx.engine.takeoverBridges.delete(prev.nonce);
+    const bridge: TakeoverBridge = { accountId: s.accountId, nonce: screencastNonce };
+    ctx.engine.takeoverBridges.set(screencastNonce, bridge);
+    ctx.engine.takeoverByAccount.set(s.accountId, bridge);
     return c.json({ ticket });
   });
 
@@ -1768,42 +1957,8 @@ export function createApp(cfg: HomeConfig): {
       body = {};
     }
     try {
-      const result = await handleMcpJsonRpc(db, inflight, bearer, body, {
-        onKick: () => ctx.engine.kick(),
-        federationEffective: () => federationEffective(currentOrgMeta(db)),
-        orgPrivateKey: () => loadOrgKeypair(ctx.home, ctx.master).privateKey,
-        onCreateBot: async ({ accountId, botId, name }) => {
-          const runner = ctx.engine.runnerFor(accountId);
-          await runner.ensure(accountId);
-          runner.ensureProject(botId, name);
-          onPush(accountId, { type: "bots.updated" });
-        },
-        onCalendarDue: () => {
-          ctx.engine.tickCalendar();
-          ctx.engine.kick();
-        },
-        browserNavigate: (accountId, botId, url) =>
-          ctx.engine.runnerFor(accountId).navigate(url, { owner: botId }),
-        browserSnapshot: (accountId, botId) => ctx.engine.runnerFor(accountId).pageText(botId),
-        browserClick: (accountId, botId, input) => ctx.engine.runnerFor(accountId).click(input, botId),
-        browserType: (accountId, botId, input) => ctx.engine.runnerFor(accountId).typeText(input, botId),
-        browserWait: (_accountId, _botId, ms) => ctx.engine.runnerFor(_accountId).waitFor(ms),
-      });
-      const json = result.json as { result?: { content?: unknown[] } };
-      if (result.status === 200 && json?.result?.content) {
-        const parsed = JSON.parse(String((json.result.content as { text?: string }[])[0]?.text ?? "{}")) as {
-          messageId?: string;
-        };
-        if (parsed.messageId) {
-          const msg = db.get("SELECT * FROM messages WHERE id = ?", [parsed.messageId]);
-          if (msg) {
-            const thread = db.get<{ account_id: string }>("SELECT account_id FROM threads WHERE id = ?", [
-              (msg as { thread_id: string }).thread_id,
-            ]);
-            if (thread) onPush(thread.account_id, { type: "message.created", message: msg });
-          }
-        }
-      }
+      const result = await handleMcpJsonRpc(db, inflight, bearer, body, mcpHooks());
+      emitMcpSideEffects(result);
       return c.json(result.json as Record<string, unknown>, result.status as 200);
     } catch (err) {
       if (err instanceof McpError) return c.json({ error: err.code, message: err.message }, err.httpStatus as 409);
@@ -1839,13 +1994,227 @@ export function createApp(cfg: HomeConfig): {
   );
 
   app.get(
-    "/v1/takeover",
+    "/runner/v1/screencast",
+    upgradeWebSocket(() => {
+      let bridge: TakeoverBridge | undefined;
+      let authed = false;
+      return {
+        onMessage(evt, ws) {
+          const raw = (ws as { raw?: ServerWebSocket }).raw;
+          if (!authed) {
+            if (typeof evt.data !== "string") {
+              ws.close();
+              return;
+            }
+            try {
+              const msg = JSON.parse(evt.data) as { type?: string; nonce?: string; machineToken?: string };
+              if (msg.type !== "auth" || !msg.nonce || !msg.machineToken) {
+                ws.close();
+                return;
+              }
+              const row = lookupMachineToken(db, msg.machineToken);
+              if (!row) {
+                ws.close();
+                return;
+              }
+              const found = ctx.engine.takeoverBridges.get(msg.nonce);
+              if (!found || found.accountId !== row.account_id) {
+                ws.close();
+                return;
+              }
+              authed = true;
+              bridge = found;
+              if (raw) found.mediaWs = raw;
+            } catch {
+              ws.close();
+            }
+            return;
+          }
+          if (!bridge?.spaWs) return;
+          try {
+            if (typeof evt.data === "string") {
+              bridge.spaWs.send(evt.data);
+            } else {
+              const bytes = wsBinary(evt.data);
+              if (bytes) bridge.spaWs.send(bytes);
+            }
+          } catch {
+            /* spa gone */
+          }
+        },
+        onClose() {
+          if (bridge) bridge.mediaWs = undefined;
+        },
+      };
+    }),
+  );
+
+  app.get(
+    "/runner/v1",
     upgradeWebSocket((c) => {
+      let accountId: string | null = null;
+      let client: RemoteRunnerClient | null = null;
+      let peer: JsonRpcPeer | null = null;
+      let authed = false;
+      return {
+        onOpen(_evt, ws) {
+          const raw = (ws as { raw?: ServerWebSocket }).raw;
+          peer = new JsonRpcPeer(
+            (text) => {
+              try {
+                if (raw) raw.send(text);
+                else ws.send(text);
+              } catch {
+                /* ignore */
+              }
+            },
+            async (method, params) => {
+              if (method === "hello") {
+                try {
+                  const hello = (params ?? {}) as RunnerHello;
+                  if (hello.protocol !== RUNNER_PROTOCOL) {
+                    throw new RpcError(RPC_PROTOCOL, "protocol");
+                  }
+                  let machineToken: string;
+                  let acct: string;
+                  if (hello.enrollToken) {
+                    const looked = lookupEnrollToken(db, hello.enrollToken);
+                    if (looked.kind === "attached") throw new RpcError(RPC_RUNNER_ATTACHED, "runner_attached");
+                    if (looked.kind === "invalid") throw new RpcError(RPC_UNAUTHORIZED, "unauthorized");
+                    const consumed = consumeEnrollToken(db, hello.enrollToken);
+                    if (!consumed) throw new RpcError(RPC_UNAUTHORIZED, "unauthorized");
+                    acct = consumed.accountId;
+                    machineToken = mintRunnerSecret("ob_run_");
+                    persistHello(
+                      db,
+                      acct,
+                      {
+                        hostname: hello.hostname,
+                        platform: hello.platform,
+                        version: hello.version,
+                        grokCliSignedIn: hello.grokCliSignedIn,
+                        workspacePath: hello.workspacePath,
+                      },
+                      machineToken,
+                    );
+                  } else if (hello.machineToken) {
+                    const row = lookupMachineToken(db, hello.machineToken);
+                    if (!row || row.status === "revoked") throw new RpcError(RPC_UNAUTHORIZED, "unauthorized");
+                    acct = row.account_id;
+                    machineToken = hello.machineToken;
+                    persistHello(db, acct, {
+                      hostname: hello.hostname,
+                      platform: hello.platform,
+                      version: hello.version,
+                      grokCliSignedIn: hello.grokCliSignedIn,
+                      workspacePath: hello.workspacePath,
+                    });
+                  } else {
+                    throw new RpcError(RPC_UNAUTHORIZED, "unauthorized");
+                  }
+                  const org = currentOrgMeta(db);
+                  if (!org) throw new RpcError(RPC_UNAUTHORIZED, "unauthorized");
+                  await ctx.engine.detachLocal(acct);
+                  const remote = new RemoteRunnerClient(acct, peer!, () => {
+                    try {
+                      ws.close();
+                    } catch {
+                      /* ignore */
+                    }
+                  });
+                  remote.workspacePath = hello.workspacePath;
+                  remote.hostname = hello.hostname;
+                  remote.platform = hello.platform;
+                  remote.runnerVersion = hello.version;
+                  remote.grokCliSignedIn = hello.grokCliSignedIn;
+                  remote.lastHeartbeatAt = Date.now();
+                  ctx.engine.attachRemote(acct, remote);
+                  accountId = acct;
+                  client = remote;
+                  authed = true;
+                  ctx.log.info("runner.hello", {
+                    hostname: hello.hostname,
+                    platform: hello.platform,
+                    warmBotIds: hello.warmBotIds,
+                  });
+                  ctx.engine.kick();
+                  const ack: RunnerHelloAck = {
+                    machineToken,
+                    orgId: org.org_id,
+                    orgSlug: org.slug,
+                    mcpProxy: true,
+                  };
+                  return ack;
+                } catch (err) {
+                  setTimeout(() => {
+                    try {
+                      ws.close();
+                    } catch {
+                      /* ignore */
+                    }
+                  }, 50);
+                  throw err;
+                }
+              }
+              if (!authed || !client || !accountId) throw new RpcError(RPC_UNAUTHORIZED, "unauthorized");
+              if (method === "heartbeat") {
+                const h = (params ?? {}) as RunnerHeartbeat;
+                client.applyHeartbeat(h);
+                persistHeartbeat(db, accountId, h.workspacePath);
+                return;
+              }
+              if (method === "mcp.forward") return forwardMcp(params);
+              if (method === "live_work") {
+                const p = (params ?? {}) as { botId?: string; kind?: string; payload?: Record<string, unknown> };
+                client.onLiveWork?.(
+                  { kind: String(p.kind ?? ""), payload: p.payload ?? {}, botId: p.botId },
+                  p.botId,
+                );
+                return;
+              }
+              if (method === "harness_state") {
+                const p = (params ?? {}) as { harness?: RemoteRunnerClient["harness"] };
+                if (p.harness) client.harness = p.harness;
+                return;
+              }
+              throw new RpcError(-32601, `unknown ${method}`);
+            },
+          );
+        },
+        onMessage(evt) {
+          if (!peer) return;
+          if (typeof evt.data === "string") {
+            peer.handleMessage(evt.data);
+            return;
+          }
+          if (client) client.binaryOnControl += 1;
+          peer.handleMessage(wsBinary(evt.data) ?? new Uint8Array());
+        },
+        onClose() {
+          if (accountId && client && ctx.engine.disconnectRemote(accountId, client)) {
+            persistDisconnect(db, accountId);
+            ctx.log.info("runner.disconnect", { accountId });
+          }
+          peer?.rejectAll(new Error("runner ws closed"));
+        },
+        onError() {
+          if (accountId && client && ctx.engine.disconnectRemote(accountId, client)) {
+            persistDisconnect(db, accountId);
+          }
+        },
+      };
+    }),
+  );
+
+  app.get(
+    "/v1/takeover",
+    upgradeWebSocket(() => {
       let authed = false;
       let accountId: string | null = null;
       return {
         onMessage(evt, ws) {
           const data = typeof evt.data === "string" ? evt.data : "";
+          const raw = (ws as { raw?: ServerWebSocket }).raw;
           if (!authed) {
             try {
               const msg = JSON.parse(data) as { type?: string; ticket?: string };
@@ -1865,17 +2234,34 @@ export function createApp(cfg: HomeConfig): {
               }
               authed = true;
               accountId = row.account_id;
+              const live = ctx.engine.remotes.get(accountId);
+              if (live?.connected) {
+                const bridge = ctx.engine.takeoverByAccount.get(accountId);
+                if (bridge && raw) bridge.spaWs = raw;
+                void (async () => {
+                  try {
+                    if (bridge) await live.startScreencastNonce(bridge.nonce);
+                  } catch (err) {
+                    ws.send(JSON.stringify({ error: String(err) }));
+                  }
+                })();
+                return;
+              }
               const runner = ctx.engine.runnerFor(accountId);
               void (async () => {
                 try {
                   await runner.ensureBrowser();
                   const d = await runner.display();
+                  const viewport =
+                    "browser" in runner && runner.browser && typeof runner.browser === "object"
+                      ? (runner.browser as { viewport?: { width: number; height: number } }).viewport
+                      : undefined;
                   ws.send(
                     JSON.stringify({
                       type: "meta",
                       pageUrl: d.pageUrl,
                       pageOrigin: d.pageOrigin,
-                      viewport: runner.browser?.viewport,
+                      viewport,
                     }),
                   );
                   await runner.startScreencast((jpeg, meta) => {
@@ -1886,10 +2272,10 @@ export function createApp(cfg: HomeConfig): {
                             type: "meta",
                             pageUrl: meta.pageUrl,
                             pageOrigin: meta.pageOrigin,
+                            viewport: meta.viewport,
                           }),
                         );
                       }
-                      const raw = (ws as { raw?: ServerWebSocket }).raw;
                       if (raw) raw.send(jpeg);
                       else ws.send(jpeg);
                     } catch {
@@ -1908,6 +2294,18 @@ export function createApp(cfg: HomeConfig): {
           }
           if (accountId) {
             try {
+              const live = ctx.engine.remotes.get(accountId);
+              if (live?.connected) {
+                const bridge = ctx.engine.takeoverByAccount.get(accountId);
+                if (bridge?.mediaWs && typeof evt.data === "string") {
+                  try {
+                    bridge.mediaWs.send(evt.data);
+                  } catch {
+                    /* ignore */
+                  }
+                }
+                return;
+              }
               const msg = JSON.parse(data) as Record<string, unknown>;
               const runner = ctx.engine.runnerFor(accountId);
               if (msg.type === "navigate") {
@@ -1925,7 +2323,21 @@ export function createApp(cfg: HomeConfig): {
           }
         },
         onClose() {
-          if (accountId) ctx.engine.runnerFor(accountId).stopTakeover();
+          if (!accountId) return;
+          const live = ctx.engine.remotes.get(accountId);
+          if (live?.connected) void live.stopTakeover().catch(() => undefined);
+          else {
+            try {
+              void Promise.resolve(ctx.engine.runnerFor(accountId).stopTakeover()).catch(() => undefined);
+            } catch {
+              /* offline */
+            }
+          }
+          const bridge = ctx.engine.takeoverByAccount.get(accountId);
+          if (bridge) {
+            ctx.engine.takeoverBridges.delete(bridge.nonce);
+            ctx.engine.takeoverByAccount.delete(accountId);
+          }
         },
       };
     }),
@@ -1989,6 +2401,12 @@ function botPresence(ctx: AppContext, botId: string): { key: string; label: stri
   );
   if (last && (last.status === "failed" || (last.error && last.status !== "completed"))) {
     return { key: "attention", label: "Needs you" };
+  }
+  const bot = ctx.db.get<{ account_id: string }>("SELECT account_id FROM bots WHERE id = ?", [botId]);
+  if (bot && ctx.engine.enrolledRow(bot.account_id)) {
+    const live = ctx.engine.remotes.get(bot.account_id);
+    if (live?.bots.some((b) => b.id === botId && b.acpAlive)) return { key: "idle", label: "Dormant" };
+    return { key: "idle", label: "Dormant" };
   }
   for (const runner of ctx.engine.runners.values()) {
     const acp = runner.acpFor(botId);
@@ -2248,20 +2666,50 @@ function stitchLearnPrompt(opts: {
 }
 
 function healthPayload(ctx: AppContext, accountId: string) {
-  const runner = ctx.engine.runners.get(accountId);
+  const bots = activityForAccount(ctx, accountId).map((b) => ({
+    id: b.id,
+    presence: b.presence,
+    doing: b.doing,
+  }));
+  const row = getRunnerRow(ctx.db, accountId);
+  if (!row || row.status === "revoked") {
+    const runner = ctx.engine.runners.get(accountId);
+    return {
+      driver: "localhost",
+      state: runner?.harness === "crashed" ? "unhealthy" : "running",
+      harness: runner?.harness ?? "down",
+      browser: runner?.browser ? "up" : "down",
+      workspacePath: join(ctx.home, "desk"),
+      uid: process.getuid?.() ?? -1,
+      bots,
+    };
+  }
+  const live = ctx.engine.remotes.get(accountId);
+  const connected = Boolean(live?.connected);
+  const connection =
+    row.status === "pending" ? "pending" : connected ? "connected" : "disconnected";
   return {
-    driver: "localhost",
-    state: runner?.harness === "crashed" ? "unhealthy" : "running",
-    harness: runner?.harness ?? "down",
-    browser: runner?.browser ? "up" : "down",
-    workspacePath: join(ctx.home, "desk"),
-    uid: process.getuid?.() ?? -1,
-    bots: activityForAccount(ctx, accountId).map((b) => ({
-      id: b.id,
-      presence: b.presence,
-      doing: b.doing,
-    })),
+    driver: row.machine_token_hash ? "runner" : "localhost",
+    connection,
+    state: connected ? (live?.harness === "crashed" ? "unhealthy" : "running") : "disconnected",
+    harness: live?.harness ?? "down",
+    browser: live?.browser ?? "down",
+    workspacePath: live?.workspacePath || row.workspace_path || "",
+    uid: live?.uid ?? -1,
+    hostname: row.hostname,
+    platform: row.platform,
+    lastHeartbeatAt: row.last_heartbeat_at,
+    runnerVersion: row.runner_version,
+    bots,
   };
+}
+
+function wsBinary(data: unknown): Uint8Array | null {
+  if (typeof data === "string") return null;
+  if (data instanceof Uint8Array) return data;
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (typeof Buffer !== "undefined" && Buffer.isBuffer(data)) return data;
+  return null;
 }
 
 export { websocketOf };
