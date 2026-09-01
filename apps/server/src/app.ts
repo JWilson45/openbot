@@ -16,6 +16,7 @@ import {
   pauseCalendarSeriesForAssignee,
   rematerializeScheduledInstances,
   suppressOpenCalendarInstances,
+  type MessageRow,
   type TurnRow,
 } from "@openbot/db";
 import {
@@ -47,7 +48,7 @@ import {
   patchCalendarSeriesInput,
   postMessageInput,
 } from "@openbot/api-types";
-import { insertMessage, parseLivePayload, promote, summarizeLiveEvent } from "@openbot/live-work";
+import { insertMessage, notifyA2aSender, parseLivePayload, promote, summarizeLiveEvent } from "@openbot/live-work";
 import { sha256Hex } from "@openbot/db";
 import { detectCliLogins, listGrokModels, resolveBotInference } from "@openbot/acp-grok";
 import { FED_MAX_REQUEST_BYTES } from "@openbot/federation";
@@ -846,17 +847,32 @@ export function createApp(cfg: HomeConfig): {
     if (isGatewayRole(bot.role)) return c.json({ error: "gateway_protected" }, 409);
     if (bot.status !== "active") return c.json({ error: "not_active" }, 409);
     const t = now();
-    db.run("UPDATE bots SET status = 'archived', archived_at = ? WHERE id = ?", [t, bot.id]);
-    db.run(
-      "UPDATE turns SET status = 'cancelled', finished_at = ? WHERE bot_id = ? AND status IN ('queued', 'running')",
-      [t, bot.id],
-    );
-    pauseCalendarSeriesForAssignee(db, bot.id);
-    for (const row of db.all<{ id: string }>(
-      "SELECT id FROM calendar_series WHERE assignee_bot_id = ? AND status = 'paused'",
-      [bot.id],
-    )) {
-      suppressOpenCalendarInstances(db, row.id, "pause");
+    const completeRows = db.immediate(() => {
+      db.run("UPDATE bots SET status = 'archived', archived_at = ? WHERE id = ?", [t, bot.id]);
+      const pending = db.all<{ id: string }>(
+        "SELECT id FROM turns WHERE bot_id = ? AND status IN ('queued', 'running')",
+        [bot.id],
+      );
+      db.run(
+        "UPDATE turns SET status = 'cancelled', finished_at = ? WHERE bot_id = ? AND status IN ('queued', 'running')",
+        [t, bot.id],
+      );
+      pauseCalendarSeriesForAssignee(db, bot.id);
+      for (const row of db.all<{ id: string }>(
+        "SELECT id FROM calendar_series WHERE assignee_bot_id = ? AND status = 'paused'",
+        [bot.id],
+      )) {
+        suppressOpenCalendarInstances(db, row.id, "pause");
+      }
+      const rows: MessageRow[] = [];
+      for (const turn of pending) {
+        const msg = notifyA2aSender(db, turn.id, "target_archived");
+        if (msg) rows.push(msg);
+      }
+      return rows;
+    });
+    for (const msg of completeRows) {
+      onPush(s.accountId, { type: "message.created", message: msg });
     }
     await ctx.engine.runnerFor(s.accountId).kill(bot.id);
     return c.json({ ok: true, archivedAt: t, deleteAfter: t + ARCHIVE_TTL_MS });
@@ -1736,7 +1752,11 @@ export function createApp(cfg: HomeConfig): {
       promote(db, turn.id, { kind: "cancel" });
       cancelled = true;
     } else if (turn.status === "queued") {
-      db.run("UPDATE turns SET status = 'cancelled', finished_at = ? WHERE id = ?", [now(), turn.id]);
+      const complete = db.immediate(() => {
+        db.run("UPDATE turns SET status = 'cancelled', finished_at = ? WHERE id = ?", [now(), turn.id]);
+        return notifyA2aSender(db, turn.id, "cancel");
+      });
+      if (complete) onPush(s.accountId, { type: "message.created", message: complete });
       cancelled = true;
     }
     if (cancelled) {

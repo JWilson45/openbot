@@ -27,6 +27,7 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 - Restarting the server starts a new Grok ACP process. Chat history is in SQLite. On cold start OpenBot tries ACP `session/resume`; if that fails it injects a thread **summary + recent tail**. Idle desk children stay warm for 2 hours (override `OPENBOT_ACP_IDLE_MS`; `0` disables desk idle kill).
 - Teammates see who is on the desk (up to six names + Gateway) in their spawn overlay. Hiring someone does not kill the other Groks; each bot picks up the new roster on its next turn.
 - **Federation is off until you turn it on** on **both** sides. OpenBot does not provision Fly Machines.
+- **SendToAgent is queued, not done.** Completions sit on the A2A thread as a system line; the sender is not auto-woken.
 
 ---
 

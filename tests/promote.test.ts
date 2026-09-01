@@ -1,15 +1,23 @@
 import { describe, expect, test } from "bun:test";
-import { OpenbotDb, id, now } from "@openbot/db";
+import { OpenbotDb, id, now, orderedBotPair, sha256Hex } from "@openbot/db";
 import {
   appendLiveWork,
   buildThreadDigest,
+  insertMessage,
   parseLivePayload,
   promote,
   refreshThreadSummary,
   wrapPromptWithDigest,
 } from "@openbot/live-work";
-import { McpError } from "@openbot/api-types";
-import { handleMcpJsonRpc, McpInflight, sendMessage, sendToThread } from "@openbot/mcp-send-message";
+import { McpError, type A2aCompleteEvent } from "@openbot/api-types";
+import {
+  handleMcpJsonRpc,
+  McpInflight,
+  persistMcpToken,
+  sendMessage,
+  sendToAgent,
+  sendToThread,
+} from "@openbot/mcp-send-message";
 import { insertTurn, seedWorld, tempHome, type World } from "./helpers.ts";
 import { join } from "node:path";
 
@@ -555,5 +563,316 @@ describe("SendToThread + group promote", () => {
         [groupId, w.botId, turnId],
       )?.n,
     ).toBe(0);
+  });
+});
+
+function parseA2aComplete(body: string): A2aCompleteEvent {
+  expect(body.startsWith("A2A complete:")).toBe(true);
+  const jsonAt = body.indexOf("{");
+  expect(jsonAt).toBeGreaterThan(0);
+  return JSON.parse(body.slice(jsonAt)) as A2aCompleteEvent;
+}
+
+function completeRows(db: OpenbotDb, opts: { turnId?: string; threadId?: string }) {
+  if (opts.turnId) {
+    return db.all<{ body: string; turn_id: string; from_bot_id: string | null; origin: string }>(
+      `SELECT body, turn_id, from_bot_id, origin FROM messages
+       WHERE turn_id = ? AND origin = 'system' AND body LIKE 'A2A complete:%'`,
+      [opts.turnId],
+    );
+  }
+  return db.all<{ body: string; turn_id: string; from_bot_id: string | null; origin: string }>(
+    `SELECT body, turn_id, from_bot_id, origin FROM messages
+     WHERE thread_id = ? AND origin = 'system' AND body LIKE 'A2A complete:%'
+     ORDER BY created_at`,
+    [opts.threadId],
+  );
+}
+
+function insertDeskBot(db: OpenbotDb, w: World, name: string) {
+  const botId = id();
+  const threadId = id();
+  const harnessSessionId = id();
+  const token = "ob_sess_test_" + id().replaceAll("-", "");
+  const t = now();
+  db.run(
+    `INSERT INTO bots (id, account_id, name, description, status, permission_mode, created_at)
+     VALUES (?, ?, ?, 'teammate', 'active', 'auto', ?)`,
+    [botId, w.accountId, name, t],
+  );
+  db.run(
+    `INSERT INTO threads (id, account_id, bot_id, title, kind, created_at) VALUES (?, ?, ?, 't', 'human', ?)`,
+    [threadId, w.accountId, botId, t],
+  );
+  db.run(
+    `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at) VALUES (?, ?, ?, 'active', ?)`,
+    [harnessSessionId, w.computeId, botId, t],
+  );
+  persistMcpToken(db, { accountId: w.accountId, botId, threadId, harnessSessionId }, sha256Hex(token));
+  return { botId, threadId, harnessSessionId, token };
+}
+
+function insertA2aMailbox(
+  db: OpenbotDb,
+  opts: {
+    accountId: string;
+    fromBotId: string;
+    toBotId: string;
+    status?: string;
+    harnessSessionId?: string | null;
+  },
+) {
+  const [lo, hi] = orderedBotPair(opts.fromBotId, opts.toBotId);
+  let thread = db.get<{ id: string }>(
+    "SELECT id FROM threads WHERE kind = 'a2a' AND account_id = ? AND bot_id = ? AND peer_bot_id = ?",
+    [opts.accountId, lo, hi],
+  );
+  if (!thread) {
+    const threadId = id();
+    db.run(
+      `INSERT INTO threads (id, account_id, bot_id, title, kind, peer_bot_id, created_at)
+       VALUES (?, ?, ?, ?, 'a2a', ?, ?)`,
+      [threadId, opts.accountId, lo, `${lo}↔${hi}`, hi, now()],
+    );
+    thread = { id: threadId };
+  }
+  const turnId = id();
+  db.run(
+    `INSERT INTO turns (id, thread_id, bot_id, harness_session_id, status, sent_message_count, assistant_text, created_at)
+     VALUES (?, ?, ?, ?, ?, 0, '', ?)`,
+    [turnId, thread.id, opts.toBotId, opts.harnessSessionId ?? null, opts.status ?? "running", now()],
+  );
+  insertMessage(db, {
+    threadId: thread.id,
+    turnId,
+    role: "user",
+    origin: "agent",
+    body: "please do the thing",
+    fromBotId: opts.fromBotId,
+  });
+  return { threadId: thread.id, turnId };
+}
+
+describe("A2A complete ping", () => {
+  test("hasSend on an A2A turn writes code=ok sentMessage=true on that thread only", () => {
+    const db = openDb();
+    const w = seedWorld(db);
+    const bob = insertDeskBot(db, w, "Bob");
+    const { threadId, turnId } = insertA2aMailbox(db, {
+      accountId: w.accountId,
+      fromBotId: w.botId,
+      toBotId: bob.botId,
+      harnessSessionId: bob.harnessSessionId,
+    });
+    const inflight = new McpInflight();
+    sendMessage(db, inflight, `Bearer ${bob.token}`, { body: "draft for the human" });
+    expect(() => promote(db, turnId, { kind: "acp_done", assistantText: "leftover" })).not.toThrow(
+      /transaction/i,
+    );
+    const rows = completeRows(db, { turnId });
+    expect(rows.length).toBe(1);
+    expect(rows[0]?.from_bot_id).toBe(bob.botId);
+    const ev = parseA2aComplete(rows[0]!.body);
+    expect(ev.event).toBe("a2a_complete");
+    expect(ev.code).toBe("ok");
+    expect(ev.sentMessage).toBe(true);
+    expect(ev.status).toBe("completed");
+    expect(ev.from).toBe("Bob");
+    expect(ev.fromBotId).toBe(bob.botId);
+    expect(ev.toBotId).toBe(w.botId);
+    expect(ev.turnId).toBe(turnId);
+    expect(ev.promoteReason).toBeNull();
+    expect(completeRows(db, { threadId }).length).toBe(1);
+    expect(
+      db.get<{ n: number }>(
+        "SELECT COUNT(*) as n FROM messages WHERE thread_id = ? AND body LIKE 'A2A complete:%'",
+        [w.threadId],
+      )?.n,
+    ).toBe(0);
+    expect(
+      db.get<{ n: number }>(
+        "SELECT COUNT(*) as n FROM messages WHERE thread_id = ? AND body LIKE 'A2A complete:%'",
+        [bob.threadId],
+      )?.n,
+    ).toBe(0);
+    db.close();
+  });
+
+  test("sent_message_count from SendToThread counts as hasSend", () => {
+    const db = openDb();
+    const w = seedWorld(db);
+    const bob = insertDeskBot(db, w, "Bob");
+    const { turnId } = insertA2aMailbox(db, {
+      accountId: w.accountId,
+      fromBotId: w.botId,
+      toBotId: bob.botId,
+    });
+    db.run("UPDATE turns SET sent_message_count = 1 WHERE id = ?", [turnId]);
+    promote(db, turnId, { kind: "acp_done", assistantText: "leftover" });
+    const ev = parseA2aComplete(completeRows(db, { turnId })[0]!.body);
+    expect(ev.code).toBe("ok");
+    expect(ev.sentMessage).toBe(true);
+    expect(
+      db.get<{ n: number }>(
+        "SELECT COUNT(*) as n FROM messages WHERE turn_id = ? AND origin = 'fallback'",
+        [turnId],
+      )?.n,
+    ).toBe(0);
+    db.close();
+  });
+
+  test("ramble fallback is no_send_message", () => {
+    const db = openDb();
+    const w = seedWorld(db);
+    const bob = insertDeskBot(db, w, "Bob");
+    const { turnId } = insertA2aMailbox(db, {
+      accountId: w.accountId,
+      fromBotId: w.botId,
+      toBotId: bob.botId,
+    });
+    promote(db, turnId, { kind: "acp_done", assistantText: "I ramble privately" });
+    const ev = parseA2aComplete(completeRows(db, { turnId })[0]!.body);
+    expect(ev.code).toBe("no_send_message");
+    expect(ev.sentMessage).toBe(false);
+    expect(ev.promoteReason).toBe("no_send_message");
+    expect(
+      db.get<{ n: number }>(
+        "SELECT COUNT(*) as n FROM messages WHERE turn_id = ? AND origin = 'fallback'",
+        [turnId],
+      )?.n,
+    ).toBe(1);
+    db.close();
+  });
+
+  test("empty A2A has placeholder plus complete empty_turn", () => {
+    const db = openDb();
+    const w = seedWorld(db);
+    const bob = insertDeskBot(db, w, "Bob");
+    const { turnId } = insertA2aMailbox(db, {
+      accountId: w.accountId,
+      fromBotId: w.botId,
+      toBotId: bob.botId,
+    });
+    promote(db, turnId, { kind: "acp_done" });
+    const system = db.all<{ origin: string; body: string; role: string }>(
+      "SELECT origin, body, role FROM messages WHERE turn_id = ? AND origin = 'system' ORDER BY created_at",
+      [turnId],
+    );
+    expect(system.length).toBe(2);
+    expect(system[0]?.body).toContain("finished this turn without a message");
+    const ev = parseA2aComplete(system[1]!.body);
+    expect(ev.code).toBe("empty_turn");
+    expect(ev.sentMessage).toBe(false);
+    expect(ev.promoteReason).toBe("empty_turn");
+    db.close();
+  });
+
+  test("promote crash is code crash", () => {
+    const db = openDb();
+    const w = seedWorld(db);
+    const bob = insertDeskBot(db, w, "Bob");
+    const { turnId } = insertA2aMailbox(db, {
+      accountId: w.accountId,
+      fromBotId: w.botId,
+      toBotId: bob.botId,
+    });
+    promote(db, turnId, { kind: "crash" });
+    const ev = parseA2aComplete(completeRows(db, { turnId })[0]!.body);
+    expect(ev.code).toBe("crash");
+    expect(ev.status).toBe("completed");
+    db.close();
+  });
+
+  test("running cancel via promote is code cancel", () => {
+    const db = openDb();
+    const w = seedWorld(db);
+    const bob = insertDeskBot(db, w, "Bob");
+    const { turnId } = insertA2aMailbox(db, {
+      accountId: w.accountId,
+      fromBotId: w.botId,
+      toBotId: bob.botId,
+    });
+    promote(db, turnId, { kind: "cancel", assistantText: "halfway" });
+    const ev = parseA2aComplete(completeRows(db, { turnId })[0]!.body);
+    expect(ev.code).toBe("cancel");
+    expect(ev.status).toBe("cancelled");
+    expect(ev.promoteReason).toBe("cancel");
+    db.close();
+  });
+
+  test("deadline promote is code deadline", () => {
+    const db = openDb();
+    const w = seedWorld(db);
+    const bob = insertDeskBot(db, w, "Bob");
+    const { turnId } = insertA2aMailbox(db, {
+      accountId: w.accountId,
+      fromBotId: w.botId,
+      toBotId: bob.botId,
+    });
+    promote(db, turnId, { kind: "deadline", assistantText: "too slow" });
+    const ev = parseA2aComplete(completeRows(db, { turnId })[0]!.body);
+    expect(ev.code).toBe("deadline");
+    expect(ev.status).toBe("failed");
+    db.close();
+  });
+
+  test("second promote on the same turn still one complete line", () => {
+    const db = openDb();
+    const w = seedWorld(db);
+    const bob = insertDeskBot(db, w, "Bob");
+    const { turnId } = insertA2aMailbox(db, {
+      accountId: w.accountId,
+      fromBotId: w.botId,
+      toBotId: bob.botId,
+    });
+    promote(db, turnId, { kind: "acp_done", assistantText: "one" });
+    promote(db, turnId, { kind: "acp_done", assistantText: "two" });
+    expect(completeRows(db, { turnId }).length).toBe(1);
+    db.close();
+  });
+
+  test("Ada then Bob hop writes two complete lines with different turn ids", () => {
+    const db = openDb();
+    const w = seedWorld(db);
+    insertTurn(db, w, "running");
+    const bob = insertDeskBot(db, w, "Bob");
+    const inflight = new McpInflight();
+    const first = sendToAgent(db, inflight, `Bearer ${w.token}`, { name: "Bob", body: "write a draft" });
+    db.run("UPDATE turns SET status = 'running', harness_session_id = ? WHERE id = ?", [
+      bob.harnessSessionId,
+      first.turnId,
+    ]);
+    const second = sendToAgent(db, inflight, `Bearer ${bob.token}`, { name: "Ada", body: "here is the draft" });
+    db.run("UPDATE turns SET sent_message_count = 1 WHERE id = ?", [first.turnId]);
+    promote(db, first.turnId, { kind: "acp_done" });
+    db.run("UPDATE turns SET status = 'running' WHERE id = ?", [second.turnId]);
+    db.run("UPDATE turns SET sent_message_count = 1 WHERE id = ?", [second.turnId]);
+    promote(db, second.turnId, { kind: "acp_done" });
+    const rows = completeRows(db, { threadId: first.threadId });
+    expect(rows.length).toBe(2);
+    expect(first.threadId).toBe(second.threadId);
+    expect(rows[0]?.turn_id).toBe(first.turnId);
+    expect(rows[1]?.turn_id).toBe(second.turnId);
+    const a = parseA2aComplete(rows[0]!.body);
+    const b = parseA2aComplete(rows[1]!.body);
+    expect(a.fromBotId).toBe(bob.botId);
+    expect(a.toBotId).toBe(w.botId);
+    expect(b.fromBotId).toBe(w.botId);
+    expect(b.toBotId).toBe(bob.botId);
+    db.close();
+  });
+
+  test("human and group promote write zero complete lines", () => {
+    const db = openDb();
+    const w = seedWorld(db);
+    const humanTurn = insertTurn(db, w, "running");
+    promote(db, humanTurn, { kind: "acp_done", assistantText: "ramble" });
+    expect(completeRows(db, { turnId: humanTurn }).length).toBe(0);
+    const bobId = insertBot(db, w, "Bob");
+    const groupId = insertGroup(db, w, [w.botId, bobId], "Design");
+    const groupTurn = insertTurn(db, w, "running", { threadId: groupId });
+    promote(db, groupTurn, { kind: "acp_done", assistantText: "group ramble" });
+    expect(completeRows(db, { turnId: groupTurn }).length).toBe(0);
+    db.close();
   });
 });

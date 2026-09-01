@@ -239,9 +239,65 @@ export type PromoteCause =
   | { kind: "cancel"; assistantText?: string }
   | { kind: "deadline"; assistantText?: string };
 
+export type A2aCompleteCode =
+  | "ok"
+  | "no_send_message"
+  | "empty_turn"
+  | "crash"
+  | "cancel"
+  | "deadline"
+  | "target_archived";
+
+export type A2aCompleteEvent = {
+  event: "a2a_complete";
+  code: A2aCompleteCode;
+  status: string;
+  from: string;
+  fromBotId: string;
+  toBotId: string;
+  turnId: string;
+  sentMessage: boolean;
+  promoteReason: string | null;
+};
+
+export type McpErrorCode =
+  | "unauthorized"
+  | "rate_limited"
+  | "no_active_turn"
+  | "no_human_thread"
+  | "not_found"
+  | "bad_request"
+  | "forbidden"
+  | "target_busy"
+  | "target_archived"
+  | "runtime_offline"
+  | "unsafe_memory"
+  | "federation_off"
+  | "conflict"
+  | "no_forward"
+  | "no_org_key"
+  | "timeout"
+  | "outbound_failed"
+  | "peer_error"
+  | "unknown_tool"
+  | "reserved_name"
+  | "cap"
+  | "duplicate_name"
+  | "invalid_assignee"
+  | "invalid_thread"
+  | "invalid_timezone"
+  | "invalid_rrule"
+  | "invalid_dtstart"
+  | "unsupported_rrule"
+  | "min_interval"
+  | "cancelled"
+  | "not_active"
+  | "not_paused"
+  | "not_proposed";
+
 export class McpError extends Error {
   constructor(
-    public readonly code: string,
+    public readonly code: McpErrorCode,
     message: string,
     public readonly httpStatus = 409,
   ) {

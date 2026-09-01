@@ -35,6 +35,7 @@ import {
   sendToAgentInput,
   sendToOrgInput,
   sendToThreadInput,
+  type McpErrorCode,
   type SendMessageInput,
 } from "@openbot/api-types";
 import {
@@ -364,6 +365,53 @@ export function sendToThread(
   }
 }
 
+function sendToAgentNotFound(input: { botId?: string; name?: string }): McpError {
+  const wanted = input.name?.trim() || input.botId || "that name";
+  return new McpError(
+    "not_found",
+    `target bot not found. "${wanted}" is not on this desk. Call CreateBot to hire a new teammate. Do not curl OpenBot HTTP or /auth/local.`,
+    404,
+  );
+}
+
+function sendToAgentArchived(name: string): McpError {
+  return new McpError(
+    "target_archived",
+    `"${name}" is archived. Restore them or pick a live teammate.`,
+    409,
+  );
+}
+
+function resolveSendToAgentTarget(
+  db: OpenbotDb,
+  accountId: string,
+  input: { botId?: string; name?: string },
+): { id: string; name: string } {
+  if (input.botId) {
+    const row = db.get<{ id: string; name: string; status: string }>(
+      "SELECT id, name, status FROM bots WHERE id = ? AND account_id = ?",
+      [input.botId, accountId],
+    );
+    if (!row) throw sendToAgentNotFound(input);
+    if (row.status === "archived") throw sendToAgentArchived(row.name);
+    if (row.status !== "active") throw sendToAgentNotFound(input);
+    return row;
+  }
+  const active = db.get<{ id: string; name: string }>(
+    "SELECT id, name FROM bots WHERE account_id = ? AND status = 'active' AND lower(name) = lower(?)",
+    [accountId, input.name!],
+  );
+  if (active) return active;
+  const archived = db.get<{ id: string; name: string }>(
+    `SELECT id, name FROM bots
+     WHERE account_id = ? AND status = 'archived' AND lower(name) = lower(?)
+     ORDER BY archived_at DESC LIMIT 1`,
+    [accountId, input.name!],
+  );
+  if (archived) throw sendToAgentArchived(archived.name);
+  throw sendToAgentNotFound(input);
+}
+
 export function sendToAgent(
   db: OpenbotDb,
   inflight: McpInflight,
@@ -395,23 +443,7 @@ export function sendToAgent(
       );
       if ((a2aThisTurn?.n ?? 0) >= 20) throw new McpError("rate_limited", "per-turn A2A limit", 429);
 
-      const target = input.botId
-        ? db.get<{ id: string; name: string; account_id: string; status: string }>(
-            "SELECT id, name, account_id, status FROM bots WHERE id = ? AND account_id = ?",
-            [input.botId, claims.accountId],
-          )
-        : db.get<{ id: string; name: string; account_id: string; status: string }>(
-            "SELECT id, name, account_id, status FROM bots WHERE account_id = ? AND status = 'active' AND lower(name) = lower(?)",
-            [claims.accountId, input.name!],
-          );
-      if (!target || target.status !== "active") {
-        const wanted = input.name?.trim() || input.botId || "that name";
-        throw new McpError(
-          "not_found",
-          `target bot not found. "${wanted}" is not on this desk. Call CreateBot to hire a new teammate. Do not curl OpenBot HTTP or /auth/local.`,
-          404,
-        );
-      }
+      const target = resolveSendToAgentTarget(db, claims.accountId, input);
       if (target.id === claims.botId) {
         throw new McpError("bad_request", "cannot SendToAgent yourself", 400);
       }
@@ -690,7 +722,7 @@ export const SEND_MESSAGE_TOOL = {
 export const SEND_TO_AGENT_TOOL = {
   name: "SendToAgent",
   description:
-    "Send work to another named bot already on this desk. Compose a message for them; do not forward the human verbatim. Async: returns immediately. Does not message the human. If they do not exist, CreateBot then SendToAgent. Do not curl OpenBot HTTP.",
+    "Send work to another named bot already on this desk. Compose a message for them; do not forward the human verbatim. Async: queued, not done — this turn is not resumed with their result. Completions land on the 1:1 handoff as a system line. Does not message the human. Typed errors: not_found, target_archived, target_busy. If they do not exist, CreateBot then SendToAgent. Do not curl OpenBot HTTP.",
   inputSchema: {
     type: "object",
     properties: {
@@ -1374,7 +1406,7 @@ function insertProposedSeries(
         try {
           parseRrule(rrule);
         } catch (err) {
-          const code = err instanceof RruleError ? err.code : "invalid_rrule";
+          const code = (err instanceof RruleError ? err.code : "invalid_rrule") as McpErrorCode;
           throw new McpError(code, code, 400);
         }
       }
@@ -1383,7 +1415,7 @@ function insertProposedSeries(
         dtstartUtc =
           input.dtstart != null ? parseCalendarDtstart(input.dtstart, timezone) : localNineTomorrow(timezone, now());
       } catch (err) {
-        const code = err instanceof RruleError ? err.code : "invalid_dtstart";
+        const code = (err instanceof RruleError ? err.code : "invalid_dtstart") as McpErrorCode;
         throw new McpError(code, code, 400);
       }
       if (nonCancelledSeriesCount(db, claims.accountId) >= CAL_MAX_SERIES) {
@@ -1914,7 +1946,11 @@ export async function handleMcpJsonRpc(
         json: {
           jsonrpc: "2.0",
           id: idVal,
-          error: { code: -32000, message: err.message, data: { code: err.code } },
+          error: {
+            code: -32000,
+            message: err.message.startsWith(err.code + ":") ? err.message : `${err.code}: ${err.message}`,
+            data: { code: err.code },
+          },
         },
       };
     }
