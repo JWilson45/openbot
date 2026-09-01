@@ -40,9 +40,9 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 | `ListBots` / `CreateBot` | Roster and hire. Desk bots only (cap 6). Gateway does not hire. Bots must **not** mint `/auth/local` or `POST /v1/bots`. |
 | Parallel turns | At most one running turn **per bot**. Two bots can work at the same time on the shared desk. |
 | Warm Grok process | Each bot keeps an ACP child across turns. Model / reasoning changes respawn it on the **next** turn. |
-| Model & reasoning | Per-bot Grok model (e.g. grok-4.6) and effort (low / medium / high / extra high). Composer + Settings. |
-| Live work | Collapsible thinking and tool calls in a resizable sidebar. Activity board for the whole team. |
-| Takeover | You grab the human tab of the shared Chromium (screencast + input). Esc / Close ends it. Desk bots keep their own tabs. |
+| Model & reasoning | Per-bot Grok model (e.g. grok-4.6) and effort (low / medium / high / extra high). Settings always; Debug composer on a human DM. |
+| Live work | Default UI is the messenger (roster + thread). **Debug** (header, or Ctrl/Cmd+Shift+Period) shows thinking and tool calls in a resizable sidebar. Activity board for the whole team. |
+| Takeover | **Desk browser** grabs the human tab of the shared Chromium (screencast + input). Esc / Close ends it; F6 from the canvas focuses Close. Desk bots keep their own tabs. |
 | Archive | Soft-delete folder. Restore, or type `DELETE` to purge. Expired archives (30 days) are removed automatically. |
 | Calendar / schedules / Learn this | Org-local sqlite (not Google Calendar: no sync, no invites). Schedules and learned routines are two products on the same grid. **Learn this** drafts a proposed event from a thread — not a recording. The clock is the process. |
 | OpenAI-compatible API | Open WebUI (and similar) can use a bot as `openbot/<Name>` with a `sk-ob_…` key. Two connections = two orgs (mint the key on that VM). |
@@ -89,7 +89,7 @@ cd openbot
 bun install
 ```
 
-The CLI is `bun run openbot -- <command>` (or `bun run apps/server/src/cli.ts`). Current version is **0.4.1**. `openbot version` prints `{ openbot, grokPin, grok }`. OpenBot pins **Grok CLI 1.0.5** (warns if missing or older; does not refuse to start).
+The CLI is `bun run openbot -- <command>` (or `bun run apps/server/src/cli.ts`). Current version is **0.5.0**. `openbot version` prints `{ openbot, grokPin, grok }`. OpenBot pins **Grok CLI 1.0.5** (warns if missing or older; does not refuse to start).
 
 Merging to `main` with a **new** `package.json` version creates tag `vX.Y.Z` and publishes GitHub Release binaries. Pull requests run tests. Other branches do not. A version that already has a tag is not re-released.
 
@@ -214,9 +214,12 @@ bun run openbot server --origin https://desk.example.com
 
 ### Chat
 
-- Enter sends, Shift+Enter newline.
-- **Model** and **Reasoning** sit above the composer. Changing them saves immediately and applies on the **next turn**. A running turn keeps the old setting.
-- Live work (thinking, tools) is the right sidebar; drag the handle to resize. **Activity** is a folder in the rail for every teammate at once.
+- Enter sends, Shift+Enter newline. First Tab is a skip link to the message box.
+- Default chrome is a two-pane messenger: team rail + transcript. Teammate replies are **SendMessage** bubbles, not thinking.
+- **Debug mode** (header **Debug**, or Ctrl/Cmd+Shift+Period) shows live work (thinking, tools) in the right sidebar; drag the handle to resize. The status chip next to the title is not a button and is hidden when idle.
+- **Model** and **Reasoning** live in Settings. They also appear above the human composer in Debug. Changing them saves immediately and applies on the **next turn**. A running turn keeps the old setting.
+- **Appearance** (Settings): Match system, Dark (ink), or Light (paper). Takeover stays dark.
+- **Activity** is a folder in the rail for every teammate at once.
 - **Handoff** threads are the A2A log (read-only from the human UI). Message a bot from their human DM.
 
 ### Calendar
@@ -225,7 +228,7 @@ bun run openbot server --origin https://desk.example.com
 
 ### Takeover
 
-**Takeover** shows the shared Chromium. `about:blank` means no page is open yet. Esc or **Close** ends takeover. One browser, mutexed with bot browser tools.
+**Desk browser** (Takeover) shows the shared Chromium. `about:blank` means no page is open yet. Esc or **Close** ends it; F6 from the canvas focuses Close. One browser, mutexed with bot browser tools.
 
 ---
 

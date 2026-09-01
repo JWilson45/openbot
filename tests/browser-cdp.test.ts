@@ -134,17 +134,19 @@ describe("CDP + takeover", () => {
       session.ws.close();
     }
 
-    const { SPA_HTML } = await import("../apps/server/src/spa.ts");
-    expect(SPA_HTML).toContain("/v1/turns/");
-    expect(SPA_HTML).toContain("live-work");
-    expect(SPA_HTML).toContain("catchUpLive");
-    expect(SPA_HTML).toContain("mousedown");
-    expect(SPA_HTML).toContain("keydown");
-    expect(SPA_HTML).toContain("permission_request");
-    expect(SPA_HTML).toContain("el.querySelector(sel)");
-    expect(SPA_HTML).toContain("SendToAgent");
-    expect(SPA_HTML).toContain("New bot");
-    expect(SPA_HTML).toContain("/v1/messages/");
+    const { SPA_JS, spaSource } = await import("../apps/server/src/spa.ts");
+    const source = spaSource();
+    expect(SPA_JS).toContain("/v1/turns/");
+    expect(SPA_JS).toContain("live-work");
+    expect(SPA_JS).toContain("catchUpLive");
+    expect(SPA_JS).toContain("mousedown");
+    expect(SPA_JS).toContain("keydown");
+    expect(SPA_JS).toContain("permission_request");
+    expect(SPA_JS).toContain("el.querySelector(sel)");
+    expect(SPA_JS).toContain("SendToAgent");
+    expect(SPA_JS).toContain("New bot");
+    expect(SPA_JS).toContain("/v1/messages/");
+    expect(source).toContain("catchUpLive");
 
     server.stop(true);
     runner.stopBrowser();

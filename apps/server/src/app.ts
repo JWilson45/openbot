@@ -60,7 +60,7 @@ import {
   parseCalendarDtstart,
   parseRrule,
 } from "@openbot/calendar";
-import { SPA_HTML } from "./spa.ts";
+import { SPA_CSS, SPA_HTML, SPA_JS } from "./spa.ts";
 import { TurnEngine } from "./engine.ts";
 import { reconcileCalendarInstance } from "./calendar-tick.ts";
 import { mountOpenAiCompat } from "./openai.ts";
@@ -297,6 +297,14 @@ export function createApp(cfg: HomeConfig): {
   });
 
   app.get("/", (c) => c.html(SPA_HTML));
+  app.get("/ui/desk.css", (c) => {
+    c.header("Content-Type", "text/css; charset=utf-8");
+    return c.body(SPA_CSS);
+  });
+  app.get("/ui/desk.js", (c) => {
+    c.header("Content-Type", "text/javascript; charset=utf-8");
+    return c.body(SPA_JS);
+  });
 
   app.get("/auth/github", (c) => {
     if (!ctx.githubClientId) {
