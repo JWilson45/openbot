@@ -24,7 +24,7 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 - **Schedules and learned routines are two products** on the same grid.
 - `$OPENBOT_HOME/desk` is a **shared computer**. It is **not** a security boundary **inside** an org. Every bot on the account can read and write the desk the way you can. There is **one Chromium** for the whole team (**a tab per desk bot**; cookies shared). Cross-org is messages only (hop=1).
 - Vault files (`master.key`, `org.ed25519`, credentials) live **outside** `desk/`. Grok’s `HOME` is `$OPENBOT_HOME/grok-home` (a copy of `~/.grok/auth.json`, not a symlink). ACP tools whose paths resolve outside the desk are denied. Optional `OPENBOT_SANDBOX` (macOS `sandbox-exec` / Linux `bwrap`) is best-effort and off in tests. Same-uid `0600` is not a jail; a dedicated OS user is. Do not copy secrets into the workspace Grok can see.
-- Restarting the server starts a new Grok ACP process. Chat history is in SQLite; OpenBot injects a thread digest on the next turn so the bot continues instead of announcing amnesia.
+- Restarting the server starts a new Grok ACP process. Chat history is in SQLite. On cold start OpenBot tries ACP `session/resume`; if that fails it injects a thread **summary + recent tail**. Idle desk children stay warm for 2 hours (override `OPENBOT_ACP_IDLE_MS`; `0` disables desk idle kill).
 - **Federation is off until you turn it on** on **both** sides. OpenBot does not provision Fly Machines.
 
 ---
@@ -277,7 +277,7 @@ Control dir is `~/.openbot`. Each org profile is its own data root (`$OPENBOT_HO
 | `OPENBOT_ORG_ID` | Stable org UUID. Generated on first boot if unset. A **different** value than `org_meta.org_id` refuses to boot. |
 | `OPENBOT_ORG_SLUG` | Org slug (single DNS label). May update the stored slug. FQDN origins such as `desk.example.com` do **not** auto-slug — they become `local` unless you set this, `org.json`, or `openbot org init --slug`. |
 | `OPENBOT_ORG_NAME` | Display name. May update the stored name. |
-| `OPENBOT_ACP_IDLE_MS` | Kill idle **desk** Grok ACP children after this many ms. Default **600000** (10 minutes). `0` disables desk idle kill only (not Gateway). Cold start on the next message is a few seconds plus a thread digest — not a full amnesia. |
+| `OPENBOT_ACP_IDLE_MS` | Kill idle **desk** Grok ACP children after this many ms. Default **7200000** (2 hours). `0` disables desk idle kill only (not Gateway). Cold start on the next message is a few seconds plus a thread digest — not a full amnesia. |
 | `OPENBOT_GATEWAY_ACP_IDLE_MS` | Gateway ACP idle TTL. Default **1800000** (30 minutes). `0` disables Gateway idle kill only. |
 | `OPENBOT_FEDERATION` | Panic **off:** `0` forces federation off even if the DB flag is on. Unset/`1` does **not** force on. Restart the unit so the process sees env. |
 | `OPENBOT_FED_ALLOW_HTTP` | `1` allows RFC1918 `http://` peer URLs. Default is https + loopback http. |
@@ -405,7 +405,7 @@ CI (`.github/workflows/ci.yml`) is `bun install --frozen-lockfile` then `bun tes
 
 - Six active **desk** bots, 1:1 A2A only (no group chat in this cut). Gateway is extra and does not consume a roster slot.
 - One desk, one Chromium. Two bots editing files will race; two bots scraping will queue on the browser lock. Each bot's cwd is `desk/projects/<id>/`; that is a home folder, not a jail.
-- Idle desk Grok processes exit after 10 minutes (override `OPENBOT_ACP_IDLE_MS`). Gateway default 30 minutes. The next message cold-starts in a few seconds.
+- Idle desk Grok processes exit after 2 hours (override `OPENBOT_ACP_IDLE_MS`). Gateway default 30 minutes. The next message cold-starts in a few seconds.
 - Federation default **off**. Hop **1** (no forwards). Group `@mention` cap is 3 when groups ship — still a RAM foot-gun.
 - Codex / OpenCode adapters are not shipped.
 - Bind is 127.0.0.1 by default; you own TLS and exposure. Caddy must 404 `/mcp/v1`.
@@ -424,7 +424,7 @@ Design background: [docs/design/phase-1-always-on-teammate-loop.md](docs/design/
 
 | Symptom | What to try |
 | --- | --- |
-| Bot says it is a “new session” after restart | Expected ACP reset. Current builds inject a thread digest and tell Grok not to announce it. Restart after pull, then send again. |
+| Bot says it is a “new session” after restart | Expected ACP reset if resume failed. Current builds inject a summary + recent tail and tell Grok not to announce it. Restart after pull, then send again. |
 | Empty bubbles / no reply | Confirm `grok login` or a vaulted key. Check Live work for a crashed turn. `OPENBOT_ACP_COMMAND` must be unset for real Grok. |
 | UI looks old | Hard-refresh. The SPA is served by the same process; restart `openbot demo`. |
 | Purge / delete fails | Archive first. Permanent delete is archived-only and body `{ "confirm": "DELETE" }`. |

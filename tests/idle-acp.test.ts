@@ -24,6 +24,7 @@ function withEnv<T>(key: string, value: string | undefined, fn: () => T): T {
 
 describe("acpIdleTtlMs", () => {
   test("defaults, disables at 0, and rejects invalid values", () => {
+    expect(DEFAULT_ACP_IDLE_MS).toBe(7_200_000);
     expect(withEnv("OPENBOT_ACP_IDLE_MS", undefined, acpIdleTtlMs)).toBe(DEFAULT_ACP_IDLE_MS);
     expect(withEnv("OPENBOT_ACP_IDLE_MS", "", acpIdleTtlMs)).toBe(DEFAULT_ACP_IDLE_MS);
     expect(withEnv("OPENBOT_ACP_IDLE_MS", "0", acpIdleTtlMs)).toBe(0);
@@ -102,6 +103,55 @@ describe("idle ACP TTL", () => {
       }
       const pid2 = ctx.engine.runnerFor(session.accountId).acpPid(created.bot.id);
       expect(pid2).toBeTruthy();
+    } finally {
+      server.stop(true);
+      if (prevIdle === undefined) delete process.env.OPENBOT_ACP_IDLE_MS;
+      else process.env.OPENBOT_ACP_IDLE_MS = prevIdle;
+    }
+  });
+
+  test("does not kill a harness that still has a queued turn", async () => {
+    const prevIdle = process.env.OPENBOT_ACP_IDLE_MS;
+    process.env.OPENBOT_ACP_COMMAND = fakeAgentCommand();
+    process.env.OPENBOT_ACP_IDLE_MS = "80";
+    const { ctx, server, origin } = startTestServer({ home: tempHome() });
+    try {
+      const { cookie, session } = loginCookie({ ctx }, "alice");
+      const headers = { cookie, "content-type": "application/json" };
+      const created = (await fetch(`${origin}/v1/bots`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ name: "Ada" }),
+      }).then((r) => r.json())) as { bot: { id: string }; threadId: string };
+      await fetch(`${origin}/v1/credentials/xai`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ key: "xai-idlekey0002" }),
+      });
+      await fetch(`${origin}/v1/threads/${created.threadId}/messages`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ body: "[[send:one]]" }),
+      });
+      const start = Date.now();
+      while (Date.now() - start < 10_000) {
+        const t = ctx.db.get<{ status: string }>(
+          "SELECT status FROM turns WHERE bot_id = ? ORDER BY created_at DESC LIMIT 1",
+          [created.bot.id],
+        );
+        if (t?.status === "completed") break;
+        await Bun.sleep(40);
+      }
+      expect(ctx.engine.runnerFor(session.accountId).acpPid(created.bot.id)).toBeTruthy();
+
+      ctx.db.run(
+        `INSERT INTO turns (id, thread_id, bot_id, status, sent_message_count, assistant_text, created_at)
+         VALUES (?, ?, ?, 'queued', 0, '', ?)`,
+        [id(), created.threadId, created.bot.id, now()],
+      );
+      await Bun.sleep(150);
+      ctx.engine.maintenance();
+      expect(ctx.engine.runnerFor(session.accountId).acpPid(created.bot.id)).toBeTruthy();
     } finally {
       server.stop(true);
       if (prevIdle === undefined) delete process.env.OPENBOT_ACP_IDLE_MS;

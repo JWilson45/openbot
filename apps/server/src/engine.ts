@@ -134,8 +134,14 @@ export class TurnEngine {
 
   reapIdleHarnesses(): void {
     const federationOff = !federationEffective(currentOrgMeta(this.opts.db));
+    const skipBotIds = new Set(this.runningBots);
+    for (const row of this.opts.db.all<{ bot_id: string }>(
+      "SELECT DISTINCT bot_id FROM turns WHERE status IN ('queued', 'running')",
+    )) {
+      skipBotIds.add(row.bot_id);
+    }
     for (const runner of this.runners.values()) {
-      const killed = runner.reapIdle(Date.now(), { federationOff });
+      const killed = runner.reapIdle(Date.now(), { federationOff, skipBotIds });
       for (const botId of killed) {
         this.opts.db.run(
           "UPDATE harness_sessions SET state = 'ended', ended_at = ? WHERE bot_id = ? AND ended_at IS NULL",
@@ -306,7 +312,13 @@ export class TurnEngine {
       bot.permission_mode as "ask" | "auto" | "always-approve",
     );
     let harnessId = turn.harness_session_id;
+    let prevAcpId: string | undefined;
     if (!warm) {
+      prevAcpId =
+        this.opts.db.get<{ acp_session_id: string }>(
+          "SELECT acp_session_id FROM harness_sessions WHERE bot_id = ? AND acp_session_id IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+          [bot.id],
+        )?.acp_session_id || undefined;
       this.opts.db.run(
         "UPDATE harness_sessions SET state = 'ended', ended_at = ? WHERE bot_id = ? AND ended_at IS NULL",
         [now(), bot.id],
@@ -343,9 +355,6 @@ export class TurnEngine {
         WHERE turn_id = ? AND status = 'queued'`,
       [runningAt, turn.id],
     );
-    if (!warm) {
-      appendLiveWork(this.opts.db, turn.id, "harness_session_reset", { reason: "cold_start" });
-    }
     this.opts.onPush(bot.account_id, { type: "turn.updated", turnId: turn.id, status: "running" });
 
     const fakeHarness = Boolean(process.env.OPENBOT_ACP_COMMAND);
@@ -397,7 +406,7 @@ export class TurnEngine {
     runner.harnessSessionId = harnessId;
 
     try {
-      await runner.ensureHarness({
+      const harness = await runner.ensureHarness({
         botId: bot.id,
         env: apiKey ? { XAI_API_KEY: apiKey } : {},
         mcpUrl,
@@ -413,9 +422,10 @@ export class TurnEngine {
         orgSlug: org?.slug,
         idleTtlMs: isGateway ? gatewayAcpIdleTtlMs() : acpIdleTtlMs(),
         omitCdp: isGateway,
+        resumeSessionId: !warm && prevAcpId ? prevAcpId : undefined,
       });
       this.opts.db.run("UPDATE harness_sessions SET acp_session_id = ? WHERE id = ?", [
-        runner.acpSessionId ?? null,
+        harness.acpSessionId ?? null,
         harnessId,
       ]);
 
@@ -431,13 +441,18 @@ export class TurnEngine {
         prompt = `${calendarTurnBlock(this.opts.db, turn.id)}\n\n${prompt}`;
       }
       if (!warm) {
-        const digest = buildThreadDigest(this.opts.db, {
-          threadId: turn.thread_id,
-          botId: bot.id,
-          botName: bot.name,
-          excludeTurnId: turn.id,
-        });
-        prompt = wrapPromptWithDigest(digest, prompt);
+        if (harness.resumed) {
+          appendLiveWork(this.opts.db, turn.id, "harness_session_reset", { reason: "resumed" });
+        } else {
+          appendLiveWork(this.opts.db, turn.id, "harness_session_reset", { reason: "cold_start" });
+          const digest = buildThreadDigest(this.opts.db, {
+            threadId: turn.thread_id,
+            botId: bot.id,
+            botName: bot.name,
+            excludeTurnId: turn.id,
+          });
+          prompt = wrapPromptWithDigest(digest, prompt);
+        }
       }
       const result = await runner.prompt(prompt, bot.id);
       markCalendarPendingAsSend(this.opts.db, turn.id);

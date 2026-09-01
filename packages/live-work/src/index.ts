@@ -38,6 +38,7 @@ export function promote(db: OpenbotDb, turnId: string, cause: PromoteCause): Mes
           origin: "fallback",
           role: "assistant",
           body,
+          fromBotId: turn.bot_id,
         });
         turn.promote_reason =
           cause.kind === "crash"
@@ -78,6 +79,7 @@ export function promote(db: OpenbotDb, turnId: string, cause: PromoteCause): Mes
       ],
     );
 
+    refreshThreadSummary(db, turn.thread_id);
     return inserted;
   });
 }
@@ -129,55 +131,166 @@ export function insertMessage(
   return msg;
 }
 
-const DIGEST_MAX_MESSAGES = 40;
-const DIGEST_MAX_CHARS = 12_000;
+const DIGEST_TAIL_MESSAGES = 20;
 const DIGEST_LINE_MAX = 800;
+const SUMMARY_LINE_MAX = 160;
+const SUMMARY_MAX_CHARS = 4000;
+
+const DIGEST_ORIGIN_SQL = `origin IN ('user', 'send_message', 'fallback', 'agent', 'system', 'thread', 'federation')
+       AND origin NOT IN ('prompt', 'calendar')`;
+
+type DigestMsg = { origin: string; body: string; from_bot_id: string | null };
+
+export function refreshThreadSummary(
+  db: OpenbotDb,
+  threadId: string,
+  opts?: { excludeTurnId?: string },
+): void {
+  const thread = db.get<{ bot_id: string }>("SELECT bot_id FROM threads WHERE id = ?", [threadId]);
+  const botId = thread?.bot_id ?? "";
+  const botName = botId
+    ? (db.get<{ name: string }>("SELECT name FROM bots WHERE id = ?", [botId])?.name ?? "")
+    : "";
+  const names = new Map<string, string>();
+  if (botId) names.set(botId, botName);
+
+  const excludeTurnId = opts?.excludeTurnId;
+  const rows = excludeTurnId
+    ? db.all<DigestMsg & { created_at: number }>(
+        `SELECT origin, body, from_bot_id, created_at FROM messages
+         WHERE thread_id = ?
+           AND ${DIGEST_ORIGIN_SQL}
+           AND (turn_id IS NULL OR turn_id != ?)
+         ORDER BY created_at ASC`,
+        [threadId, excludeTurnId],
+      )
+    : db.all<DigestMsg & { created_at: number }>(
+        `SELECT origin, body, from_bot_id, created_at FROM messages
+         WHERE thread_id = ?
+           AND ${DIGEST_ORIGIN_SQL}
+         ORDER BY created_at ASC`,
+        [threadId],
+      );
+
+  const eligible: Array<DigestMsg & { created_at: number; text: string }> = [];
+  for (const m of rows) {
+    const text = normalizeDigestBody(m.origin, m.body);
+    if (text === null) continue;
+    eligible.push({ ...m, text });
+  }
+
+  let body = "";
+  let through = 0;
+  if (eligible.length > DIGEST_TAIL_MESSAGES) {
+    const older = eligible.slice(0, -DIGEST_TAIL_MESSAGES);
+    through = older[older.length - 1]?.created_at ?? 0;
+    const lines: string[] = [];
+    let used = 0;
+    for (let i = older.length - 1; i >= 0; i--) {
+      const m = older[i]!;
+      const speaker = digestSpeakerStored(db, m, { botId, botName }, names);
+      const clipped = m.text.length > SUMMARY_LINE_MAX ? `${m.text.slice(0, SUMMARY_LINE_MAX)}…` : m.text;
+      const line = `${speaker}: ${clipped}`;
+      if (used + line.length + 1 > SUMMARY_MAX_CHARS) break;
+      lines.push(line);
+      used += line.length + 1;
+    }
+    lines.reverse();
+    body = lines.join("\n");
+  }
+
+  db.run(
+    `INSERT OR REPLACE INTO thread_summaries (thread_id, body, through_created_at, updated_at)
+     VALUES (?, ?, ?, ?)`,
+    [threadId, body, through, now()],
+  );
+}
 
 export function buildThreadDigest(
   db: OpenbotDb,
   opts: { threadId: string; botId: string; botName: string; excludeTurnId: string },
 ): string | null {
-  const rows = db.all<{
-    origin: string;
-    body: string;
-    from_bot_id: string | null;
-  }>(
+  refreshThreadSummary(db, opts.threadId, { excludeTurnId: opts.excludeTurnId });
+  const summary = db.get<{ body: string; through_created_at: number }>(
+    "SELECT body, through_created_at FROM thread_summaries WHERE thread_id = ?",
+    [opts.threadId],
+  );
+  const summaryBody = summary?.body.trim() ?? "";
+  const through = summary?.through_created_at ?? 0;
+
+  const rows = db.all<DigestMsg>(
     `SELECT origin, body, from_bot_id FROM messages
      WHERE thread_id = ?
-       AND origin IN ('user', 'send_message', 'fallback', 'agent', 'system', 'thread', 'federation')
-       AND origin NOT IN ('prompt', 'calendar')
+       AND ${DIGEST_ORIGIN_SQL}
        AND (turn_id IS NULL OR turn_id != ?)
+       AND (? = 0 OR created_at > ?)
      ORDER BY created_at DESC
      LIMIT ?`,
-    [opts.threadId, opts.excludeTurnId, DIGEST_MAX_MESSAGES],
+    [opts.threadId, opts.excludeTurnId, through, through, DIGEST_TAIL_MESSAGES],
   );
   const names = new Map<string, string>();
   names.set(opts.botId, opts.botName);
   const lines: string[] = [];
-  let used = 0;
   for (const m of rows) {
-    const body = m.body.replace(/\s+/g, " ").trim();
-    if (!body) continue;
-    if (m.origin === "system" && /OpenBot restarted/i.test(body)) continue;
+    const text = normalizeDigestBody(m.origin, m.body);
+    if (text === null) continue;
     const speaker = digestSpeaker(db, m, opts, names);
-    const clipped = body.length > DIGEST_LINE_MAX ? `${body.slice(0, DIGEST_LINE_MAX)}…` : body;
-    const line = `${speaker}: ${clipped}`;
-    if (used + line.length + 1 > DIGEST_MAX_CHARS) break;
-    lines.push(line);
-    used += line.length + 1;
+    const clipped = text.length > DIGEST_LINE_MAX ? `${text.slice(0, DIGEST_LINE_MAX)}…` : text;
+    lines.push(`${speaker}: ${clipped}`);
   }
-  if (!lines.length) return null;
   lines.reverse();
-  return [
+  if (!summaryBody && !lines.length) return null;
+
+  const blocks = [
     `ACP session reset. You are still ${opts.botName}, same human, same desk.`,
     "The block below is prior thread you already lived. Treat it as memory.",
     "Do not tell the human this is a new session. Do not say you reconstructed anything. Do not recap unless they ask.",
-    "",
-    ...lines,
-  ].join("\n");
+  ];
+  if (summaryBody) {
+    blocks.push("", "Earlier (summary):", summaryBody);
+  }
+  if (lines.length) {
+    blocks.push("", "Recent:", ...lines);
+  }
+  return blocks.join("\n");
 }
 
-function digestSpeaker(
+function normalizeDigestBody(origin: string, body: string): string | null {
+  const text = body.replace(/\s+/g, " ").trim();
+  if (!text) return null;
+  if (origin === "system" && /OpenBot restarted/i.test(text)) return null;
+  return text;
+}
+
+function botDisplayName(
+  db: OpenbotDb,
+  botId: string,
+  names: Map<string, string>,
+  fallback = "Peer",
+): string {
+  const cached = names.get(botId);
+  if (cached) return cached;
+  const row = db.get<{ name: string }>("SELECT name FROM bots WHERE id = ?", [botId]);
+  const name = row?.name || fallback;
+  names.set(botId, name);
+  return name;
+}
+
+/** Stored summary lines: never "You" (row is shared across bots on the thread). */
+export function digestSpeakerStored(
+  db: OpenbotDb,
+  m: { origin: string; from_bot_id: string | null },
+  opts: { botId: string; botName: string },
+  names: Map<string, string>,
+): string {
+  if (m.origin === "user") return "Human";
+  if (m.origin === "system") return "System";
+  if (m.origin === "federation") return "Org";
+  if (m.from_bot_id) return botDisplayName(db, m.from_bot_id, names, opts.botName || "Peer");
+  return opts.botName || "You";
+}
+
+export function digestSpeaker(
   db: OpenbotDb,
   m: { origin: string; from_bot_id: string | null },
   opts: { botId: string; botName: string },
@@ -187,12 +300,7 @@ function digestSpeaker(
   if (m.origin === "system") return "System";
   if (m.origin === "federation") return "Org";
   if (m.from_bot_id && m.from_bot_id !== opts.botId) {
-    const cached = names.get(m.from_bot_id);
-    if (cached) return cached;
-    const row = db.get<{ name: string }>("SELECT name FROM bots WHERE id = ?", [m.from_bot_id]);
-    const name = row?.name || "Peer";
-    names.set(m.from_bot_id, name);
-    return name;
+    return botDisplayName(db, m.from_bot_id, names);
   }
   return "You";
 }

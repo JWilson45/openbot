@@ -366,9 +366,15 @@ export class AcpClient {
     }
   }
 
-  async newSession(req: EnsureHarnessRequest): Promise<string> {
-    this.lastActivityAt = Date.now();
-    this.assistantText = "";
+  private sessionParams(req: EnsureHarnessRequest): {
+    cwd: string;
+    mcpServers: unknown[];
+    _meta: {
+      autoMode: boolean;
+      yoloMode: boolean;
+      rules: string;
+    };
+  } {
     const mcpServers: unknown[] = [];
     if (this.mcpHttp) {
       mcpServers.push({
@@ -386,25 +392,40 @@ export class AcpClient {
         env: [],
       });
     }
-    const result = await this.request<{ sessionId: string }>(
-      "session/new",
-      {
-        cwd: req.cwd,
-        mcpServers,
-        _meta: {
-          autoMode: req.permissionMode !== "ask",
-          yoloMode: req.permissionMode !== "ask",
-          rules:
-            req.role === "gateway"
-              ? gatewayIdentityRules(req.orgSlug ?? "local", req.orgId ?? "")
-              : deskIdentityRules(req.botName, req.botDescription),
-        },
+    return {
+      cwd: req.cwd,
+      mcpServers,
+      _meta: {
+        autoMode: req.permissionMode !== "ask",
+        yoloMode: req.permissionMode !== "ask",
+        rules:
+          req.role === "gateway"
+            ? gatewayIdentityRules(req.orgSlug ?? "local", req.orgId ?? "")
+            : deskIdentityRules(req.botName, req.botDescription),
       },
-      90_000,
-    );
+    };
+  }
+
+  async newSession(req: EnsureHarnessRequest): Promise<string> {
+    this.lastActivityAt = Date.now();
+    this.assistantText = "";
+    const result = await this.request<{ sessionId: string }>("session/new", this.sessionParams(req), 90_000);
     this.sessionId = result.sessionId;
     this.lastActivityAt = Date.now();
     return result.sessionId;
+  }
+
+  async resumeSession(req: EnsureHarnessRequest, sessionId: string): Promise<string> {
+    this.lastActivityAt = Date.now();
+    this.assistantText = "";
+    const result = await this.request<{ sessionId?: string }>(
+      "session/resume",
+      { sessionId, ...this.sessionParams(req) },
+      90_000,
+    );
+    this.sessionId = result?.sessionId || sessionId;
+    this.lastActivityAt = Date.now();
+    return this.sessionId;
   }
 
   async prompt(text: string): Promise<PromptResult> {

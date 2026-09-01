@@ -5,6 +5,7 @@ import type {
   ComputeContract,
   ComputeDriver,
   EnsureHarnessRequest,
+  EnsureHarnessResult,
   LiveWorkEvent,
   PromptResult,
 } from "@openbot/compute-protocol";
@@ -21,7 +22,7 @@ import { buildChromiumEnv, buildHarnessEnv, chromiumTmpDir, snapshotChildEnv, ty
 import { denyGatewayExec, deskPathGuard } from "./permissions.ts";
 import { wrapSandboxCommand, type SandboxWrap } from "./sandbox.ts";
 
-export const DEFAULT_ACP_IDLE_MS = 10 * 60 * 1000;
+export const DEFAULT_ACP_IDLE_MS = 2 * 60 * 60 * 1000;
 export const DEFAULT_GATEWAY_ACP_IDLE_MS = 30 * 60 * 1000;
 export const BROWSER_SNAPSHOT_MAX_CHARS = 12_000;
 export const BROWSER_VIEWPORT_MIN = { width: 640, height: 400 };
@@ -121,6 +122,7 @@ type AcpSlot = {
   botId: string;
   idleTtlMs: number;
   role: "desk" | "gateway";
+  resumed?: boolean;
 };
 
 type CdpConn = {
@@ -153,6 +155,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   browser: BrowserHandle | null = null;
   harnessSessionId?: string;
   acpSessionId?: string;
+  lastResume = false;
   lastEnv: Record<string, string> = {};
   lastChildEnv: ChildEnvSnapshot | null = null;
   lastSandbox: Pick<SandboxWrap, "backend" | "reason"> | null = null;
@@ -537,8 +540,9 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     }
   }
 
-  reapIdle(now = Date.now(), opts?: { federationOff?: boolean }): string[] {
+  reapIdle(now = Date.now(), opts?: { federationOff?: boolean; skipBotIds?: Iterable<string> }): string[] {
     const killed: string[] = [];
+    const skipBotIds = opts?.skipBotIds ? new Set(opts.skipBotIds) : undefined;
     for (const [botId, slot] of this.acps) {
       const client = slot.client;
       if (client.closed) continue;
@@ -546,6 +550,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
       const federationKill = opts?.federationOff && slot.role === "gateway";
       // Desk OPENBOT_ACP_IDLE_MS=0 disables desk idle kill only.
       if (!federationKill && slot.idleTtlMs === 0) continue;
+      if (!federationKill && skipBotIds?.has(botId)) continue;
       if (!federationKill && client.lastActivityAt + slot.idleTtlMs > now) continue;
       void client.kill();
       this.acps.delete(botId);
@@ -558,7 +563,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     return killed;
   }
 
-  async ensureHarness(req: EnsureHarnessRequest): Promise<void> {
+  async ensureHarness(req: EnsureHarnessRequest): Promise<EnsureHarnessResult> {
     await this.ensure(this.accountId);
     const env = { ...req.env };
     this.lastEnv = { ...env };
@@ -585,14 +590,16 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
       const client = existing!.client;
       existing!.idleTtlMs = idleTtlMs;
       existing!.role = role;
+      existing!.resumed = false;
       client.permissionMode = req.permissionMode;
       client.permissionHandler = permissionHandler;
       this.acp = client;
       this.acpSessionId = client.sessionId;
+      this.lastResume = false;
       this.harness = "idle";
       client.lastActivityAt = Date.now();
       for (const k of Object.keys(this.lastEnv)) this.lastEnv[k] = "";
-      return;
+      return { acpSessionId: client.sessionId ?? undefined, resumed: false };
     }
     this.harness = "starting";
     try {
@@ -629,15 +636,31 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
         permissionHandler,
         onEvent: (ev) => this.onLiveWork?.({ ...ev, botId: req.botId }, req.botId),
       });
-      this.acps.set(req.botId, { client, botId: req.botId, idleTtlMs, role });
+      this.acps.set(req.botId, { client, botId: req.botId, idleTtlMs, role, resumed: false });
       this.acp = client;
       for (const k of Object.keys(env)) {
         delete spawnEnv[k];
       }
       await client.initialize();
       await client.authenticate({ apiKey: Boolean(env.XAI_API_KEY) });
-      this.acpSessionId = await client.newSession(req);
+      let resumed = false;
+      let acpSessionId: string;
+      if (req.resumeSessionId) {
+        try {
+          acpSessionId = await client.resumeSession(req, req.resumeSessionId);
+          resumed = true;
+        } catch {
+          acpSessionId = await client.newSession(req);
+        }
+      } else {
+        acpSessionId = await client.newSession(req);
+      }
+      const slot = this.acps.get(req.botId);
+      if (slot) slot.resumed = resumed;
+      this.acpSessionId = acpSessionId;
+      this.lastResume = resumed;
       this.harness = "idle";
+      return { acpSessionId, resumed };
     } catch (err) {
       this.harness = "crashed";
       throw err;

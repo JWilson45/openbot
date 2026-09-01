@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { OpenbotDb, id, now } from "@openbot/db";
-import { appendLiveWork, buildThreadDigest, parseLivePayload, promote, wrapPromptWithDigest } from "@openbot/live-work";
+import {
+  appendLiveWork,
+  buildThreadDigest,
+  parseLivePayload,
+  promote,
+  refreshThreadSummary,
+  wrapPromptWithDigest,
+} from "@openbot/live-work";
 import { McpError } from "@openbot/api-types";
 import { handleMcpJsonRpc, McpInflight, sendMessage, sendToThread } from "@openbot/mcp-send-message";
 import { insertTurn, seedWorld, tempHome, type World } from "./helpers.ts";
@@ -251,8 +258,10 @@ describe("thread digest", () => {
       botName: "Ada",
       excludeTurnId: current,
     });
+    expect(digest).toContain("Recent:");
     expect(digest).toContain("Human: remember the pineapple");
     expect(digest).toContain("You: pineapple is great");
+    expect(digest).not.toContain("Earlier (summary):");
     expect(digest).not.toContain("what did I say?");
     expect(digest).toContain("Do not tell the human this is a new session");
     const wrapped = wrapPromptWithDigest(digest, "what did I say?");
@@ -303,6 +312,126 @@ describe("thread digest", () => {
     expect(digest).toContain("Bob: bob dm in group");
     expect(digest).toContain("Org: mail from peer org");
     expect(digest).not.toContain("secret prompt clone");
+  });
+
+  test("folds 25 eligible messages into Earlier summary plus Recent tail", () => {
+    const db = openDb();
+    const w = seedWorld(db);
+    const old = insertTurn(db, w, "completed");
+    for (let i = 1; i <= 25; i++) {
+      const body =
+        i === 1 ? "unique-early-phrase-quince" : i === 25 ? "unique-newest-phrase-durian" : `filler-${i}`;
+      db.run(
+        `INSERT INTO messages (id, thread_id, turn_id, role, origin, body, urgency, created_at)
+         VALUES (?, ?, ?, 'user', 'user', ?, 'normal', ?)`,
+        [`m-old-${i}`, w.threadId, old, body, i],
+      );
+    }
+    refreshThreadSummary(db, w.threadId);
+    const current = insertTurn(db, w, "queued");
+    db.run(
+      `INSERT INTO messages (id, thread_id, turn_id, role, origin, body, urgency, created_at)
+       VALUES (?, ?, ?, 'user', 'user', 'unique-current-phrase-currant', 'normal', ?)`,
+      ["m-current", w.threadId, current, 26],
+    );
+    const digest = buildThreadDigest(db, {
+      threadId: w.threadId,
+      botId: w.botId,
+      botName: "Ada",
+      excludeTurnId: current,
+    });
+    expect(digest).toContain("Earlier (summary):");
+    expect(digest).toContain("Recent:");
+    const earlier = digest!.split("Recent:")[0]!;
+    const recent = digest!.split("Recent:")[1]!;
+    expect(earlier).toContain("unique-early-phrase-quince");
+    expect(recent).not.toContain("unique-early-phrase-quince");
+    expect(recent).toContain("unique-newest-phrase-durian");
+    expect(earlier).not.toContain("unique-newest-phrase-durian");
+    expect(digest).not.toContain("unique-current-phrase-currant");
+  });
+
+  test("group summary stores Ada not You when Bob cold-starts", () => {
+    const db = openDb();
+    const w = seedWorld(db);
+    const bobId = insertBot(db, w, "Bob");
+    const groupId = insertGroup(db, w, [w.botId, bobId], "Design");
+    const old = insertTurn(db, w, "completed", { threadId: groupId, botId: w.botId });
+    for (let i = 1; i <= 25; i++) {
+      const body = i === 1 ? "unique-ada-early-kumquat" : `ada-filler-${i}`;
+      db.run(
+        `INSERT INTO messages (id, thread_id, turn_id, role, origin, body, urgency, from_bot_id, created_at)
+         VALUES (?, ?, ?, 'assistant', 'thread', ?, 'normal', ?, ?)`,
+        [`m-ada-${i}`, groupId, old, body, w.botId, i],
+      );
+    }
+    const current = insertTurn(db, w, "queued", { threadId: groupId, botId: bobId });
+    const digest = buildThreadDigest(db, {
+      threadId: groupId,
+      botId: bobId,
+      botName: "Bob",
+      excludeTurnId: current,
+    });
+    const earlier = digest!.split("Recent:")[0]!;
+    expect(earlier).toContain("Ada: unique-ada-early-kumquat");
+    expect(earlier).not.toContain("You: unique-ada-early-kumquat");
+    db.close();
+  });
+
+  test("prompt and calendar origins never appear in digest", () => {
+    const db = openDb();
+    const w = seedWorld(db);
+    const old = insertTurn(db, w, "completed");
+    db.run(
+      `INSERT INTO messages (id, thread_id, turn_id, role, origin, body, urgency, created_at)
+       VALUES (?, ?, ?, 'user', 'user', 'visible pineapple', 'normal', ?)`,
+      ["m-user", w.threadId, old, 1],
+    );
+    db.run(
+      `INSERT INTO messages (id, thread_id, turn_id, role, origin, body, urgency, created_at)
+       VALUES (?, ?, ?, 'user', 'prompt', 'secret prompt clone', 'normal', ?)`,
+      ["m-prompt", w.threadId, old, 2],
+    );
+    db.run(
+      `INSERT INTO messages (id, thread_id, turn_id, role, origin, body, urgency, created_at)
+       VALUES (?, ?, ?, 'user', 'calendar', 'secret calendar fire', 'normal', ?)`,
+      ["m-cal", w.threadId, old, 3],
+    );
+    db.run(
+      `INSERT INTO messages (id, thread_id, turn_id, role, origin, body, urgency, created_at)
+       VALUES (?, ?, ?, 'assistant', 'send_message', 'pineapple is great', 'normal', ?)`,
+      ["m-send", w.threadId, old, 4],
+    );
+    refreshThreadSummary(db, w.threadId);
+    const current = insertTurn(db, w, "queued");
+    const digest = buildThreadDigest(db, {
+      threadId: w.threadId,
+      botId: w.botId,
+      botName: "Ada",
+      excludeTurnId: current,
+    });
+    expect(digest).toContain("visible pineapple");
+    expect(digest).toContain("pineapple is great");
+    expect(digest).not.toContain("secret prompt clone");
+    expect(digest).not.toContain("secret calendar fire");
+    expect(digest).not.toContain("Earlier (summary):");
+  });
+
+  test("promote with send_message writes a thread_summaries row", () => {
+    const db = openDb();
+    const w = seedWorld(db);
+    const turnId = insertTurn(db, w, "running");
+    const inflight = new McpInflight();
+    sendMessage(db, inflight, `Bearer ${w.token}`, { body: "hello from bot" });
+    promote(db, turnId, { kind: "acp_done", telemetrySentMessageCount: 0, assistantText: "leftover" });
+    const row = db.get<{ body: string; through_created_at: number; updated_at: number }>(
+      "SELECT body, through_created_at, updated_at FROM thread_summaries WHERE thread_id = ?",
+      [w.threadId],
+    );
+    expect(row).toBeTruthy();
+    expect(row?.body).toBe("");
+    expect(row?.through_created_at).toBe(0);
+    expect(row?.updated_at).toBeGreaterThan(0);
   });
 });
 

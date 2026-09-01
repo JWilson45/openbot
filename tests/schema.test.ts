@@ -16,6 +16,7 @@ test("schema applies on a fresh sqlite file", () => {
     "threads",
     "turns",
     "messages",
+    "thread_summaries",
     "harness_sessions",
     "mcp_tokens",
     "credentials",
