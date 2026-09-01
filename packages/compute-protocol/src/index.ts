@@ -205,6 +205,8 @@ export interface RunnerSession {
   setCompactCounters(botId: string, turns: number, chars: number): MaybePromise<void>;
   noteSuccessfulPrompt(botId: string, sentChars: number): MaybePromise<{ turns: number; chars: number }>;
   didOverflow(botId: string): MaybePromise<boolean>;
+  droppedSlot(botId: string): MaybePromise<boolean>;
+  takeDroppedSlot(botId: string): MaybePromise<boolean>;
   invalidateAcp(botId: string): MaybePromise<void>;
   kill(botId: string): MaybePromise<void>;
   reapIdle(

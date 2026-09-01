@@ -156,6 +156,12 @@ export class RemoteRunnerClient implements RunnerSession {
   didOverflow(botId: string): Promise<boolean> {
     return this.peer.request("didOverflow", { botId }) as Promise<boolean>;
   }
+  droppedSlot(botId: string): Promise<boolean> {
+    return this.peer.request("droppedSlot", { botId }) as Promise<boolean>;
+  }
+  takeDroppedSlot(botId: string): Promise<boolean> {
+    return this.peer.request("takeDroppedSlot", { botId }) as Promise<boolean>;
+  }
   invalidateAcp(botId: string): Promise<void> {
     return this.peer.request("invalidateAcp", { botId }) as Promise<void>;
   }

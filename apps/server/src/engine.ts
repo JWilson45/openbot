@@ -474,7 +474,7 @@ export class TurnEngine {
     const orgNotes = standingForOverlay(notes.org, this.opts.log);
     const botNotes = standingForOverlay(notes.bot, this.opts.log);
     const currentOverlayHash = overlayHashV1(currentFingerprint, skillNames, orgNotes, botNotes);
-    const hadSlot = await runner.hasWarmBot(bot.id);
+    const hadSlot = (await runner.hasWarmBot(bot.id)) || (await runner.takeDroppedSlot(bot.id));
     const warm = await runner.matchesHarness(bot.id, model, reasoningEffort, permissionMode, currentFingerprint);
     let harnessId = turn.harness_session_id;
     let resumeSessionId: string | undefined;
@@ -764,7 +764,11 @@ export class TurnEngine {
         local?.acpFor(bot.id)?.lastStderr ||
         "";
       const text = (err instanceof Error ? err.message : String(err)) + (stderr ? `\n${stderr.slice(-1500)}` : "");
-      if ((await runner.didOverflow(bot.id)) || overflowErrorText(text)) {
+      if (
+        (await runner.didOverflow(bot.id)) ||
+        (await runner.droppedSlot(bot.id)) ||
+        overflowErrorText(text)
+      ) {
         this.opts.db.run("UPDATE harness_sessions SET acp_session_id = NULL WHERE id = ?", [harnessId]);
       }
       this.opts.db.run("UPDATE turns SET error = ? WHERE id = ?", [text, turn.id]);

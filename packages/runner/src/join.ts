@@ -138,6 +138,10 @@ export async function joinRunner(opts: JoinOpts): Promise<{ stop: () => void; pi
         return local.noteSuccessfulPrompt(String(p.botId ?? ""), Number(p.sentChars ?? 0));
       case "didOverflow":
         return local.didOverflow(String(p.botId ?? ""));
+      case "droppedSlot":
+        return local.droppedSlot(String(p.botId ?? ""));
+      case "takeDroppedSlot":
+        return local.takeDroppedSlot(String(p.botId ?? ""));
       case "invalidateAcp":
         local.invalidateAcp(String(p.botId ?? ""));
         return {};

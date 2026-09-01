@@ -839,6 +839,7 @@ describe("warm compact", () => {
   test("Gateway turn-count compact", async () => {
     const prevTurns = process.env.OPENBOT_ACP_COMPACT_TURNS;
     const prevChars = process.env.OPENBOT_ACP_COMPACT_CHARS;
+    const prevFedHttp = process.env.OPENBOT_FED_ALLOW_HTTP;
     process.env.OPENBOT_ACP_COMPACT_TURNS = "2";
     process.env.OPENBOT_ACP_COMPACT_CHARS = "0";
     process.env.OPENBOT_FED_ALLOW_HTTP = "1";
@@ -885,6 +886,8 @@ describe("warm compact", () => {
       else process.env.OPENBOT_ACP_COMPACT_TURNS = prevTurns;
       if (prevChars === undefined) delete process.env.OPENBOT_ACP_COMPACT_CHARS;
       else process.env.OPENBOT_ACP_COMPACT_CHARS = prevChars;
+      if (prevFedHttp === undefined) delete process.env.OPENBOT_FED_ALLOW_HTTP;
+      else process.env.OPENBOT_FED_ALLOW_HTTP = prevFedHttp;
     }
   });
 });

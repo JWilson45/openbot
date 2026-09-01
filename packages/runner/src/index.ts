@@ -221,6 +221,8 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   onLiveWork?: (ev: LiveWorkEvent, botId?: string) => void;
   permissionHandler?: PermissionHandler;
   uid: number;
+  private droppedSlots = new Set<string>();
+  private overflowDropped = new Set<string>();
 
   constructor(
     public readonly home: string,
@@ -625,7 +627,18 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   }
 
   didOverflow(botId: string): boolean {
-    return Boolean(this.acps.get(botId)?.needsCompact);
+    return Boolean(this.acps.get(botId)?.needsCompact) || this.overflowDropped.has(botId);
+  }
+
+  droppedSlot(botId: string): boolean {
+    return this.droppedSlots.has(botId);
+  }
+
+  /** Consume a prompt() slot drop so the next !warm turn omits resume. */
+  takeDroppedSlot(botId: string): boolean {
+    const hit = this.droppedSlots.delete(botId);
+    this.overflowDropped.delete(botId);
+    return hit;
   }
 
   noteSuccessfulPrompt(botId: string, sentChars: number): { turns: number; chars: number } {
@@ -900,12 +913,16 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
       return result;
     } catch (err) {
       const dump = `${err instanceof Error ? err.message : String(err)}\n${client.lastStderr}`;
-      if (slot && !client.closed && overflowErrorText(dump)) {
+      const overflow = overflowErrorText(dump);
+      // Closed distinguishes kill vs compact, not whether the harness id should be nulled.
+      if (slot && overflow && !client.closed) {
         slot.needsCompact = true;
         this.harness = "idle";
         throw err;
       }
       if (slot) {
+        this.droppedSlots.add(slot.botId);
+        if (overflow) this.overflowDropped.add(slot.botId);
         this.acps.delete(slot.botId);
         if (this.acp === client) {
           this.acp = null;
