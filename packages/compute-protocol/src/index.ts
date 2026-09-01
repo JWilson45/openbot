@@ -69,3 +69,8 @@ export type LiveWorkEvent = {
   payload: Record<string, unknown>;
   botId?: string;
 };
+
+/** ACP session/request_permission decision. `defer` means follow the bot's ask/auto/always-approve setting. */
+export type PermissionDecision = { allow: true } | { allow: false } | { defer: true };
+
+export type PermissionHandler = (req: LiveWorkEvent) => Promise<PermissionDecision>;

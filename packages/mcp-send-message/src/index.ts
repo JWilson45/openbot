@@ -1808,7 +1808,7 @@ export async function handleMcpJsonRpc(
           result: {
             protocolVersion: requested,
             capabilities: { tools: { listChanged: false } },
-            serverInfo: { name: "openbot", version: "0.4.0" },
+            serverInfo: { name: "openbot", version: "0.4.1" },
           },
         },
       };

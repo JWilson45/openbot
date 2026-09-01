@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { denyGatewayExec } from "@openbot/runner";
+import { join } from "node:path";
+import { denyGatewayExec, deskPathGuard, pathIsDenied, resolvePermissionPath } from "@openbot/runner";
+import { grokHomeDir } from "@openbot/acp-grok";
 import { fakeAgentCommand, tempHome } from "./helpers.ts";
 import { loginCookie, startTestServer } from "../apps/server/src/test-helpers.ts";
 
@@ -107,6 +109,106 @@ describe("ACP session/request_permission", () => {
         payload: { toolCall: { kind: "shell" } },
       }),
     ).toEqual({ allow: false });
+  });
+
+  test("deskPathGuard denies vault and operator paths, defers in-desk", async () => {
+    const openbotHome = tempHome();
+    const desk = join(openbotHome, "desk");
+    const grokHome = grokHomeDir(openbotHome);
+    const cwd = join(desk, "projects", "ada");
+    const roots = { desk, grokHome, openbotHome, cwd, operatorHome: "/Users/jason" };
+    expect(
+      await deskPathGuard(
+        { kind: "permission_request", payload: { toolCall: { kind: "read", path: join(openbotHome, "master.key") } } },
+        roots,
+      ),
+    ).toEqual({ allow: false });
+    expect(
+      await deskPathGuard(
+        { kind: "permission_request", payload: { toolCall: { kind: "read", path: "/etc/passwd" } } },
+        roots,
+      ),
+    ).toEqual({ allow: false });
+    expect(
+      await deskPathGuard(
+        { kind: "permission_request", payload: { toolCall: { kind: "read", path: join(cwd, "README.md") } } },
+        roots,
+      ),
+    ).toEqual({ defer: true });
+    expect(
+      await deskPathGuard(
+        { kind: "permission_request", payload: { toolCall: { kind: "execute", title: "run a command" } } },
+        roots,
+      ),
+    ).toEqual({ defer: true });
+    expect(pathIsDenied("/Users/jason/.ssh/id_rsa", roots)).toBe(true);
+    expect(resolvePermissionPath("~/auth.json", cwd, grokHome)).toBe(join(grokHome, "auth.json"));
+  });
+
+  test("auto mode denies master.key without waiting for the human", async () => {
+    const home = tempHome();
+    process.env.OPENBOT_ACP_COMMAND = fakeAgentCommand();
+    const { ctx, server, origin } = startTestServer({ home });
+    const { cookie } = loginCookie({ ctx }, "alice");
+    const headers = { cookie, "content-type": "application/json" };
+    const botRes = await fetch(`${origin}/v1/bots`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name: "Ada" }),
+    });
+    const bot = (await botRes.json()) as { bot: { id: string } };
+    const vault = join(home, "master.key");
+    const thread = (await fetch(`${origin}/v1/threads`, { headers }).then((r) => r.json())) as {
+      thread: { id: string };
+    };
+    const posted = await fetch(`${origin}/v1/threads/${thread.thread.id}/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ body: `[[permission-path:${vault}]] [[send:after-deny]]` }),
+    });
+    expect(posted.status).toBe(202);
+    const { turnId } = (await posted.json()) as { turnId: string };
+    const start = Date.now();
+    while (Date.now() - start < 10_000) {
+      const t = ctx.db.get<{ status: string }>("SELECT status FROM turns WHERE id = ?", [turnId]);
+      if (t?.status === "completed") break;
+      await Bun.sleep(40);
+    }
+    const done = await waitMessages(origin, headers, (m) => m.origin === "send_message" && m.body === "after-deny");
+    expect(done.messages.some((m) => m.body === "after-deny")).toBe(true);
+    const events = (await fetch(`${origin}/v1/turns/${turnId}/live-work`, { headers }).then((r) =>
+      r.json(),
+    )) as { events: Array<{ kind: string }> };
+    expect(events.events.some((e) => e.kind === "permission_request")).toBe(true);
+    expect(bot.bot.id).toBeTruthy();
+    server.stop(true);
+  });
+
+  test("auto mode defers in-desk paths and still completes without a modal", async () => {
+    const home = tempHome();
+    process.env.OPENBOT_ACP_COMMAND = fakeAgentCommand();
+    const { ctx, server, origin } = startTestServer({ home });
+    const { cookie } = loginCookie({ ctx }, "alice");
+    const headers = { cookie, "content-type": "application/json" };
+    const botRes = await fetch(`${origin}/v1/bots`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name: "Ada" }),
+    });
+    const bot = (await botRes.json()) as { bot: { id: string } };
+    const inside = join(home, "desk", "projects", bot.bot.id, "README.md");
+    const thread = (await fetch(`${origin}/v1/threads`, { headers }).then((r) => r.json())) as {
+      thread: { id: string };
+    };
+    const posted = await fetch(`${origin}/v1/threads/${thread.thread.id}/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ body: `[[permission-path:${inside}]] [[send:after-allow]]` }),
+    });
+    expect(posted.status).toBe(202);
+    const done = await waitMessages(origin, headers, (m) => m.origin === "send_message" && m.body === "after-allow");
+    expect(done.messages.some((m) => m.body === "after-allow")).toBe(true);
+    server.stop(true);
   });
 
   test("Gateway auto-denies exec without waiting for the human", async () => {

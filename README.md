@@ -23,7 +23,7 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 - **This is not Google Calendar.** No sync. No invites. Org-local sqlite.
 - **Schedules and learned routines are two products** on the same grid.
 - `$OPENBOT_HOME/desk` is a **shared computer**. It is **not** a security boundary **inside** an org. Every bot on the account can read and write the desk the way you can. There is **one Chromium** for the whole team (**a tab per desk bot**; cookies shared). Cross-org is messages only (hop=1).
-- Vault files (`master.key`, `org.ed25519`, credentials) live **outside** `desk/`. Do not copy secrets into the workspace Grok can see.
+- Vault files (`master.key`, `org.ed25519`, credentials) live **outside** `desk/`. Grok’s `HOME` is `$OPENBOT_HOME/grok-home` (a copy of `~/.grok/auth.json`, not a symlink). ACP tools whose paths resolve outside the desk are denied. Optional `OPENBOT_SANDBOX` (macOS `sandbox-exec` / Linux `bwrap`) is best-effort and off in tests. Same-uid `0600` is not a jail; a dedicated OS user is. Do not copy secrets into the workspace Grok can see.
 - Restarting the server starts a new Grok ACP process. Chat history is in SQLite; OpenBot injects a thread digest on the next turn so the bot continues instead of announcing amnesia.
 - **Federation is off until you turn it on** on **both** sides. OpenBot does not provision Fly Machines.
 
@@ -89,7 +89,7 @@ cd openbot
 bun install
 ```
 
-The CLI is `bun run openbot -- <command>` (or `bun run apps/server/src/cli.ts`). Current version is **0.4.0**. `openbot version` prints `{ openbot, grokPin, grok }`. OpenBot pins **Grok CLI 1.0.5** (warns if missing or older; does not refuse to start).
+The CLI is `bun run openbot -- <command>` (or `bun run apps/server/src/cli.ts`). Current version is **0.4.1**. `openbot version` prints `{ openbot, grokPin, grok }`. OpenBot pins **Grok CLI 1.0.5** (warns if missing or older; does not refuse to start).
 
 Merging to `main` with a **new** `package.json` version creates tag `vX.Y.Z` and publishes GitHub Release binaries. Pull requests run tests. Other branches do not. A version that already has a tag is not re-released.
 
@@ -259,7 +259,7 @@ Control dir is `~/.openbot`. Each org profile is its own data root (`$OPENBOT_HO
 | `allowlist` | GitHub logins, one per line |
 | `desk/` | Shared computer. Chromium profile under `desk/.openbot/chromium`. Gateway cwd `desk/.openbot/gateway/`. |
 | `desk/projects/<botId>/` | That bot's ACP cwd. Purge deletes this folder only. Bots can still `../` into siblings. |
-| `grok-home/` | Isolated Grok config (no user MCP servers). Auth is linked from `~/.grok/auth.json` |
+| `grok-home/` | Isolated Grok config (no user MCP servers) and the Grok child `HOME`. Auth is a **copy** of `~/.grok/auth.json`, refreshed on each `ensureHarness`. |
 
 `--home` / `OPENBOT_HOME` relocate one org's data. Wiping the desk does not delete the sqlite DB or vault. Grok CLI login stays in `~/.grok/auth.json`.
 
@@ -286,16 +286,17 @@ Control dir is `~/.openbot`. Each org profile is its own data root (`$OPENBOT_HO
 | `OPENBOT_DEV_LOGIN` | `1` enables `/auth/local` (loopback only). `demo` sets this. |
 | `OPENBOT_MASTER_KEY` | Override vault master (hex/raw). Prefer the file. |
 | `OPENBOT_ACP_COMMAND` | Replace `grok agent … stdio` (tests / `--fake`) |
+| `OPENBOT_SANDBOX` | Grok-child OS sandbox: `auto` (default; `sandbox-exec` on macOS, `bwrap` on Linux, else none), `none`, `bwrap`, `seatbelt`, `required` (fail the turn if missing). Tests default to `none`. Does not wrap Chromium. |
 | `OPENBOT_CHROME` | Chromium/Chrome binary for takeover |
 | `XAI_API_KEY` | Optional; prefer Settings or `grok login` |
 
 Grok is spawned as:
 
 ```text
-grok agent --no-leader --always-approve --model <id> --reasoning-effort <level> stdio
+grok agent --no-leader [--always-approve] --model <id> --reasoning-effort <level> stdio
 ```
 
-with `GROK_HOME` pointed at `$OPENBOT_HOME/grok-home` and `GROK_CONFIG` overlaying the selected model / effort. User `~/.grok/config.toml` MCP servers are **not** loaded.
+`--always-approve` is passed only when that bot’s permission mode is Always-approve. `HOME` and `GROK_HOME` are `$OPENBOT_HOME/grok-home`. `GROK_CONFIG` overlays the selected model / effort. User `~/.grok/config.toml` MCP servers are **not** loaded. The child env is an allowlist (no `SSH_AUTH_SOCK`, no GitHub OAuth secrets, no MCP token — HTTP MCP uses `session/new` headers).
 
 ---
 
