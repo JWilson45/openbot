@@ -22,6 +22,7 @@ describe("harness spawn env", () => {
         GPG_AGENT_INFO: "secret",
         OPENBOT_GITHUB_CLIENT_SECRET: "oauth",
         LANG: "en_US.UTF-8",
+        OPENBOT_FAKE_RESUME: "1",
       },
     });
     expect(env.HOME).toBe(grokHomeDir(home));
@@ -29,6 +30,7 @@ describe("harness spawn env", () => {
     expect(env.TMPDIR).toBe(grokHomeTmpDir(home));
     expect(env.PATH).toBe("/usr/bin");
     expect(env.LANG).toBe("en_US.UTF-8");
+    expect(env.OPENBOT_FAKE_RESUME).toBe("1");
     expect(env.SSH_AUTH_SOCK).toBeUndefined();
     expect(env.GPG_AGENT_INFO).toBeUndefined();
     expect(env.OPENBOT_GITHUB_CLIENT_SECRET).toBeUndefined();

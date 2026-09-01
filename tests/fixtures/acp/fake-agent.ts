@@ -166,6 +166,25 @@ async function handle(msg: {
     write({ jsonrpc: "2.0", id, result: { sessionId } });
     return;
   }
+  if (method === "session/resume") {
+    const sessionId = String(params.sessionId ?? "");
+    if (process.env.OPENBOT_FAKE_RESUME === "1" && sessionId) {
+      const parsed = parseMcp(params.mcpServers);
+      sessions.set(sessionId, {
+        cwd: String(params.cwd ?? process.cwd()),
+        mcpUrl: parsed.url || process.env.OPENBOT_MCP_URL,
+        mcpToken: parsed.token || process.env.OPENBOT_MCP_TOKEN,
+      });
+      write({ jsonrpc: "2.0", id, result: { sessionId } });
+      return;
+    }
+    write({
+      jsonrpc: "2.0",
+      id,
+      error: { code: -32000, message: "session not found" },
+    });
+    return;
+  }
   if (method === "session/cancel") {
     write({ jsonrpc: "2.0", id, result: {} });
     return;

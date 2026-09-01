@@ -57,6 +57,12 @@ export type EnsureHarnessRequest = {
   orgSlug?: string;
   idleTtlMs?: number;
   omitCdp?: boolean;
+  resumeSessionId?: string;
+};
+
+export type EnsureHarnessResult = {
+  acpSessionId?: string;
+  resumed: boolean;
 };
 
 export type PromptResult = {

@@ -140,6 +140,13 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_thread_created ON messages(thread_id, created_at);
 CREATE INDEX IF NOT EXISTS messages_turn_origin ON messages(turn_id, origin);
 
+CREATE TABLE IF NOT EXISTS thread_summaries (
+  thread_id text PRIMARY KEY REFERENCES threads(id),
+  body text NOT NULL DEFAULT '',
+  through_created_at integer NOT NULL DEFAULT 0,
+  updated_at integer NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS credentials (
   id text PRIMARY KEY,
   account_id text NOT NULL REFERENCES accounts(id),
@@ -674,6 +681,10 @@ export function deleteBotPermanently(db: OpenbotDb, botId: string): void {
     // FK: thread_bridges.local_thread_id → threads(id)
     db.run(
       `DELETE FROM thread_bridges WHERE local_thread_id IN (SELECT id FROM threads WHERE bot_id = ?)`,
+      [botId],
+    );
+    db.run(
+      `DELETE FROM thread_summaries WHERE thread_id IN (SELECT id FROM threads WHERE bot_id = ?)`,
       [botId],
     );
     db.run(`DELETE FROM threads WHERE bot_id = ?`, [botId]);
