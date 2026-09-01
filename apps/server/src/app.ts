@@ -1750,6 +1750,12 @@ export function createApp(cfg: HomeConfig): {
     if (turn.status === "running") {
       await ctx.engine.runnerFor(s.accountId).cancel(turn.bot_id);
       promote(db, turn.id, { kind: "cancel" });
+      const complete = db.get(
+        `SELECT * FROM messages WHERE turn_id = ? AND origin = 'system' AND body LIKE 'A2A complete:%'`,
+        [turn.id],
+      );
+      if (complete) onPush(s.accountId, { type: "message.created", message: complete });
+      onPush(s.accountId, { type: "turn.updated", turnId: turn.id, status: "cancelled" });
       cancelled = true;
     } else if (turn.status === "queued") {
       const complete = db.immediate(() => {

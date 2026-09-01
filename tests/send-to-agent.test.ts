@@ -4,7 +4,7 @@ import { OpenbotDb, id, now, orderedBotPair, sha256Hex } from "@openbot/db";
 import { insertMessage } from "@openbot/live-work";
 import type { A2aCompleteEvent } from "@openbot/api-types";
 import { deskIdentityRules, gatewayIdentityRules } from "@openbot/acp-grok";
-import { handleMcpJsonRpc, McpInflight, persistMcpToken } from "@openbot/mcp-send-message";
+import { handleMcpJsonRpc, McpInflight, persistMcpToken, SEND_TO_AGENT_TOOL } from "@openbot/mcp-send-message";
 import { insertTurn, seedWorld, fakeAgentCommand, tempHome } from "./helpers.ts";
 import { loginCookie, startTestServer } from "../apps/server/src/test-helpers.ts";
 
@@ -133,6 +133,8 @@ describe("SendToAgent overlay", () => {
       expect(rules).toMatch(/Typed errors/i);
       expect(rules).toContain("1:1 handoff");
     }
+    expect(SEND_TO_AGENT_TOOL.description).not.toMatch(/ListBots/);
+    expect(SEND_TO_AGENT_TOOL.description).toContain("CreateBot");
   });
 });
 
@@ -238,6 +240,86 @@ describe("A2A queued cancel and archive", () => {
     expect(ev.code).toBe("cancel");
     expect(ev.status).toBe("cancelled");
     expect(ev.promoteReason).toBeNull();
+    server.stop(true);
+  });
+
+  test("running HTTP cancel onPushes the A2A complete row", async () => {
+    process.env.OPENBOT_ACP_COMMAND = fakeAgentCommand();
+    const { ctx, server, origin } = startTestServer({ home: tempHome() });
+    const { cookie } = loginCookie({ ctx }, "alice");
+    const headers = { cookie, "content-type": "application/json" };
+    const ada = (await fetch(`${origin}/v1/bots`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name: "Ada" }),
+    }).then((r) => r.json())) as { bot: { id: string } };
+    const bob = (await fetch(`${origin}/v1/bots`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name: "Bob" }),
+    }).then((r) => r.json())) as { bot: { id: string } };
+    const accountId = ctx.db.get<{ account_id: string }>("SELECT account_id FROM bots WHERE id = ?", [
+      ada.bot.id,
+    ])!.account_id;
+    const [lo, hi] = orderedBotPair(ada.bot.id, bob.bot.id);
+    const threadId = id();
+    const turnId = id();
+    const t = now();
+    ctx.db.run(
+      `INSERT INTO threads (id, account_id, bot_id, title, kind, peer_bot_id, created_at)
+       VALUES (?, ?, ?, ?, 'a2a', ?, ?)`,
+      [threadId, accountId, lo, `${lo}↔${hi}`, hi, t],
+    );
+    ctx.db.run(
+      `INSERT INTO turns (id, thread_id, bot_id, status, sent_message_count, assistant_text, created_at)
+       VALUES (?, ?, ?, 'running', 0, '', ?)`,
+      [turnId, threadId, bob.bot.id, t],
+    );
+    insertMessage(ctx.db, {
+      threadId,
+      turnId,
+      role: "user",
+      origin: "agent",
+      body: "please draft",
+      fromBotId: ada.bot.id,
+    });
+
+    const pushed: Array<{ type?: string; turnId?: string; message?: { origin?: string; body?: string } }> = [];
+    const ws = new WebSocket(`${origin.replace(/^http/, "ws")}/v1/push`, { headers: { cookie } });
+    await new Promise<void>((resolve, reject) => {
+      ws.addEventListener("open", () => resolve());
+      ws.addEventListener("error", () => reject(new Error("push websocket failed")));
+    });
+    ws.addEventListener("message", (ev) => {
+      pushed.push(JSON.parse(String(ev.data)) as { type?: string; turnId?: string; message?: { origin?: string; body?: string } });
+    });
+
+    const cancelled = await fetch(`${origin}/v1/turns/${turnId}/cancel`, { method: "POST", headers });
+    expect(cancelled.status).toBe(200);
+    const start = Date.now();
+    while (
+      Date.now() - start < 2000 &&
+      !pushed.some((e) => e.message?.body?.startsWith("A2A complete:"))
+    ) {
+      await Bun.sleep(20);
+    }
+    ws.close();
+    const turn = ctx.db.get<{ status: string; promote_reason: string | null }>(
+      "SELECT status, promote_reason FROM turns WHERE id = ?",
+      [turnId],
+    );
+    expect(turn?.status).toBe("cancelled");
+    expect(turn?.promote_reason).toBe("empty_turn");
+    const row = ctx.db.get<{ body: string }>(
+      `SELECT body FROM messages WHERE turn_id = ? AND origin = 'system' AND body LIKE 'A2A complete:%'`,
+      [turnId],
+    );
+    expect(row).toBeTruthy();
+    expect(parseA2aComplete(row!.body).code).toBe("cancel");
+    expect(pushed.some((e) => e.type === "message.created" && e.message?.body?.startsWith("A2A complete:"))).toBe(
+      true,
+    );
+    expect(pushed.some((e) => e.type === "turn.updated" && e.turnId === turnId)).toBe(true);
     server.stop(true);
   });
 
