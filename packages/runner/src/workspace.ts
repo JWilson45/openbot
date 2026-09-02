@@ -37,6 +37,11 @@ export function ensureBotProject(desk: string, botId: string, name: string): str
       `Workspace for bot ${name}. Shared desk is the parent. Not a security boundary.\n`,
     );
   }
+  // Grok 1.0.5 may walk cwd/.grok/skills and bypass the names-only overlay budget.
+  const nativeSkills = join(dir, ".grok", "skills");
+  if (existsSync(nativeSkills)) {
+    rmSync(nativeSkills, { recursive: true, force: true });
+  }
   return dir;
 }
 

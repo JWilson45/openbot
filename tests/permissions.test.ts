@@ -137,6 +137,24 @@ describe("ACP session/request_permission", () => {
     ).toEqual({ defer: true });
     expect(
       await deskPathGuard(
+        {
+          kind: "permission_request",
+          payload: { toolCall: { kind: "read", path: join(desk, "skills", "confirm-series", "SKILL.md") } },
+        },
+        roots,
+      ),
+    ).toEqual({ defer: true });
+    expect(
+      await deskPathGuard(
+        {
+          kind: "permission_request",
+          payload: { toolCall: { kind: "read", path: "/Users/jason/.grok/skills/confirm-series/SKILL.md" } },
+        },
+        roots,
+      ),
+    ).toEqual({ allow: false });
+    expect(
+      await deskPathGuard(
         { kind: "permission_request", payload: { toolCall: { kind: "execute", title: "run a command" } } },
         roots,
       ),

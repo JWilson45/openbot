@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { lstatSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { isolatedGrokConfig, prepareIsolatedGrokHome } from "@openbot/acp-grok";
 import { tempHome } from "./helpers.ts";
@@ -24,6 +24,8 @@ describe("isolated grok home", () => {
     const grokHome = prepareIsolatedGrokHome(openbotHome, userHome);
     const cfg = readFileSync(join(grokHome, "config.toml"), "utf8");
     expect(cfg).toBe(isolatedGrokConfig("auto"));
+    expect(existsSync(join(grokHome, ".grok", "skills"))).toBe(false);
+    expect(cfg).not.toMatch(/^\[skills\]/m);
     expect(cfg).not.toContain("always-approve");
     expect(readFileSync(join(grokHome, "models_cache.json"), "utf8")).toContain("grok-4.6");
     expect(cfg).not.toContain("grafana");

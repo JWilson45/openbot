@@ -108,7 +108,40 @@ export async function joinRunner(opts: JoinOpts): Promise<{ stop: () => void; pi
           p.model as string | undefined,
           p.reasoningEffort as string | undefined,
           p.permissionMode as EnsureHarnessRequest["permissionMode"],
+          typeof p.rosterFp === "string" ? p.rosterFp : "",
         );
+      case "hasWarmBot":
+        return local.hasWarmBot(String(p.botId ?? ""));
+      case "listDeskSkillNames":
+        return local.listDeskSkillNames(typeof p.cap === "number" ? p.cap : undefined);
+      case "lastPromptThread":
+        return local.lastPromptThread(String(p.botId ?? ""));
+      case "markPromptThread":
+        local.markPromptThread(String(p.botId ?? ""), String(p.threadId ?? ""));
+        return {};
+      case "canCompact":
+        return local.canCompact(String(p.botId ?? ""));
+      case "compactReason":
+        return local.compactReason(
+          String(p.botId ?? ""),
+          (p.opts as { threadId?: string; innerBodyChars: number; switched: boolean }) ?? {
+            innerBodyChars: 0,
+            switched: false,
+          },
+        );
+      case "compactSession":
+        return local.compactSession(String(p.botId ?? ""), p.req as EnsureHarnessRequest);
+      case "setCompactCounters":
+        local.setCompactCounters(String(p.botId ?? ""), Number(p.turns ?? 0), Number(p.chars ?? 0));
+        return {};
+      case "noteSuccessfulPrompt":
+        return local.noteSuccessfulPrompt(String(p.botId ?? ""), Number(p.sentChars ?? 0));
+      case "didOverflow":
+        return local.didOverflow(String(p.botId ?? ""));
+      case "droppedSlot":
+        return local.droppedSlot(String(p.botId ?? ""));
+      case "takeDroppedSlot":
+        return local.takeDroppedSlot(String(p.botId ?? ""));
       case "invalidateAcp":
         local.invalidateAcp(String(p.botId ?? ""));
         return {};
@@ -286,7 +319,7 @@ export async function joinRunner(opts: JoinOpts): Promise<{ stop: () => void; pi
     protocol: RUNNER_PROTOCOL,
     hostname: osHostname(),
     platform: process.platform,
-    version: opts.version ?? "0.6.0",
+    version: opts.version ?? "0.7.0",
     grokCliSignedIn: grokCliSignedIn(),
     warmBotIds: [...local.acps.keys()],
     inFlightPromptBotIds: [],

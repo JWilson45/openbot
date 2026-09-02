@@ -57,7 +57,40 @@ export const patchBotInput = z.object({
 export const botSettingsInput = z.object({
   permissionMode: z.enum(["ask", "auto", "always-approve"]).optional(),
   requireHumanApproval: z.boolean().optional(),
+  requireMemoryApproval: z.boolean().optional(),
   harness: z.enum(["grok", "codex"]).optional(),
+});
+
+export const memoryInput = z.object({
+  action: z.enum(["read", "replace", "add", "remove"]),
+  scope: z.enum(["self", "org"]),
+  text: z.string().max(2000).optional(),
+});
+
+export type MemoryInput = z.infer<typeof memoryInput>;
+
+export const searchMessagesInput = z.object({
+  query: z.string().min(1).max(500),
+  threadId: z.string().optional(),
+  limit: z.number().int().min(1).max(20).optional(),
+  since: z.number().int().optional(),
+});
+
+export type SearchMessagesInput = z.infer<typeof searchMessagesInput>;
+
+export const searchThreadsInput = z.object({
+  query: z.string().min(1).max(500),
+  limit: z.number().int().min(1).max(20).optional(),
+});
+
+export type SearchThreadsInput = z.infer<typeof searchThreadsInput>;
+
+export const patchOrgMemoryInput = z.object({
+  org: z.string().max(1200).optional(),
+});
+
+export const patchBotMemoryInput = z.object({
+  body: z.string().max(2000),
 });
 
 export const postMessageInput = z.object({
@@ -239,9 +272,65 @@ export type PromoteCause =
   | { kind: "cancel"; assistantText?: string }
   | { kind: "deadline"; assistantText?: string };
 
+export type A2aCompleteCode =
+  | "ok"
+  | "no_send_message"
+  | "empty_turn"
+  | "crash"
+  | "cancel"
+  | "deadline"
+  | "target_archived";
+
+export type A2aCompleteEvent = {
+  event: "a2a_complete";
+  code: A2aCompleteCode;
+  status: string;
+  from: string;
+  fromBotId: string;
+  toBotId: string;
+  turnId: string;
+  sentMessage: boolean;
+  promoteReason: string | null;
+};
+
+export type McpErrorCode =
+  | "unauthorized"
+  | "rate_limited"
+  | "no_active_turn"
+  | "no_human_thread"
+  | "not_found"
+  | "bad_request"
+  | "forbidden"
+  | "target_busy"
+  | "target_archived"
+  | "runtime_offline"
+  | "unsafe_memory"
+  | "federation_off"
+  | "conflict"
+  | "no_forward"
+  | "no_org_key"
+  | "timeout"
+  | "outbound_failed"
+  | "peer_error"
+  | "unknown_tool"
+  | "reserved_name"
+  | "cap"
+  | "duplicate_name"
+  | "invalid_assignee"
+  | "invalid_thread"
+  | "invalid_timezone"
+  | "invalid_rrule"
+  | "invalid_dtstart"
+  | "unsupported_rrule"
+  | "min_interval"
+  | "cancelled"
+  | "not_active"
+  | "not_paused"
+  | "not_proposed";
+
 export class McpError extends Error {
   constructor(
-    public readonly code: string,
+    public readonly code: McpErrorCode,
     message: string,
     public readonly httpStatus = 409,
   ) {

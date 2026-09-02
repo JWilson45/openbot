@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   OpenbotDb,
@@ -10,6 +11,7 @@ import {
   sha256Hex,
 } from "@openbot/db";
 import { persistMcpToken } from "@openbot/mcp-send-message";
+import { deleteBotProject, ensureBotProject, ensureDeskSkills } from "@openbot/runner";
 import { seedWorld, tempHome } from "./helpers.ts";
 
 function openDb() {
@@ -137,9 +139,25 @@ describe("deleteBotPermanently", () => {
 
     const { a2aId, keepA2aTurn } = graph(db, w.botId, peer.botId, peer.threadId, peer.harnessSessionId);
 
+    db.run(
+      `INSERT INTO memory_notes (id, account_id, scope, bot_id, body, updated_by, updated_at, created_at)
+       VALUES (?, ?, 'bot', ?, 'bot-note', 'human', ?, ?)`,
+      [id(), w.accountId, w.botId, now(), now()],
+    );
+    db.run(
+      `INSERT INTO memory_notes (id, account_id, scope, bot_id, body, updated_by, updated_at, created_at)
+       VALUES (?, ?, 'org', NULL, 'org-note', 'human', ?, ?)`,
+      [id(), w.accountId, now(), now()],
+    );
+
     deleteBotPermanently(db, w.botId);
 
     expect(db.get("SELECT id FROM bots WHERE id = ?", [w.botId])).toBeNull();
+    expect(db.get("SELECT id FROM memory_notes WHERE bot_id = ?", [w.botId])).toBeNull();
+    expect(
+      db.get<{ body: string }>("SELECT body FROM memory_notes WHERE account_id = ? AND scope = 'org'", [w.accountId])
+        ?.body,
+    ).toBe("org-note");
     expect(db.get<{ id: string }>("SELECT id FROM bots WHERE id = ?", [peer.botId])?.id).toBe(peer.botId);
     expect(db.get("SELECT id FROM threads WHERE bot_id = ?", [w.botId])).toBeNull();
     expect(db.get("SELECT id FROM turns WHERE bot_id = ?", [w.botId])).toBeNull();
@@ -320,5 +338,20 @@ describe("deleteBotPermanently", () => {
     expect(db.get<{ status: string }>("SELECT status FROM calendar_series WHERE id = ?", [pausedId])?.status).toBe(
       "paused",
     );
+  });
+});
+
+describe("desk skills survive bot delete", () => {
+  test("deleteBotProject does not touch desk/skills", () => {
+    const desk = join(tempHome(), "desk");
+    ensureDeskSkills(desk);
+    const botId = "11111111-1111-4111-8111-111111111111";
+    ensureBotProject(desk, botId, "Ada");
+    const confirm = join(desk, "skills", "confirm-series", "SKILL.md");
+    expect(existsSync(confirm)).toBe(true);
+    deleteBotProject(desk, botId);
+    expect(existsSync(join(desk, "projects", botId))).toBe(false);
+    expect(existsSync(confirm)).toBe(true);
+    expect(existsSync(join(desk, "skills", "shared-chromium", "SKILL.md"))).toBe(true);
   });
 });

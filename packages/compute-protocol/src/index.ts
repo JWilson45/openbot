@@ -41,6 +41,11 @@ export interface ComputeDriver {
   wipeDesk(id: string): Promise<void>;
 }
 
+export type OverlayRoster = {
+  desks: Array<{ name: string; description: string }>;
+  gateway?: { name: string; description: string } | null;
+};
+
 export type EnsureHarnessRequest = {
   botId: string;
   env: Record<string, string>;
@@ -58,12 +63,19 @@ export type EnsureHarnessRequest = {
   idleTtlMs?: number;
   omitCdp?: boolean;
   resumeSessionId?: string;
+  roster?: OverlayRoster;
+  /** Desk only. Engine lists; ensureHarness must not re-scan. */
+  skillNames?: string[];
+  orgNotes?: string;
+  botNotes?: string;
 };
 
 export type EnsureHarnessResult = {
   acpSessionId?: string;
   resumed: boolean;
 };
+
+export type CompactReason = "turns" | "chars" | "thread" | "overflow";
 
 export type PromptResult = {
   stopReason: string;
@@ -175,7 +187,26 @@ export interface RunnerSession {
     model?: string,
     reasoningEffort?: string,
     permissionMode?: EnsureHarnessRequest["permissionMode"],
+    rosterFp?: string,
   ): MaybePromise<boolean>;
+  hasWarmBot(botId: string): MaybePromise<boolean>;
+  listDeskSkillNames(cap?: number): MaybePromise<string[]>;
+  lastPromptThread(botId: string): MaybePromise<string | null>;
+  markPromptThread(botId: string, threadId: string): MaybePromise<void>;
+  canCompact(botId: string): MaybePromise<boolean>;
+  compactReason(
+    botId: string,
+    opts: { threadId?: string; innerBodyChars: number; switched: boolean },
+  ): MaybePromise<CompactReason | null>;
+  compactSession(
+    botId: string,
+    req: EnsureHarnessRequest,
+  ): Promise<EnsureHarnessResult & { compacted: boolean; fallback?: "respawn" }>;
+  setCompactCounters(botId: string, turns: number, chars: number): MaybePromise<void>;
+  noteSuccessfulPrompt(botId: string, sentChars: number): MaybePromise<{ turns: number; chars: number }>;
+  didOverflow(botId: string): MaybePromise<boolean>;
+  droppedSlot(botId: string): MaybePromise<boolean>;
+  takeDroppedSlot(botId: string): MaybePromise<boolean>;
   invalidateAcp(botId: string): MaybePromise<void>;
   kill(botId: string): MaybePromise<void>;
   reapIdle(

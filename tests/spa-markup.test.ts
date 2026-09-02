@@ -165,6 +165,17 @@ describe("desk SPA markup", () => {
     expect(js).toContain("Desk browser");
     expect(js).toContain("retargetSkip");
     expect(html).toContain('href="#app"');
+    expect(js).toContain('id="mem-approve"');
+    expect(js).toContain("Require approval for Memory writes");
+    expect(js).toContain("Standing notes");
+    expect(js).toContain('id="org-notes"');
+    expect(js).toContain('id="bot-notes"');
+    expect(js).toContain("kills the child");
+    expect(js).toContain("if it is not in a turn");
+    expect(js).toContain("Memory.read");
+    expect(js).toContain("sees sqlite now");
+    expect(js).toContain("/v1/memory");
+    expect(js).toContain("requireMemoryApproval");
 
     const toggleSrc = extractFn(js, "toggleDebug");
     expect(toggleSrc).not.toContain("renderApp");

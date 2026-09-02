@@ -14,7 +14,9 @@ export function isolatedGrokConfig(mode: GrokPermissionMode = "auto"): string {
       : mode === "ask"
         ? 'permission_mode = "ask"\n'
         : "";
+  // HOME=grok-home hides operator ~/.grok/skills. Native skill scanner stays off.
   return `# Managed by OpenBot. Does not replace ~/.grok/config.toml for the TUI.
+# Operator ~/.grok/skills are not visible (HOME=grok-home). Native skill scanner stays off.
 [ui]
 yolo = ${yolo}
 ${perm}[cli]

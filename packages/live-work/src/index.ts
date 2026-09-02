@@ -1,5 +1,5 @@
 import { id, now, type MessageRow, type OpenbotDb, type TurnRow } from "@openbot/db";
-import type { PromoteCause } from "@openbot/api-types";
+import type { A2aCompleteCode, A2aCompleteEvent, PromoteCause } from "@openbot/api-types";
 
 const ASSISTANT_CAP = 256 * 1024;
 
@@ -79,8 +79,99 @@ export function promote(db: OpenbotDb, turnId: string, cause: PromoteCause): Mes
       ],
     );
 
+    notifyA2aSender(db, turn.id, a2aCodeFromPromote(cause, hasSend, turn.promote_reason));
     refreshThreadSummary(db, turn.thread_id);
     return inserted;
+  });
+}
+
+function a2aCodeFromPromote(
+  cause: PromoteCause,
+  hasSend: boolean,
+  promoteReason: string | null,
+): A2aCompleteCode {
+  if (cause.kind === "crash") return "crash";
+  if (cause.kind === "cancel") return "cancel";
+  if (cause.kind === "deadline") return "deadline";
+  if (hasSend) return "ok";
+  if (promoteReason === "empty_turn") return "empty_turn";
+  return "no_send_message";
+}
+
+function turnHasSend(db: OpenbotDb, turn: TurnRow): boolean {
+  const sendRows = db.get<{ n: number }>(
+    "SELECT COUNT(*) as n FROM messages WHERE turn_id = ? AND origin = 'send_message'",
+    [turn.id],
+  );
+  const pendingRows = db.get<{ n: number }>(
+    "SELECT COUNT(*) as n FROM messages WHERE turn_id = ? AND origin = 'pending_approval'",
+    [turn.id],
+  );
+  return turn.sent_message_count > 0 || (sendRows?.n ?? 0) > 0 || (pendingRows?.n ?? 0) > 0;
+}
+
+/** Assumes an open writer — OpenbotDb.immediate is not reentrant. */
+export function notifyA2aSender(
+  db: OpenbotDb,
+  turnId: string,
+  code?: A2aCompleteCode,
+): MessageRow | null {
+  const turn = db.get<TurnRow>("SELECT * FROM turns WHERE id = ?", [turnId]);
+  if (!turn) return null;
+  const thread = db.get<{ kind: string }>("SELECT kind FROM threads WHERE id = ?", [turn.thread_id]);
+  if (!thread || thread.kind !== "a2a") return null;
+
+  const existing = db.get(
+    `SELECT id FROM messages
+     WHERE turn_id = ? AND origin = 'system' AND body LIKE 'A2A complete:%'
+     LIMIT 1`,
+    [turnId],
+  );
+  if (existing) return null;
+
+  const inbound = db.get<{ from_bot_id: string | null }>(
+    `SELECT from_bot_id FROM messages
+     WHERE turn_id = ? AND origin = 'agent' AND role = 'user'
+     LIMIT 1`,
+    [turnId],
+  );
+  if (!inbound?.from_bot_id) return null;
+
+  const finishing = db.get<{ name: string }>("SELECT name FROM bots WHERE id = ?", [turn.bot_id]);
+  const fromName = finishing?.name || "bot";
+  const sentMessage = turnHasSend(db, turn);
+  const resolved =
+    code ??
+    (turn.promote_reason === "crash" ||
+    turn.promote_reason === "cancel" ||
+    turn.promote_reason === "deadline" ||
+    turn.promote_reason === "empty_turn" ||
+    turn.promote_reason === "no_send_message"
+      ? turn.promote_reason
+      : turn.status === "cancelled"
+        ? "cancel"
+        : sentMessage
+          ? "ok"
+          : "empty_turn");
+
+  const payload: A2aCompleteEvent = {
+    event: "a2a_complete",
+    code: resolved,
+    status: turn.status,
+    from: fromName,
+    fromBotId: turn.bot_id,
+    toBotId: inbound.from_bot_id,
+    turnId: turn.id,
+    sentMessage,
+    promoteReason: turn.promote_reason,
+  };
+  return insertMessage(db, {
+    threadId: turn.thread_id,
+    turnId: turn.id,
+    role: "system",
+    origin: "system",
+    body: `A2A complete: ${fromName} finished (${turn.status}).\n${JSON.stringify(payload)}`,
+    fromBotId: turn.bot_id,
   });
 }
 
@@ -206,10 +297,12 @@ export function refreshThreadSummary(
   );
 }
 
-export function buildThreadDigest(
+export type ThreadDigestKind = "cold_start" | "thread_switch";
+
+export function buildThreadMemory(
   db: OpenbotDb,
   opts: { threadId: string; botId: string; botName: string; excludeTurnId: string },
-): string | null {
+): { summary: string; tailLines: string[] } {
   refreshThreadSummary(db, opts.threadId, { excludeTurnId: opts.excludeTurnId });
   const summary = db.get<{ body: string; through_created_at: number }>(
     "SELECT body, through_created_at FROM thread_summaries WHERE thread_id = ?",
@@ -239,20 +332,51 @@ export function buildThreadDigest(
     lines.push(`${speaker}: ${clipped}`);
   }
   lines.reverse();
-  if (!summaryBody && !lines.length) return null;
+  return { summary: summaryBody, tailLines: lines };
+}
 
-  const blocks = [
-    `ACP session reset. You are still ${opts.botName}, same human, same desk.`,
-    "The block below is prior thread you already lived. Treat it as memory.",
-    "Do not tell the human this is a new session. Do not say you reconstructed anything. Do not recap unless they ask.",
-  ];
-  if (summaryBody) {
-    blocks.push("", "Earlier (summary):", summaryBody);
+export function formatThreadDigest(opts: {
+  kind: ThreadDigestKind;
+  botName: string;
+  threadLabel: string;
+  memory: { summary: string; tailLines: string[] };
+}): string | null {
+  const summary = opts.memory.summary.trim();
+  const lines = opts.memory.tailLines;
+  if (opts.kind === "cold_start" && !summary && !lines.length) return null;
+
+  const blocks =
+    opts.kind === "thread_switch"
+      ? [
+          `You are now on a different thread: ${opts.threadLabel}.`,
+          "Ignore other threads' last turns. Do not mix them into this reply. Do not mention them unless the human asks.",
+          "The block below is prior messages on THIS thread only. Treat it as memory for this thread.",
+          "Do not tell the human this is a new session. Do not say you reconstructed anything. Do not recap unless they ask.",
+        ]
+      : [
+          `ACP session reset. You are still ${opts.botName}, same human, same desk.`,
+          "The block below is prior thread you already lived. Treat it as memory.",
+          "Do not tell the human this is a new session. Do not say you reconstructed anything. Do not recap unless they ask.",
+        ];
+  if (summary) {
+    blocks.push("", "Earlier (summary):", summary);
   }
   if (lines.length) {
     blocks.push("", "Recent:", ...lines);
   }
   return blocks.join("\n");
+}
+
+export function buildThreadDigest(
+  db: OpenbotDb,
+  opts: { threadId: string; botId: string; botName: string; excludeTurnId: string },
+): string | null {
+  return formatThreadDigest({
+    kind: "cold_start",
+    botName: opts.botName,
+    threadLabel: "",
+    memory: buildThreadMemory(db, opts),
+  });
 }
 
 function normalizeDigestBody(origin: string, body: string): string | null {
@@ -368,7 +492,10 @@ export function summarizeLiveEvent(kind: string, payload: unknown): string | nul
   }
   if (kind === "user_message_chunk") return "Reading your message";
   if (kind === "permission_request") return "Needs permission";
-  if (kind === "harness_session_reset") return "Harness restarted";
+  if (kind === "harness_session_reset") {
+    return p.reason === "compacted" ? "Context refreshed" : "Harness restarted";
+  }
+  if (kind === "thread_switch") return "Switched thread";
   if (kind === "acp_notify") {
     const method = String(p.method ?? "");
     if (method.includes("prompt_complete")) return "Turn finished";

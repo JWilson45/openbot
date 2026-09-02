@@ -2,6 +2,33 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { materializeHorizon } from "@openbot/calendar";
+import { FTS_SCHEMA } from "./memory.ts";
+
+export {
+  ORG_NOTES_MAX,
+  BOT_NOTES_MAX,
+  MEMORY_WRITE_PER_TURN,
+  MEMORY_WRITE_PER_HOUR,
+  SEARCH_PER_TURN,
+  SEARCH_SNIPPET_MAX,
+  SEARCH_LIMIT_DEFAULT,
+  SEARCH_LIMIT_MAX,
+  MemoryTextError,
+  scanMemoryText,
+  assertMemoryText,
+  ftsMatchQuery,
+  ensureOrgNotes,
+  ensureBotNotes,
+  readNotes,
+  applyMemoryWrite,
+  approvePendingMemory,
+  rejectPendingMemory,
+  listAccountMemory,
+  FTS_SCHEMA,
+  type MemoryScope,
+  type MemoryNoteRow,
+  type MemoryWriteAction,
+} from "./memory.ts";
 
 export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
@@ -146,6 +173,23 @@ CREATE TABLE IF NOT EXISTS thread_summaries (
   through_created_at integer NOT NULL DEFAULT 0,
   updated_at integer NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS memory_notes (
+  id text PRIMARY KEY,
+  account_id text NOT NULL REFERENCES accounts(id),
+  scope text NOT NULL,
+  bot_id text REFERENCES bots(id),
+  body text NOT NULL DEFAULT '',
+  pending_body text,
+  updated_by text NOT NULL DEFAULT 'human',
+  source_turn_id text REFERENCES turns(id) ON DELETE SET NULL,
+  updated_at integer NOT NULL,
+  created_at integer NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS memory_notes_org
+  ON memory_notes(account_id) WHERE scope = 'org';
+CREATE UNIQUE INDEX IF NOT EXISTS memory_notes_bot
+  ON memory_notes(bot_id) WHERE scope = 'bot' AND bot_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS credentials (
   id text PRIMARY KEY,
@@ -383,6 +427,13 @@ export class OpenbotDb {
     this.ensureColumn("org_meta", "timezone", "text NOT NULL DEFAULT 'UTC'");
     this.ensureColumn("messages", "remote_org_id", "text");
     this.ensureColumn("messages", "remote_actor_name", "text");
+    this.ensureColumn("harness_sessions", "roster_fingerprint", "text");
+    this.ensureColumn("harness_sessions", "overlay_hash", "text");
+    this.ensureColumn("harness_sessions", "compact_turns", "integer NOT NULL DEFAULT 0");
+    this.ensureColumn("harness_sessions", "compact_chars", "integer NOT NULL DEFAULT 0");
+    this.ensureColumn("bots", "require_memory_approval", "integer NOT NULL DEFAULT 0");
+    this.raw.exec(FTS_SCHEMA);
+    this.backfillFts();
     this.raw.exec(
       "UPDATE bots SET archived_at = created_at WHERE status = 'archived' AND archived_at IS NULL",
     );
@@ -404,6 +455,26 @@ export class OpenbotDb {
     const cols = this.all<{ name: string }>(`PRAGMA table_info(${table})`);
     if (cols.some((c) => c.name === column)) return;
     this.raw.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+  }
+
+  private backfillFts(): void {
+    const msgN = this.get<{ n: number }>("SELECT COUNT(*) AS n FROM messages_fts")?.n ?? 0;
+    if (msgN === 0) {
+      this.raw.exec(`
+        INSERT INTO messages_fts(body, message_id, thread_id, account_id, origin, created_at)
+        SELECT m.body, m.id, m.thread_id, th.account_id, m.origin, m.created_at
+        FROM messages m
+        JOIN threads th ON th.id = m.thread_id
+        WHERE m.origin NOT IN ('prompt', 'calendar')
+      `);
+    }
+    const thN = this.get<{ n: number }>("SELECT COUNT(*) AS n FROM threads_fts")?.n ?? 0;
+    if (thN === 0) {
+      this.raw.exec(`
+        INSERT INTO threads_fts(title, thread_id, account_id, kind)
+        SELECT title, id, account_id, kind FROM threads
+      `);
+    }
   }
 
   close(): void {
@@ -715,6 +786,7 @@ export function deleteBotPermanently(db: OpenbotDb, botId: string): void {
       [botId],
     );
     db.run(`DELETE FROM threads WHERE bot_id = ?`, [botId]);
+    db.run(`DELETE FROM memory_notes WHERE bot_id = ?`, [botId]);
     db.run(`DELETE FROM bots WHERE id = ?`, [botId]);
   });
 }

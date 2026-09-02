@@ -16,14 +16,18 @@ import {
   defaultCommand,
   grokHomeDir,
   prepareIsolatedGrokHome,
+  rosterFingerprint,
 } from "@openbot/acp-grok";
 import { botProjectDir, deleteBotProject, ensureBotProject, ensureGatewayWorkspace } from "./workspace.ts";
 import { buildChromiumEnv, buildHarnessEnv, chromiumTmpDir, snapshotChildEnv, type ChildEnvSnapshot } from "./harness-env.ts";
 import { denyGatewayExec, deskPathGuard } from "./permissions.ts";
 import { wrapSandboxCommand, type SandboxWrap } from "./sandbox.ts";
+import { DESK_SKILL_NAME_CAP, ensureDeskSkills, listDeskSkillNames as scanDeskSkillNames } from "./desk-skills.ts";
 
 export const DEFAULT_ACP_IDLE_MS = 2 * 60 * 60 * 1000;
 export const DEFAULT_GATEWAY_ACP_IDLE_MS = 30 * 60 * 1000;
+export const DEFAULT_ACP_COMPACT_TURNS = 20;
+export const DEFAULT_ACP_COMPACT_CHARS = 48_000;
 export const BROWSER_SNAPSHOT_MAX_CHARS = 12_000;
 export const BROWSER_VIEWPORT_MIN = { width: 640, height: 400 };
 export const BROWSER_VIEWPORT_MAX = { width: 2560, height: 1440 };
@@ -117,12 +121,60 @@ export function gatewayAcpIdleTtlMs(): number {
   return envTtlMs(process.env.OPENBOT_GATEWAY_ACP_IDLE_MS, DEFAULT_GATEWAY_ACP_IDLE_MS);
 }
 
+export function acpCompactTurns(): number {
+  return envTtlMs(process.env.OPENBOT_ACP_COMPACT_TURNS, DEFAULT_ACP_COMPACT_TURNS);
+}
+
+export function acpCompactChars(): number {
+  return envTtlMs(process.env.OPENBOT_ACP_COMPACT_CHARS, DEFAULT_ACP_COMPACT_CHARS);
+}
+
+export function acpCompactOnSwitch(): boolean {
+  return envTtlMs(process.env.OPENBOT_ACP_COMPACT_ON_SWITCH, 0) === 1;
+}
+
+/** "explicit" is a compactSession() caller, not a compactReason() return. */
+export type CompactReason = "turns" | "chars" | "thread" | "overflow";
+
+export function overflowStopReason(reason: string): boolean {
+  return /max_tokens|max_length|context_length|overflow/i.test(reason);
+}
+
+export function overflowErrorText(text: string): boolean {
+  return /context length|context window|prompt too long|maximum context/i.test(text);
+}
+
+function usageOccupancy(payload: Record<string, unknown>): number | undefined {
+  const nodes: unknown[] = [payload, payload.update, payload.usage];
+  const update = payload.update;
+  if (update && typeof update === "object") nodes.push((update as Record<string, unknown>).usage);
+  for (const node of nodes) {
+    if (!node || typeof node !== "object") continue;
+    const rec = node as Record<string, unknown>;
+    const used = Number(rec.used ?? rec.input_tokens ?? rec.prompt_tokens ?? rec.tokens ?? rec.occupied);
+    const max = Number(rec.total ?? rec.max_tokens ?? rec.context_window ?? rec.limit ?? rec.max);
+    if (Number.isFinite(used) && Number.isFinite(max) && max > 0) return used / max;
+    const occ = Number(rec.occupancy ?? rec.percent);
+    if (Number.isFinite(occ)) return occ > 1 ? occ / 100 : occ;
+  }
+  return undefined;
+}
+
 type AcpSlot = {
   client: AcpClient;
   botId: string;
   idleTtlMs: number;
   role: "desk" | "gateway";
   resumed?: boolean;
+  /** True while this client is inside prompt(). Per-slot; not runner.harness. */
+  inTurn?: boolean;
+  /** Compared in matchesHarness. Warm overlay is this fingerprint. */
+  rosterFingerprint: string;
+  /** Last thread this child session/prompt'd. Cleared on kill/spawn. Compact resets then re-marks. */
+  lastThreadId?: string;
+  turnsSinceCompact: number;
+  promptChars: number;
+  needsCompact?: boolean;
 };
 
 type CdpConn = {
@@ -169,6 +221,8 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   onLiveWork?: (ev: LiveWorkEvent, botId?: string) => void;
   permissionHandler?: PermissionHandler;
   uid: number;
+  private droppedSlots = new Set<string>();
+  private overflowDropped = new Set<string>();
 
   constructor(
     public readonly home: string,
@@ -208,11 +262,17 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   async ensure(_accountId: string): Promise<{ id: string; workspacePath: string }> {
     mkdirSync(join(this.desk, "projects"), { recursive: true });
     mkdirSync(join(this.desk, ".openbot", "chromium"), { recursive: true });
+    ensureDeskSkills(this.desk);
     writeFileSync(
       join(this.desk, ".openbot", "runner-state.json"),
       JSON.stringify({ driver: "localhost", updatedAt: Date.now() }),
     );
     return { id: this.accountId, workspacePath: this.desk };
+  }
+
+  /** ASCII-sorted kebab names; cap after sort. Does not seed. */
+  listDeskSkillNames(cap = DESK_SKILL_NAME_CAP): string[] {
+    return scanDeskSkillNames(this.desk, cap);
   }
 
   async describe(): Promise<{
@@ -517,8 +577,124 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     return this.acps.get(botId)?.client ?? null;
   }
 
+  hasWarmBot(botId: string): boolean {
+    return this.acps.has(botId);
+  }
+
   acpPid(botId: string): number | undefined {
     return this.acps.get(botId)?.client.pid;
+  }
+
+  lastPromptThread(botId: string): string | null {
+    return this.acps.get(botId)?.lastThreadId ?? null;
+  }
+
+  markPromptThread(botId: string, threadId: string): void {
+    const slot = this.acps.get(botId);
+    if (slot) slot.lastThreadId = threadId;
+  }
+
+  canCompact(botId: string): boolean {
+    const slot = this.acps.get(botId);
+    return Boolean(slot && !slot.client.closed && slot.client.sessionId && !slot.inTurn);
+  }
+
+  compactReason(
+    botId: string,
+    opts: { threadId?: string; innerBodyChars: number; switched: boolean },
+  ): CompactReason | null {
+    const slot = this.acps.get(botId);
+    if (!slot) return null;
+    if (slot.needsCompact) return "overflow";
+    if (acpCompactOnSwitch() && opts.switched) return "thread";
+    const charLimit = acpCompactChars();
+    if (charLimit > 0 && slot.promptChars + opts.innerBodyChars >= charLimit) return "chars";
+    const turnLimit = acpCompactTurns();
+    if (turnLimit > 0 && slot.turnsSinceCompact >= turnLimit) return "turns";
+    return null;
+  }
+
+  compactCounters(botId: string): { turns: number; chars: number } {
+    const slot = this.acps.get(botId);
+    return { turns: slot?.turnsSinceCompact ?? 0, chars: slot?.promptChars ?? 0 };
+  }
+
+  setCompactCounters(botId: string, turns: number, chars: number): void {
+    const slot = this.acps.get(botId);
+    if (!slot) return;
+    slot.turnsSinceCompact = turns;
+    slot.promptChars = chars;
+  }
+
+  didOverflow(botId: string): boolean {
+    return Boolean(this.acps.get(botId)?.needsCompact) || this.overflowDropped.has(botId);
+  }
+
+  droppedSlot(botId: string): boolean {
+    return this.droppedSlots.has(botId);
+  }
+
+  /** Consume a prompt() slot drop so the next !warm turn omits resume. */
+  takeDroppedSlot(botId: string): boolean {
+    const hit = this.droppedSlots.delete(botId);
+    this.overflowDropped.delete(botId);
+    return hit;
+  }
+
+  noteSuccessfulPrompt(botId: string, sentChars: number): { turns: number; chars: number } {
+    const slot = this.acps.get(botId);
+    if (!slot) return { turns: 0, chars: 0 };
+    slot.turnsSinceCompact += 1;
+    slot.promptChars += sentChars;
+    return { turns: slot.turnsSinceCompact, chars: slot.promptChars };
+  }
+
+  async compactSession(
+    botId: string,
+    req: EnsureHarnessRequest,
+  ): Promise<EnsureHarnessResult & { compacted: boolean; fallback?: "respawn" }> {
+    if (!this.canCompact(botId)) {
+      return { compacted: false, resumed: false };
+    }
+    const slot = this.acps.get(botId)!;
+    const prevId = slot.client.sessionId;
+    slot.lastThreadId = undefined;
+    try {
+      const acpSessionId = await slot.client.newSession(req);
+      // session/new restamps overlay. Cancel the previous id so Grok does not keep
+      // both sessions; ignore -32601 (Grok 1.0.5 has no session/compact).
+      if (prevId && prevId !== acpSessionId) {
+        await slot.client.cancelSession(prevId);
+      }
+      slot.turnsSinceCompact = 0;
+      slot.promptChars = 0;
+      slot.needsCompact = false;
+      slot.resumed = false;
+      slot.rosterFingerprint = rosterFingerprint(req.roster);
+      this.acp = slot.client;
+      this.acpSessionId = acpSessionId;
+      this.lastResume = false;
+      this.harness = "idle";
+      return { compacted: true, acpSessionId, resumed: false };
+    } catch {
+      try {
+        await slot.client.kill();
+      } catch {
+        /* ignore */
+      }
+      this.acps.delete(botId);
+      if (this.acp === slot.client) {
+        this.acp = null;
+        this.acpSessionId = undefined;
+      }
+      const spawned = await this.ensureHarness({ ...req, resumeSessionId: undefined });
+      return {
+        compacted: true,
+        acpSessionId: spawned.acpSessionId,
+        resumed: false,
+        fallback: "respawn",
+      };
+    }
   }
 
   async kill(botId: string): Promise<void> {
@@ -544,20 +720,24 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     model?: string,
     reasoningEffort?: string,
     permissionMode?: EnsureHarnessRequest["permissionMode"],
+    rosterFp = "",
   ): boolean {
-    const existing = this.acps.get(botId)?.client;
-    if (!existing || existing.closed || !existing.sessionId || this.harness === "crashed") return false;
+    const slot = this.acps.get(botId);
+    const existing = slot?.client;
+    // Crash is per-slot (closed / missing). Process-global harness=crashed would poison Ada when Bob overflows.
+    if (!existing || existing.closed || !existing.sessionId) return false;
     const wantModel = model || DEFAULT_GROK_MODEL;
     const wantEffort = reasoningEffort || DEFAULT_REASONING_EFFORT;
     if (existing.model !== wantModel || existing.reasoningEffort !== wantEffort) return false;
     if (permissionMode && existing.permissionMode !== permissionMode) return false;
+    if ((slot?.rosterFingerprint ?? "") !== rosterFp) return false;
     return true;
   }
 
   invalidateAcp(botId: string): void {
     const slot = this.acps.get(botId);
     if (!slot) return;
-    if (this.acp === slot.client && this.harness === "in_turn") return;
+    if (slot.inTurn) return;
     void slot.client.kill();
     this.acps.delete(botId);
     if (this.acp === slot.client) {
@@ -572,7 +752,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     for (const [botId, slot] of this.acps) {
       const client = slot.client;
       if (client.closed) continue;
-      if (this.acp === client && this.harness === "in_turn") continue;
+      if (slot.inTurn) continue;
       const federationKill = opts?.federationOff && slot.role === "gateway";
       // Desk OPENBOT_ACP_IDLE_MS=0 disables desk idle kill only.
       if (!federationKill && slot.idleTtlMs === 0) continue;
@@ -591,6 +771,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
 
   async ensureHarness(req: EnsureHarnessRequest): Promise<EnsureHarnessResult> {
     await this.ensure(this.accountId);
+    // Overlay catalog is req.skillNames as passed; readdir order is not a stable catalog.
     const env = { ...req.env };
     this.lastEnv = { ...env };
     this.injectedKey = Boolean(env.XAI_API_KEY);
@@ -599,6 +780,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     const existing = this.acps.get(req.botId);
     const role = req.role === "gateway" ? "gateway" : "desk";
     const idleTtlMs = req.idleTtlMs ?? (role === "gateway" ? gatewayAcpIdleTtlMs() : acpIdleTtlMs());
+    const fp = rosterFingerprint(req.roster);
     const grokHome = grokHomeDir(this.home);
     prepareIsolatedGrokHome(this.home, process.env.HOME, req.permissionMode);
     const permissionHandler =
@@ -612,11 +794,13 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
               cwd: req.cwd,
               operatorHome: process.env.HOME,
             });
-    if (this.matchesHarness(req.botId, model, reasoningEffort, req.permissionMode)) {
+    if (this.matchesHarness(req.botId, model, reasoningEffort, req.permissionMode, fp)) {
       const client = existing!.client;
       existing!.idleTtlMs = idleTtlMs;
       existing!.role = role;
       existing!.resumed = false;
+      existing!.rosterFingerprint = fp;
+      // lastThreadId stays: same child session, not a spawn.
       client.permissionMode = req.permissionMode;
       client.permissionHandler = permissionHandler;
       this.acp = client;
@@ -660,9 +844,21 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
         reasoningEffort,
         permissionMode: req.permissionMode,
         permissionHandler,
-        onEvent: (ev) => this.onLiveWork?.({ ...ev, botId: req.botId }, req.botId),
+        onEvent: (ev) => {
+          this.observeAcpEvent(req.botId, ev);
+          this.onLiveWork?.({ ...ev, botId: req.botId }, req.botId);
+        },
       });
-      this.acps.set(req.botId, { client, botId: req.botId, idleTtlMs, role, resumed: false });
+      this.acps.set(req.botId, {
+        client,
+        botId: req.botId,
+        idleTtlMs,
+        role,
+        resumed: false,
+        rosterFingerprint: fp,
+        turnsSinceCompact: 0,
+        promptChars: 0,
+      });
       this.acp = client;
       for (const k of Object.keys(env)) {
         delete spawnEnv[k];
@@ -698,25 +894,63 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   }
 
   async prompt(text: string, botId?: string): Promise<PromptResult> {
-    const client = botId ? this.acps.get(botId)?.client : this.acp;
+    const slot = botId
+      ? this.acps.get(botId)
+      : this.acp
+        ? [...this.acps.values()].find((s) => s.client === this.acp)
+        : undefined;
+    const client = slot?.client ?? this.acp;
     if (!client) throw new Error("harness not started");
     client.lastActivityAt = Date.now();
     this.harness = "in_turn";
     this.acp = client;
+    if (slot) slot.inTurn = true;
     try {
       const result = await client.prompt(text);
       this.harness = "idle";
       client.lastActivityAt = Date.now();
+      if (slot && overflowStopReason(result.stopReason)) slot.needsCompact = true;
       return result;
     } catch (err) {
-      this.harness = "crashed";
+      const dump = `${err instanceof Error ? err.message : String(err)}\n${client.lastStderr}`;
+      const overflow = overflowErrorText(dump);
+      // Closed distinguishes kill vs compact, not whether the harness id should be nulled.
+      if (slot && overflow && !client.closed) {
+        slot.needsCompact = true;
+        this.harness = "idle";
+        throw err;
+      }
+      if (slot) {
+        this.droppedSlots.add(slot.botId);
+        if (overflow) this.overflowDropped.add(slot.botId);
+        this.acps.delete(slot.botId);
+        if (this.acp === client) {
+          this.acp = null;
+          this.acpSessionId = undefined;
+        }
+      }
+      this.harness = "idle";
       try {
-        await client.kill();
+        if (!client.closed) await client.kill();
       } catch {
         /* ignore */
       }
       throw err;
+    } finally {
+      if (slot) slot.inTurn = false;
     }
+  }
+
+  private observeAcpEvent(botId: string, ev: LiveWorkEvent): void {
+    const slot = this.acps.get(botId);
+    if (!slot) return;
+    const blob = JSON.stringify(ev.payload ?? {});
+    if (/auto_compact/i.test(blob)) {
+      slot.needsCompact = true;
+      return;
+    }
+    const occ = usageOccupancy((ev.payload ?? {}) as Record<string, unknown>);
+    if (occ != null && occ >= 0.85) slot.needsCompact = true;
   }
 
   private tabOwner(owner?: string): string {
@@ -1275,6 +1509,15 @@ async function cdpInput(cdpHttp: string, event: Record<string, unknown>): Promis
 }
 
 export { findChrome };
+export {
+  DESK_SKILL_NAME_CAP,
+  DESK_SKILL_NAME_RE,
+  CONFIRM_SERIES_SKILL_MD,
+  DESK_SKILLS_README_MD,
+  SHARED_CHROMIUM_SKILL_MD,
+  ensureDeskSkills,
+  listDeskSkillNames,
+} from "./desk-skills.ts";
 export {
   botProjectDir,
   deleteBotProject,

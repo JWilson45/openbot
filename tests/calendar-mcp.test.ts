@@ -101,7 +101,17 @@ describe("calendar MCP", () => {
     const names = ((listed.json as { result: { tools: Array<{ name: string }> } }).result.tools ?? []).map(
       (t) => t.name,
     );
-    expect(names).toEqual(["SendMessage", "SendToAgent", "SendToThread", "ListBots", "SendToOrg", "Inbox"]);
+    expect(names).toEqual([
+      "SendMessage",
+      "SendToAgent",
+      "SendToThread",
+      "ListBots",
+      "Memory",
+      "SearchMessages",
+      "SearchThreads",
+      "SendToOrg",
+      "Inbox",
+    ]);
     expect(names).not.toContain("ListCalendar");
     expect(names).not.toContain("CreateEvent");
     expect(names).not.toContain("ProposeRoutine");

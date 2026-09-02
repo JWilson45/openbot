@@ -103,8 +103,64 @@ export class RemoteRunnerClient implements RunnerSession {
     model?: string,
     reasoningEffort?: string,
     permissionMode?: EnsureHarnessRequest["permissionMode"],
+    rosterFp?: string,
   ): Promise<boolean> {
-    return this.peer.request("matchesHarness", { botId, model, reasoningEffort, permissionMode }) as Promise<boolean>;
+    return this.peer.request("matchesHarness", {
+      botId,
+      model,
+      reasoningEffort,
+      permissionMode,
+      rosterFp,
+    }) as Promise<boolean>;
+  }
+  hasWarmBot(botId: string): Promise<boolean> {
+    return this.peer.request("hasWarmBot", { botId }) as Promise<boolean>;
+  }
+  listDeskSkillNames(cap?: number): Promise<string[]> {
+    return this.peer.request("listDeskSkillNames", { cap }) as Promise<string[]>;
+  }
+  lastPromptThread(botId: string): Promise<string | null> {
+    return this.peer.request("lastPromptThread", { botId }) as Promise<string | null>;
+  }
+  markPromptThread(botId: string, threadId: string): Promise<void> {
+    return this.peer.request("markPromptThread", { botId, threadId }) as Promise<void>;
+  }
+  canCompact(botId: string): Promise<boolean> {
+    return this.peer.request("canCompact", { botId }) as Promise<boolean>;
+  }
+  compactReason(
+    botId: string,
+    opts: { threadId?: string; innerBodyChars: number; switched: boolean },
+  ): Promise<import("@openbot/compute-protocol").CompactReason | null> {
+    return this.peer.request("compactReason", { botId, opts }) as Promise<
+      import("@openbot/compute-protocol").CompactReason | null
+    >;
+  }
+  compactSession(
+    botId: string,
+    req: EnsureHarnessRequest,
+  ): Promise<EnsureHarnessResult & { compacted: boolean; fallback?: "respawn" }> {
+    return this.peer.request("compactSession", { botId, req }) as Promise<
+      EnsureHarnessResult & { compacted: boolean; fallback?: "respawn" }
+    >;
+  }
+  setCompactCounters(botId: string, turns: number, chars: number): Promise<void> {
+    return this.peer.request("setCompactCounters", { botId, turns, chars }) as Promise<void>;
+  }
+  noteSuccessfulPrompt(botId: string, sentChars: number): Promise<{ turns: number; chars: number }> {
+    return this.peer.request("noteSuccessfulPrompt", { botId, sentChars }) as Promise<{
+      turns: number;
+      chars: number;
+    }>;
+  }
+  didOverflow(botId: string): Promise<boolean> {
+    return this.peer.request("didOverflow", { botId }) as Promise<boolean>;
+  }
+  droppedSlot(botId: string): Promise<boolean> {
+    return this.peer.request("droppedSlot", { botId }) as Promise<boolean>;
+  }
+  takeDroppedSlot(botId: string): Promise<boolean> {
+    return this.peer.request("takeDroppedSlot", { botId }) as Promise<boolean>;
   }
   invalidateAcp(botId: string): Promise<void> {
     return this.peer.request("invalidateAcp", { botId }) as Promise<void>;

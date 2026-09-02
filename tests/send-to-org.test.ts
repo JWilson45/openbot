@@ -231,6 +231,11 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     expect(desk).toContain("Type");
     expect(desk).toContain("Wait");
     expect(desk).toContain("own tab");
+    expect(desk).toContain("confirm-series");
+    expect(desk).toContain("shared-chromium");
+    expect(gw).not.toContain("Skills (names only");
+    expect(gw).not.toContain("confirm-series");
+    expect(gw).toMatch(/do not follow desk\/skills/i);
     expect(gw).not.toContain("ListCalendar");
     expect(gw).not.toContain("CreateEvent");
     expect(gw).not.toContain("BrowserSnapshot");
@@ -238,7 +243,7 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     expect(gw).not.toMatch(/Hire a new teammate: CreateBot/);
   });
 
-  test("tools/list is role-aware; serverInfo is 0.6.0", async () => {
+  test("tools/list is role-aware; serverInfo is 0.7.0", async () => {
     const db = OpenbotDb.open(join(tempHome(), "openbot.sqlite"));
     const w = seedWorld(db);
     const inflight = new McpInflight();
@@ -255,6 +260,9 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
       "SendToAgent",
       "SendToThread",
       "ListBots",
+      "Memory",
+      "SearchMessages",
+      "SearchThreads",
       "CreateBot",
       "ListCalendar",
       "CreateEvent",
@@ -267,11 +275,15 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
       "Type",
       "Wait",
     ]);
+    expect(deskNames).not.toContain("ListSkills");
     expect(mcpToolsForRole("desk").map((t) => (t as { name: string }).name)).toEqual([
       "SendMessage",
       "SendToAgent",
       "SendToThread",
       "ListBots",
+      "Memory",
+      "SearchMessages",
+      "SearchThreads",
       "CreateBot",
       "ListCalendar",
       "CreateEvent",
@@ -294,7 +306,17 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     const gwNames = (
       (gwList.json as { result: { tools: Array<{ name: string }> } }).result.tools ?? []
     ).map((t) => t.name);
-    expect(gwNames).toEqual(["SendMessage", "SendToAgent", "SendToThread", "ListBots", "SendToOrg", "Inbox"]);
+    expect(gwNames).toEqual([
+      "SendMessage",
+      "SendToAgent",
+      "SendToThread",
+      "ListBots",
+      "Memory",
+      "SearchMessages",
+      "SearchThreads",
+      "SendToOrg",
+      "Inbox",
+    ]);
 
     const init = await handleMcpJsonRpc(db, inflight, undefined, {
       jsonrpc: "2.0",
@@ -304,7 +326,7 @@ describe("SendToOrg / Inbox overlays and MCP", () => {
     });
     expect(
       (init.json as { result: { serverInfo: { version: string } } }).result.serverInfo.version,
-    ).toBe("0.6.0");
+    ).toBe("0.7.0");
     db.close();
   });
 

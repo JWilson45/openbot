@@ -4,7 +4,7 @@ OpenBot is a process on a machine you run. That process **is** the desk **and** 
 
 This document is how to run that process as a **user** service (systemd `--user` or a launchd LaunchAgent) and how to federate **two** such hosts. `openbot install` never requires root. Do not run Chromium as root.
 
-Version: `openbot version` prints `{"openbot":"0.6.0","grokPin":"1.0.5","grok":"…"}`. Pin lives in `packages/acp-grok/src/pin.ts`.
+Version: `openbot version` prints `{"openbot":"0.7.0","grokPin":"1.0.5","grok":"…"}`. Pin lives in `packages/acp-grok/src/pin.ts`.
 
 ---
 
@@ -15,10 +15,22 @@ Version: `openbot version` prints `{"openbot":"0.6.0","grokPin":"1.0.5","grok":"
 - **Stopping the VM makes that org unreachable.** Peers get timeouts. There is no hosted retry queue. sqlite, `org.ed25519`, and inbox rows stay on disk (`held` / `pending`).
 - **Laptop-closed:** the **service host** must stay powered and reachable. A sleeping laptop is a stopped desk. Use a VPS, home server, or a Mac/PC that does not sleep.
 - **The calendar clock is the process.** Calendar fire does not survive a stopped unit, a stopped VM, or a closed laptop: the 9am did not happen. At most one catch-up if you were down less than a day; OpenBot will not replay a weekend of missed summaries. Closing the tab does not stop a turn the calendar already queued. Stopping the process stops the clock **and** the turn.
-- `$OPENBOT_HOME/desk` is a shared computer, not a security boundary **inside** an org. Cross-org is messages only (one hop: A→B). Ada on A cannot spawn Grok on B. Grok’s process `HOME` is `$OPENBOT_HOME/grok-home`, not the service user’s home. Vault files are outside `desk/` and blocked by the ACP path guard (and by `OPENBOT_SANDBOX` when a backend is present). That is not Ada-vs-Bob isolation and not a dedicated-user jail.
+- `$OPENBOT_HOME/desk` is a shared computer, not a security boundary **inside** an org. Cross-org is messages only (one hop: A→B). Ada on A cannot spawn Grok on B. Grok’s process `HOME` is `$OPENBOT_HOME/grok-home`, not the service user’s home. Vault files are outside `desk/` and blocked by the ACP path guard (and by `OPENBOT_SANDBOX` when a backend is present). That is not Ada-vs-Bob isolation and not a dedicated-user jail. Skills live in `desk/skills/` (shared; overlay names only). Optional `desk/projects/<botId>/SOUL.md` is never auto-created. Operator `~/.grok/skills` are not loaded. Standing notes live in sqlite, not on the desk.
 - Bind defaults to **127.0.0.1**. OpenBot does **not** implement TLS. Put Caddy or nginx in front if you need a hostname. Caddy **must** 404 `/mcp/v1`; `/fed/v1` is the public federation surface.
 - **Federation is off until you turn it on** (`openbot gateway on` on **both** sides). Off does not delete the Gateway row or `org.ed25519`.
 - OpenBot does **not** provision Fly Machines or any cloud VM API. You bring the hosts.
+
+---
+
+## Data on disk
+
+Same layout as README “Data on disk”. Skills and soul are on the **shared** desk, not a jail:
+
+| Path | Role |
+| --- | --- |
+| `$OPENBOT_HOME/desk/skills/<name>/SKILL.md` | Shared procedures. Seeded `confirm-series` and `shared-chromium` (write-if-absent). Overlay lists names only. |
+| `$OPENBOT_HOME/desk/projects/<botId>/SOUL.md` | Optional voice/taboos. Never auto-created. |
+| `$OPENBOT_HOME/grok-home/` | Grok child `HOME`. Operator `~/.grok/skills` are not loaded. |
 
 ---
 
@@ -126,6 +138,9 @@ loginctl enable-linger "$USER"
 | `OPENBOT_CHROME` | Chromium/Chrome binary if not on PATH. |
 | `OPENBOT_ACP_IDLE_MS` | Kill idle **desk** Grok ACP children after this many ms. Default 7200000 (2 hours). `0` disables **desk** idle kill only — it does **not** disable Gateway. |
 | `OPENBOT_GATEWAY_ACP_IDLE_MS` | Gateway ACP idle TTL. Default 1800000 (30 minutes). `0` disables Gateway idle kill only. |
+| `OPENBOT_ACP_COMPACT_TURNS` | Warm compact after this many successful ACP turns on the session. Default 20. `0` disables this trigger. Desk and Gateway share the knob. |
+| `OPENBOT_ACP_COMPACT_CHARS` | Warm compact when accumulated sent prompt chars plus the next inner body is `>=` this. Default 48000. `0` disables this trigger only. |
+| `OPENBOT_ACP_COMPACT_ON_SWITCH` | `1` compact (`session/new` + cold digest) on thread switch instead of a switch-banner prefix. Default `0`. |
 | `OPENBOT_FEDERATION` | Panic **off:** `0` makes federation effective-off even if the DB flag is on. Unset/`1` does **not** force on. Restart the unit so the process sees env. `GET /fed/v1/info` still works. |
 | `OPENBOT_FED_ALLOW_HTTP` | `1` allows RFC1918 `http://` peer URLs (LAN). Default is https, plus loopback `http://127.0.0.1` / `localhost`. |
 | `OPENBOT_SANDBOX` | Optional Grok-child sandbox (`auto` / `none` / `bwrap` / `seatbelt` / `required`). Default `auto`. The **server** process is not sandboxed. |

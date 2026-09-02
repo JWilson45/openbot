@@ -1,18 +1,37 @@
 import { join } from "node:path";
-import { id, now, purgeExpiredArchivedBots, purgeExpiredOrgInbox, type OpenbotDb, type TurnRow } from "@openbot/db";
-import { appendLiveWork, buildThreadDigest, insertMessage, promote, wrapPromptWithDigest } from "@openbot/live-work";
-import { mintMcpToken, persistMcpToken, type McpInflight } from "@openbot/mcp-send-message";
+import {
+  id,
+  now,
+  purgeExpiredArchivedBots,
+  purgeExpiredOrgInbox,
+  readNotes,
+  scanMemoryText,
+  sha256Hex,
+  type OpenbotDb,
+  type TurnRow,
+} from "@openbot/db";
+import {
+  appendLiveWork,
+  buildThreadMemory,
+  formatThreadDigest,
+  insertMessage,
+  promote,
+  wrapPromptWithDigest,
+} from "@openbot/live-work";
+import { loadOverlayRoster, mintMcpToken, persistMcpToken, type McpInflight } from "@openbot/mcp-send-message";
 import { open, type Envelope } from "@openbot/vault";
 import {
   acpIdleTtlMs,
   deleteBotProject,
   gatewayAcpIdleTtlMs,
   LocalHostRunner,
+  overflowErrorText,
+  overflowStopReason,
 } from "@openbot/runner";
 import type { RunnerSession } from "@openbot/compute-protocol";
 import { RunnerUnavailable } from "@openbot/compute-protocol";
 import type { RemoteRunnerClient, TakeoverBridge } from "./remote-runner.ts";
-import { DEFAULT_GROK_MODEL, DEFAULT_REASONING_EFFORT, grokCliSignedIn } from "@openbot/acp-grok";
+import { DEFAULT_GROK_MODEL, DEFAULT_REASONING_EFFORT, grokCliSignedIn, rosterFingerprint } from "@openbot/acp-grok";
 import { currentOrgMeta, FEDERATION_OFF_NOTICE, federationEffective } from "./org.ts";
 import { maybeEnqueueGatewayDrain } from "./inbox.ts";
 import {
@@ -29,7 +48,21 @@ export type EngineOpts = {
   master: Buffer;
   mcpPort: () => number;
   onPush: (accountId: string, event: unknown) => void;
+  log?: { error(msg: string, extra?: Record<string, unknown>): void };
 };
+
+function overlayHashV1(rosterFp: string, skillNames: string[], orgNotes: string, botNotes: string): string {
+  return sha256Hex(["v1", rosterFp, skillNames.join(","), orgNotes, botNotes].join("\n"));
+}
+
+function standingForOverlay(raw: string, log?: EngineOpts["log"]): string {
+  const scanned = scanMemoryText(raw);
+  if (!scanned.ok) {
+    log?.error("dropped unsafe standing notes", { reason: scanned.reason });
+    return "";
+  }
+  return scanned.text;
+}
 
 export class TurnEngine {
   runners = new Map<string, LocalHostRunner>();
@@ -363,10 +396,14 @@ export class TurnEngine {
     }>("SELECT * FROM bots WHERE id = ?", [turn.bot_id]);
     if (!bot) return;
 
-    const thread = this.opts.db.get<{ id: string; account_id: string; kind: string; title: string }>(
-      "SELECT * FROM threads WHERE id = ?",
-      [turn.thread_id],
-    );
+    const thread = this.opts.db.get<{
+      id: string;
+      account_id: string;
+      kind: string;
+      title: string;
+      bot_id: string;
+      peer_bot_id: string | null;
+    }>("SELECT * FROM threads WHERE id = ?", [turn.thread_id]);
     if (!thread) return;
 
     const compute = this.opts.db.get<{ id: string; workspace_path: string }>(
@@ -429,30 +466,55 @@ export class TurnEngine {
 
     const model = bot.model || DEFAULT_GROK_MODEL;
     const reasoningEffort = bot.reasoning_effort || DEFAULT_REASONING_EFFORT;
-    const warm = await runner.matchesHarness(
-      bot.id,
-      model,
-      reasoningEffort,
-      bot.permission_mode as "ask" | "auto" | "always-approve",
-    );
+    const permissionMode = bot.permission_mode as "ask" | "auto" | "always-approve";
+    const roster = loadOverlayRoster(this.opts.db, bot.account_id);
+    const currentFingerprint = rosterFingerprint(roster);
+    const skillNames = isGateway ? [] : await runner.listDeskSkillNames(32);
+    const notes = readNotes(this.opts.db, bot.account_id, bot.id);
+    const orgNotes = standingForOverlay(notes.org, this.opts.log);
+    const botNotes = standingForOverlay(notes.bot, this.opts.log);
+    const currentOverlayHash = overlayHashV1(currentFingerprint, skillNames, orgNotes, botNotes);
+    const hadSlot = (await runner.hasWarmBot(bot.id)) || (await runner.takeDroppedSlot(bot.id));
+    const warm = await runner.matchesHarness(bot.id, model, reasoningEffort, permissionMode, currentFingerprint);
     let harnessId = turn.harness_session_id;
-    let prevAcpId: string | undefined;
+    let resumeSessionId: string | undefined;
+    // Latest row including a NULL acp_session_id; do not walk older fingerprints.
+    const latest = this.opts.db.get<{
+      acp_session_id: string | null;
+      roster_fingerprint: string | null;
+      overlay_hash: string | null;
+      compact_turns: number | null;
+      compact_chars: number | null;
+    }>(
+      `SELECT acp_session_id, roster_fingerprint, overlay_hash, compact_turns, compact_chars
+       FROM harness_sessions
+       WHERE bot_id = ? ORDER BY created_at DESC LIMIT 1`,
+      [bot.id],
+    );
     if (!warm) {
-      prevAcpId =
-        this.opts.db.get<{ acp_session_id: string }>(
-          "SELECT acp_session_id FROM harness_sessions WHERE bot_id = ? AND acp_session_id IS NOT NULL ORDER BY created_at DESC LIMIT 1",
-          [bot.id],
-        )?.acp_session_id || undefined;
       this.opts.db.run(
         "UPDATE harness_sessions SET state = 'ended', ended_at = ? WHERE bot_id = ? AND ended_at IS NULL",
         [now(), bot.id],
       );
       harnessId = id();
       this.opts.db.run(
-        `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at)
-         VALUES (?, ?, ?, 'active', ?)`,
-        [harnessId, compute?.id ?? bot.account_id, bot.id, now()],
+        `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at, roster_fingerprint, overlay_hash, compact_turns, compact_chars)
+         VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
+        [
+          harnessId,
+          compute?.id ?? bot.account_id,
+          bot.id,
+          now(),
+          latest?.roster_fingerprint ?? null,
+          latest?.overlay_hash ?? null,
+          latest?.compact_turns ?? 0,
+          latest?.compact_chars ?? 0,
+        ],
       );
+      // NULL overlay_hash is a mismatch so pre-PR5 rows skip resume.
+      const hashMatch = latest?.overlay_hash != null && latest.overlay_hash === currentOverlayHash;
+      resumeSessionId =
+        !hadSlot && latest?.acp_session_id && hashMatch ? latest.acp_session_id : undefined;
     } else if (!harnessId) {
       const existingHs = this.opts.db.get<{ id: string }>(
         "SELECT id FROM harness_sessions WHERE bot_id = ? AND state = 'active' AND ended_at IS NULL ORDER BY created_at DESC LIMIT 1",
@@ -462,9 +524,18 @@ export class TurnEngine {
       else {
         harnessId = id();
         this.opts.db.run(
-          `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at)
-           VALUES (?, ?, ?, 'active', ?)`,
-          [harnessId, compute?.id ?? bot.account_id, bot.id, now()],
+          `INSERT INTO harness_sessions (id, compute_id, bot_id, state, created_at, roster_fingerprint, overlay_hash, compact_turns, compact_chars)
+           VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
+          [
+            harnessId,
+            compute?.id ?? bot.account_id,
+            bot.id,
+            now(),
+            latest?.roster_fingerprint ?? currentFingerprint,
+            latest?.overlay_hash ?? currentOverlayHash,
+            latest?.compact_turns ?? 0,
+            latest?.compact_chars ?? 0,
+          ],
         );
       }
     }
@@ -531,56 +602,153 @@ export class TurnEngine {
       (runner as LocalHostRunner).harnessSessionId = harnessId;
     }
 
-    try {
-      const harness = await runner.ensureHarness({
-        botId: bot.id,
-        env: apiKey ? { XAI_API_KEY: apiKey } : {},
-        mcpUrl,
-        mcpToken: token,
-        cwd,
-        botName: bot.name,
-        botDescription: bot.description,
-        permissionMode: bot.permission_mode as "ask" | "auto" | "always-approve",
-        model,
-        reasoningEffort,
-        role: isGateway ? "gateway" : "desk",
-        orgId: org?.org_id,
-        orgSlug: org?.slug,
-        idleTtlMs: isGateway ? gatewayAcpIdleTtlMs() : acpIdleTtlMs(),
-        omitCdp: isGateway,
-        resumeSessionId: !warm && prevAcpId ? prevAcpId : undefined,
-      });
-      this.opts.db.run("UPDATE harness_sessions SET acp_session_id = ? WHERE id = ?", [
-        harness.acpSessionId ?? null,
-        harnessId,
-      ]);
+    const userMsg = this.opts.db.get<{ origin: string; body: string }>(
+      "SELECT origin, body FROM messages WHERE turn_id = ? AND role = 'user' ORDER BY created_at DESC LIMIT 1",
+      [turn.id],
+    );
+    const lastThreadId =
+      (await runner.lastPromptThread(bot.id)) ?? lastFinishedThread(this.opts.db, bot.id, turn.id);
+    const switched = Boolean(lastThreadId) && lastThreadId !== turn.thread_id;
+    const inner = assembleTurnPrompt({
+      wrap: "none",
+      userBody: userMsg?.body ?? "",
+      groupTitle: thread.kind === "group" ? thread.title : null,
+      calendarBlock: userMsg?.origin === "calendar" ? calendarTurnBlock(this.opts.db, turn.id) : null,
+    });
+    const harnessReq = {
+      botId: bot.id,
+      env: apiKey ? { XAI_API_KEY: apiKey } : {},
+      mcpUrl,
+      mcpToken: token,
+      cwd,
+      botName: bot.name,
+      botDescription: bot.description,
+      permissionMode,
+      model,
+      reasoningEffort,
+      role: (isGateway ? "gateway" : "desk") as "gateway" | "desk",
+      orgId: org?.org_id,
+      orgSlug: org?.slug,
+      idleTtlMs: isGateway ? gatewayAcpIdleTtlMs() : acpIdleTtlMs(),
+      omitCdp: isGateway,
+      roster,
+      skillNames,
+      orgNotes,
+      botNotes,
+    };
 
-      const userMsg = this.opts.db.get<{ origin: string; body: string }>(
-        "SELECT origin, body FROM messages WHERE turn_id = ? AND role = 'user' ORDER BY created_at DESC LIMIT 1",
-        [turn.id],
-      );
-      let prompt = userMsg?.body ?? "";
-      if (thread.kind === "group") {
-        prompt = `Group thread "${thread.title}". To speak here call SendToThread. SendMessage still DMs the human privately. SendToAgent is 1:1, not this group.\n\n${prompt}`;
-      }
-      if (userMsg?.origin === "calendar") {
-        prompt = `${calendarTurnBlock(this.opts.db, turn.id)}\n\n${prompt}`;
-      }
-      if (!warm) {
-        if (harness.resumed) {
-          appendLiveWork(this.opts.db, turn.id, "harness_session_reset", { reason: "resumed" });
-        } else {
-          appendLiveWork(this.opts.db, turn.id, "harness_session_reset", { reason: "cold_start" });
-          const digest = buildThreadDigest(this.opts.db, {
-            threadId: turn.thread_id,
-            botId: bot.id,
-            botName: bot.name,
-            excludeTurnId: turn.id,
-          });
-          prompt = wrapPromptWithDigest(digest, prompt);
+    let wrap: TurnPromptWrap = "none";
+    let didCompact = false;
+
+    try {
+      if (warm && (await runner.canCompact(bot.id))) {
+        const reason = await runner.compactReason(bot.id, {
+          threadId: turn.thread_id,
+          innerBodyChars: inner.length,
+          switched,
+        });
+        if (reason) {
+          const minted = mintMcpToken();
+          token = minted.token;
+          persistMcpToken(
+            this.opts.db,
+            {
+              accountId: bot.account_id,
+              botId: bot.id,
+              threadId: turn.thread_id,
+              harnessSessionId: harnessId,
+            },
+            minted.hash,
+          );
+          const compacted = await runner.compactSession(bot.id, { ...harnessReq, mcpToken: token });
+          if (compacted.compacted) {
+            didCompact = true;
+            wrap = "compact";
+            appendLiveWork(this.opts.db, turn.id, "harness_session_reset", {
+              reason: "compacted",
+              trigger: reason,
+              ...(compacted.fallback ? { fallback: compacted.fallback } : {}),
+            });
+          }
         }
       }
+
+      const harness = await runner.ensureHarness({
+        ...harnessReq,
+        mcpToken: token,
+        resumeSessionId: !warm ? resumeSessionId : undefined,
+      });
+      // Stored hash names the overlay frozen at session/new or resume, not live sqlite.
+      if (!warm || didCompact) {
+        this.opts.db.run(
+          "UPDATE harness_sessions SET acp_session_id = ?, roster_fingerprint = ?, overlay_hash = ? WHERE id = ?",
+          [harness.acpSessionId ?? null, currentFingerprint, currentOverlayHash, harnessId],
+        );
+        if (harness.resumed && !didCompact) {
+          const copied = this.opts.db.get<{ compact_turns: number | null; compact_chars: number | null }>(
+            "SELECT compact_turns, compact_chars FROM harness_sessions WHERE id = ?",
+            [harnessId],
+          );
+          await runner.setCompactCounters(bot.id, copied?.compact_turns ?? 0, copied?.compact_chars ?? 0);
+        } else {
+          this.opts.db.run(
+            "UPDATE harness_sessions SET compact_turns = 0, compact_chars = 0 WHERE id = ?",
+            [harnessId],
+          );
+          await runner.setCompactCounters(bot.id, 0, 0);
+        }
+      }
+
+      if (!didCompact) {
+        if (!warm) {
+          if (harness.resumed) {
+            appendLiveWork(this.opts.db, turn.id, "harness_session_reset", { reason: "resumed" });
+            if (switched) wrap = "switch";
+          } else {
+            appendLiveWork(this.opts.db, turn.id, "harness_session_reset", { reason: "cold_start" });
+            wrap = "cold";
+          }
+        } else if (switched) {
+          wrap = "switch";
+        }
+      }
+      if (wrap === "switch" && lastThreadId) {
+        appendLiveWork(this.opts.db, turn.id, "thread_switch", {
+          from: lastThreadId,
+          to: turn.thread_id,
+        });
+      }
+      const digest =
+        wrap === "none"
+          ? null
+          : formatThreadDigest({
+              kind: wrap === "switch" ? "thread_switch" : "cold_start",
+              botName: bot.name,
+              threadLabel: threadDigestLabel(this.opts.db, thread, bot.id),
+              memory: buildThreadMemory(this.opts.db, {
+                threadId: turn.thread_id,
+                botId: bot.id,
+                botName: bot.name,
+                excludeTurnId: turn.id,
+              }),
+            });
+      const prompt = assembleTurnPrompt({
+        wrap,
+        userBody: userMsg?.body ?? "",
+        groupTitle: thread.kind === "group" ? thread.title : null,
+        calendarBlock: userMsg?.origin === "calendar" ? calendarTurnBlock(this.opts.db, turn.id) : null,
+        digest,
+      });
+      await runner.markPromptThread(bot.id, turn.thread_id);
       const result = await runner.prompt(prompt, bot.id);
+      if (overflowStopReason(result.stopReason) || (await runner.didOverflow(bot.id))) {
+        this.opts.db.run("UPDATE harness_sessions SET acp_session_id = NULL WHERE id = ?", [harnessId]);
+      }
+      const counts = await runner.noteSuccessfulPrompt(bot.id, prompt.length);
+      this.opts.db.run(
+        "UPDATE harness_sessions SET compact_turns = ?, compact_chars = ? WHERE id = ?",
+        [counts.turns, counts.chars, harnessId],
+      );
       markCalendarPendingAsSend(this.opts.db, turn.id);
       promote(this.opts.db, turn.id, {
         kind: "acp_done",
@@ -596,6 +764,13 @@ export class TurnEngine {
         local?.acpFor(bot.id)?.lastStderr ||
         "";
       const text = (err instanceof Error ? err.message : String(err)) + (stderr ? `\n${stderr.slice(-1500)}` : "");
+      if (
+        (await runner.didOverflow(bot.id)) ||
+        (await runner.droppedSlot(bot.id)) ||
+        overflowErrorText(text)
+      ) {
+        this.opts.db.run("UPDATE harness_sessions SET acp_session_id = NULL WHERE id = ?", [harnessId]);
+      }
       this.opts.db.run("UPDATE turns SET error = ? WHERE id = ?", [text, turn.id]);
       this.opts.db.run("UPDATE turns SET status = 'running' WHERE id = ?", [turn.id]);
       markCalendarPendingAsSend(this.opts.db, turn.id);
@@ -620,6 +795,156 @@ export class TurnEngine {
     }
     if (isGateway) this.maybeKickGatewayDrain(bot.id, turn.id);
   }
+
+  /** Test/explicit compact between turns. Remints MCP; refuses slot.inTurn. */
+  async compactSession(botId: string): Promise<{
+    compacted: boolean;
+    acpSessionId?: string;
+    resumed: boolean;
+    fallback?: "respawn";
+  }> {
+    const bot = this.opts.db.get<{
+      id: string;
+      account_id: string;
+      name: string;
+      description: string;
+      permission_mode: string;
+      model: string | null;
+      reasoning_effort: string | null;
+      role: string | null;
+    }>("SELECT * FROM bots WHERE id = ?", [botId]);
+    if (!bot) return { compacted: false, resumed: false };
+    const runner = this.runnerFor(bot.account_id);
+    if (!(await runner.canCompact(botId))) return { compacted: false, resumed: false };
+    const isGateway = bot.role === "gateway";
+    const org = currentOrgMeta(this.opts.db);
+    const roster = loadOverlayRoster(this.opts.db, bot.account_id);
+    const currentFingerprint = rosterFingerprint(roster);
+    const skillNames = isGateway ? [] : await runner.listDeskSkillNames(32);
+    const notes = readNotes(this.opts.db, bot.account_id, bot.id);
+    const orgNotes = standingForOverlay(notes.org, this.opts.log);
+    const botNotes = standingForOverlay(notes.bot, this.opts.log);
+    const currentOverlayHash = overlayHashV1(currentFingerprint, skillNames, orgNotes, botNotes);
+    const hs = this.opts.db.get<{ id: string }>(
+      "SELECT id FROM harness_sessions WHERE bot_id = ? AND ended_at IS NULL ORDER BY created_at DESC LIMIT 1",
+      [botId],
+    );
+    const threadId =
+      runner.lastPromptThread(botId) ??
+      this.opts.db.get<{ id: string }>(
+        "SELECT id FROM threads WHERE bot_id = ? AND IFNULL(kind,'human') = 'human'",
+        [botId],
+      )?.id;
+    const cwd = isGateway ? runner.ensureGatewayWorkspace() : runner.ensureProject(bot.id, bot.name);
+    const cred = this.opts.db.get<{ ciphertext: Uint8Array; dek_wrapped: Uint8Array; key_id: string }>(
+      "SELECT ciphertext, dek_wrapped, key_id FROM credentials WHERE account_id = ? AND kind = 'xai_api_key'",
+      [bot.account_id],
+    );
+    let apiKey = "";
+    if (cred) {
+      const envelope: Envelope = {
+        ciphertext: Buffer.from(cred.ciphertext),
+        dekWrapped: Buffer.from(cred.dek_wrapped),
+        keyId: cred.key_id,
+        lastFour: "",
+      };
+      apiKey = open(this.opts.master, envelope);
+    }
+    let token = "";
+    if (hs && threadId) {
+      const minted = mintMcpToken();
+      token = minted.token;
+      persistMcpToken(
+        this.opts.db,
+        {
+          accountId: bot.account_id,
+          botId: bot.id,
+          threadId,
+          harnessSessionId: hs.id,
+        },
+        minted.hash,
+      );
+    }
+    const result = await runner.compactSession(botId, {
+      botId: bot.id,
+      env: apiKey ? { XAI_API_KEY: apiKey } : {},
+      mcpUrl: `http://127.0.0.1:${this.opts.mcpPort()}/mcp/v1`,
+      mcpToken: token,
+      cwd,
+      botName: bot.name,
+      botDescription: bot.description,
+      permissionMode: bot.permission_mode as "ask" | "auto" | "always-approve",
+      model: bot.model || DEFAULT_GROK_MODEL,
+      reasoningEffort: bot.reasoning_effort || DEFAULT_REASONING_EFFORT,
+      role: isGateway ? "gateway" : "desk",
+      orgId: org?.org_id,
+      orgSlug: org?.slug,
+      idleTtlMs: isGateway ? gatewayAcpIdleTtlMs() : acpIdleTtlMs(),
+      omitCdp: isGateway,
+      roster,
+      skillNames,
+      orgNotes,
+      botNotes,
+    });
+    if (result.compacted && hs) {
+      this.opts.db.run(
+        "UPDATE harness_sessions SET acp_session_id = ?, roster_fingerprint = ?, overlay_hash = ?, compact_turns = 0, compact_chars = 0 WHERE id = ?",
+        [result.acpSessionId ?? null, currentFingerprint, currentOverlayHash, hs.id],
+      );
+    }
+    return result;
+  }
+}
+
+/** wrap "compact" is an alias of "cold" (same ACP session reset banner). */
+export type TurnPromptWrap = "none" | "cold" | "switch" | "compact";
+
+export function assembleTurnPrompt(opts: {
+  wrap: TurnPromptWrap;
+  userBody: string;
+  groupTitle?: string | null;
+  calendarBlock?: string | null;
+  digest?: string | null;
+}): string {
+  let inner = opts.userBody;
+  if (opts.groupTitle) {
+    inner = `Group thread "${opts.groupTitle}". To speak here call SendToThread. SendMessage still DMs the human privately. SendToAgent is 1:1, not this group.\n\n${inner}`;
+  }
+  if (opts.calendarBlock) {
+    inner = `${opts.calendarBlock}\n\n${inner}`;
+  }
+  if (opts.wrap === "none") return inner;
+  return wrapPromptWithDigest(opts.digest ?? null, inner);
+}
+
+function lastFinishedThread(db: OpenbotDb, botId: string, excludeTurnId: string): string | undefined {
+  const row = db.get<{ thread_id: string }>(
+    `SELECT thread_id FROM turns
+     WHERE bot_id = ?
+       AND id != ?
+       AND status IN ('completed', 'cancelled', 'failed')
+       AND started_at IS NOT NULL
+       AND harness_session_id IS NOT NULL
+     ORDER BY started_at DESC
+     LIMIT 1`,
+    [botId, excludeTurnId],
+  );
+  return row?.thread_id;
+}
+
+function threadDigestLabel(
+  db: OpenbotDb,
+  thread: { kind: string; title: string; bot_id: string; peer_bot_id: string | null },
+  botId: string,
+): string {
+  if (thread.kind === "group") return `group "${thread.title}"`;
+  if (thread.kind === "a2a") {
+    const peerId = thread.bot_id === botId ? thread.peer_bot_id : thread.bot_id;
+    const peerName =
+      (peerId && db.get<{ name: string }>("SELECT name FROM bots WHERE id = ?", [peerId])?.name) || "peer";
+    return `your 1:1 with ${peerName}`;
+  }
+  return "your DM with the human";
 }
 
 function calendarTurnBlock(db: OpenbotDb, turnId: string): string {

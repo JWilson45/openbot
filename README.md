@@ -23,9 +23,13 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 - **This is not Google Calendar.** No sync. No invites. Org-local sqlite.
 - **Schedules and learned routines are two products** on the same grid.
 - `$OPENBOT_HOME/desk` is a **shared computer**. It is **not** a security boundary **inside** an org. Every bot on the account can read and write the desk the way you can. There is **one Chromium** for the whole team (**a tab per desk bot**; cookies shared). Cross-org is messages only (hop=1).
+- Skills are procedures on a **shared** desk (`desk/skills/<name>/SKILL.md`). Overlay lists names only; Grok reads bodies via the filesystem. Learn this / ProposeRoutine are calendar jobs. Operator `~/.grok/skills` are not loaded. Optional `desk/projects/<botId>/SOUL.md` is never auto-created.
 - Vault files (`master.key`, `org.ed25519`, credentials) live **outside** `desk/`. Grok’s `HOME` is `$OPENBOT_HOME/grok-home` (a copy of `~/.grok/auth.json`, not a symlink). ACP tools whose paths resolve outside the desk are denied. Optional `OPENBOT_SANDBOX` (macOS `sandbox-exec` / Linux `bwrap`) is best-effort and off in tests. Same-uid `0600` is not a jail; a dedicated OS user is. Do not copy secrets into the workspace Grok can see.
-- Restarting the server starts a new Grok ACP process. Chat history is in SQLite. On cold start OpenBot tries ACP `session/resume`; if that fails it injects a thread **summary + recent tail**. Idle desk children stay warm for 2 hours (override `OPENBOT_ACP_IDLE_MS`; `0` disables desk idle kill).
+- Restarting the server starts a new Grok ACP process. Chat history is in SQLite. On cold start OpenBot tries ACP `session/resume`; if that fails it injects a thread **summary + recent tail**. Idle desk children stay warm for 2 hours (override `OPENBOT_ACP_IDLE_MS`; `0` disables desk idle kill). A warm teammate hopping to another thread gets that thread's summary + tail prefixed; that is **not** a new session. Compact is `session/new` on the **same** process (default every 20 turns or 48k prompt chars; `OPENBOT_ACP_COMPACT_TURNS` / `OPENBOT_ACP_COMPACT_CHARS`, `0` disables that trigger). Compact-on-thread-switch is off unless `OPENBOT_ACP_COMPACT_ON_SWITCH=1`. Compact does not announce itself in the transcript.
+- Teammates see who is on the desk (up to six names + Gateway) in their spawn overlay. Hiring someone does not kill the other Groks; each bot picks up the new roster on its next turn.
+- Standing notes freeze at spawn (idle ~2h, compact, model/roster respawn, or Save which kills the child if it is not in a turn). They do not appear on the current warm child. `Memory.read` sees sqlite immediately. Search is a tool over this org’s log, not prompt stuffing.
 - **Federation is off until you turn it on** on **both** sides. OpenBot does not provision Fly Machines.
+- **SendToAgent is queued, not done.** Completions sit on the A2A thread as a system line; the sender is not auto-woken.
 
 ---
 
@@ -37,9 +41,9 @@ Open the `signIn` URL it prints, create a teammate, send a message.
 | Human DM | Each bot has a 1:1 thread with you. |
 | `SendMessage` | The **only** way a bot talks to you. Assistant rambling is a private work log unless it fails to call the tool (then you get a fallback). |
 | `SendToAgent` | Async mailbox to another bot. Does **not** write your DM. Handoffs in the UI show the A2A thread. |
-| `ListBots` / `CreateBot` | Roster and hire. Desk bots only (cap 6). Gateway does not hire. Bots must **not** mint `/auth/local` or `POST /v1/bots`. |
+| `ListBots` / `CreateBot` | Fallback roster and hire. Desk bots only (cap 6). Gateway does not hire. Bots must **not** mint `/auth/local` or `POST /v1/bots`. The spawn overlay already lists names. |
 | Parallel turns | At most one running turn **per bot**. Two bots can work at the same time on the shared desk. |
-| Warm Grok process | Each bot keeps an ACP child across turns. Model / reasoning changes respawn it on the **next** turn. |
+| Warm Grok process | Each bot keeps an ACP child across turns. Model / reasoning / roster changes respawn it on the **next** turn. |
 | Model & reasoning | Per-bot Grok model (e.g. grok-4.6) and effort (low / medium / high / extra high). Settings always; Debug composer on a human DM. |
 | Live work | Default UI is the messenger (roster + thread). **Debug** (header, or Ctrl/Cmd+Shift+Period) shows thinking and tool calls in a resizable sidebar. Activity board for the whole team. |
 | Takeover | **Desk browser** grabs the human tab of the shared Chromium (screencast + input). Esc / Close ends it; F6 from the canvas focuses Close. Desk bots keep their own tabs. |
@@ -90,7 +94,7 @@ cd openbot
 bun install
 ```
 
-The CLI is `bun run openbot -- <command>` (or `bun run apps/server/src/cli.ts`). Current version is **0.6.0**. `openbot version` prints `{ openbot, grokPin, grok }`. OpenBot pins **Grok CLI 1.0.5** (warns if missing or older; does not refuse to start).
+The CLI is `bun run openbot -- <command>` (or `bun run apps/server/src/cli.ts`). Current version is **0.7.0**. `openbot version` prints `{ openbot, grokPin, grok }`. OpenBot pins **Grok CLI 1.0.5** (warns if missing or older; does not refuse to start).
 
 Merging to `main` with a **new** `package.json` version creates tag `vX.Y.Z` and publishes GitHub Release binaries. Pull requests run tests. Other branches do not. A version that already has a tag is not re-released.
 
@@ -267,8 +271,10 @@ Control dir is `~/.openbot`. Each org profile is its own data root (`$OPENBOT_HO
 | `master.key` | Vault master (mode 0600). Not under `desk/` |
 | `allowlist` | GitHub logins, one per line |
 | `desk/` | Shared computer. Chromium profile under `desk/.openbot/chromium`. Gateway cwd `desk/.openbot/gateway/`. |
+| `desk/skills/<name>/SKILL.md` | Shared procedures (seeded `confirm-series`, `shared-chromium`, write-if-absent). Overlay lists names only. |
 | `desk/projects/<botId>/` | That bot's ACP cwd. Purge deletes this folder only. Bots can still `../` into siblings. |
-| `grok-home/` | Isolated Grok config (no user MCP servers) and the Grok child `HOME`. Auth is a **copy** of `~/.grok/auth.json`, refreshed on each `ensureHarness`. |
+| `desk/projects/<botId>/SOUL.md` | Optional voice/taboos. Never auto-created. |
+| `grok-home/` | Isolated Grok config (no user MCP servers) and the Grok child `HOME`. Auth is a **copy** of `~/.grok/auth.json`, refreshed on each `ensureHarness`. Operator `~/.grok/skills` are not loaded. |
 
 `--home` / `OPENBOT_HOME` relocate one org's data. Wiping the desk does not delete the sqlite DB or vault. Grok CLI login stays in `~/.grok/auth.json`.
 
@@ -326,7 +332,9 @@ Cookie session (`openbot_session`) or `Authorization: Bearer` (session token or 
 | `GET` | `/v1/bots` | Desk `bots[]` + archived; Gateway is a sidecar, not a seventh slot |
 | `POST` | `/v1/bots/:id/archive` `/restore` | Soft-delete / undo |
 | `POST` | `/v1/bots/:id/purge` | Body `{ confirm: "DELETE" }`. Archived only |
-| `PATCH` | `/v1/bots/:id/settings` | `permissionMode`, `requireHumanApproval`, `model`, `reasoningEffort` |
+| `PATCH` | `/v1/bots/:id/settings` | `permissionMode`, `requireHumanApproval`, `requireMemoryApproval`, `model`, `reasoningEffort` |
+| `GET`/`PATCH` | `/v1/memory` `/v1/bots/:id/memory` | Standing org/bot notes. Human Save kills the child if it is not in a turn. |
+| `POST` | `/v1/memory/pending/:id/approve` `/reject` | Parked agent Memory writes |
 | `GET` | `/v1/inference-models` | Grok catalog + effort menus |
 | `GET` | `/v1/threads?botId=&kind=human\|a2a` | Human DM or A2A list |
 | `POST` | `/v1/threads/:id/messages` | Queue a turn (`202`) |
@@ -392,7 +400,7 @@ packages/federation/  Ed25519 JWS for /fed/v1
 packages/vault/       credential encryption
 packages/auth/        GitHub / local session, allowlist
 packages/compute-protocol/  five-method host contract
-docs/design/          Phase 1–4 design notes
+docs/design/          Phase 1–5 design notes
 tests/                bun:test; fake ACP, no live xAI required
 ```
 
@@ -425,7 +433,7 @@ CI (`.github/workflows/ci.yml`) is `bun install --frozen-lockfile` then `bun tes
 - Remote runner (orchestrator on A, grok on B).
 - Mobile / desktop apps, Postgres control plane, per-bot filesystem isolation.
 
-Design background: [docs/design/phase-1-always-on-teammate-loop.md](docs/design/phase-1-always-on-teammate-loop.md), [docs/design/phase-2-team-on-one-desk.md](docs/design/phase-2-team-on-one-desk.md), [docs/design/phase-3-orgs-vms-gateway.md](docs/design/phase-3-orgs-vms-gateway.md), [docs/design/phase-4-calendar-automations.md](docs/design/phase-4-calendar-automations.md).
+Design background: [docs/design/phase-1-always-on-teammate-loop.md](docs/design/phase-1-always-on-teammate-loop.md), [docs/design/phase-2-team-on-one-desk.md](docs/design/phase-2-team-on-one-desk.md), [docs/design/phase-3-orgs-vms-gateway.md](docs/design/phase-3-orgs-vms-gateway.md), [docs/design/phase-4-calendar-automations.md](docs/design/phase-4-calendar-automations.md), [docs/design/phase-5-hermes-behavior.md](docs/design/phase-5-hermes-behavior.md).
 
 ---
 
