@@ -217,6 +217,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   screencastFrames = 0;
   viewportTimer: ReturnType<typeof setTimeout> | null = null;
   browserLock: Promise<void> = Promise.resolve();
+  private browserStart: Promise<BrowserHandle> | null = null;
   onScreencastFrame?: (jpeg: Uint8Array, meta: { pageUrl?: string; pageOrigin?: string }) => void;
   onLiveWork?: (ev: LiveWorkEvent, botId?: string) => void;
   permissionHandler?: PermissionHandler;
@@ -346,7 +347,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     uid: number;
     chromeNotRoot: boolean;
   }> {
-    const alive = Boolean(this.browser?.cdpUrl);
+    let alive = false;
     let pageUrl: string | undefined;
     let pageOrigin: string | undefined;
     if (this.browser?.cdpUrl) {
@@ -357,8 +358,9 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
           : await cdpPageInfo(this.browser.cdpUrl);
         pageUrl = info.url;
         pageOrigin = info.origin;
+        alive = true;
       } catch {
-        /* ignore */
+        this.stopBrowser();
       }
     }
     return {
@@ -418,9 +420,13 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
     await this.ensureBrowser();
     this.browser!.takeoverActive = true;
     const tab = await this.ensureTab(TAKEOVER_TAB);
-    const existing = await cdpTargetInfo(this.browser!.cdpUrl, tab.id).catch(() => ({} as { url?: string }));
-    if (!existing.url || existing.url === "about:blank") {
+    let pageMeta = await cdpTargetInfo(this.browser!.cdpUrl, tab.id).catch(() => ({} as {
+      url?: string;
+      origin?: string;
+    }));
+    if (!pageMeta.url || pageMeta.url === "about:blank") {
       await cdpNavigate(this.browser!.cdpUrl, TAKEOVER_HOME, tab.wsUrl).catch(() => undefined);
+      pageMeta = { url: TAKEOVER_HOME, origin: originOf(TAKEOVER_HOME) };
     }
     this.onScreencastFrame = onFrame;
     this.screencastFrames = 0;
@@ -432,7 +438,14 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
         /* ignore */
       }
     }
-    const conn = await cdpConnect(this.browser!.cdpUrl, async (method, params) => {
+    const conn = await cdpConnect(this.browser!.cdpUrl, (method, params) => {
+      if (method === "Page.frameNavigated") {
+        const frame = (params as { frame?: { parentId?: string; url?: string } } | undefined)?.frame;
+        if (frame && !frame.parentId && frame.url) {
+          pageMeta = { url: frame.url, origin: originOf(frame.url) };
+        }
+        return;
+      }
       if (method !== "Page.screencastFrame") return;
       const p = params as {
         data?: string;
@@ -440,7 +453,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
         metadata?: { deviceWidth?: number; deviceHeight?: number };
       };
       if (p.sessionId != null) {
-        void conn.send("Page.screencastFrameAck", { sessionId: p.sessionId });
+        void conn.send("Page.screencastFrameAck", { sessionId: p.sessionId }).catch(() => undefined);
       }
       if (!p.data) return;
       const jpeg = Buffer.from(p.data, "base64");
@@ -451,8 +464,9 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
           height: p.metadata.deviceHeight,
         };
       }
-      const info = await cdpTargetInfo(this.browser!.cdpUrl, tab.id).catch(() => ({}));
-      this.onScreencastFrame?.(jpeg, info);
+      // Never poll the HTTP target list per frame. At full screencast speed that
+      // creates an unbounded request fan-out and eventually wedges Chromium.
+      this.onScreencastFrame?.(jpeg, pageMeta);
     }, tab.wsUrl);
     this.browser!.screencast = conn;
     await conn.send("Page.enable");
@@ -519,7 +533,32 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   }
 
   async ensureBrowser(): Promise<BrowserHandle> {
-    if (this.browser?.cdpUrl) return this.browser;
+    if (this.browserStart) return this.browserStart;
+    const start = this.ensureBrowserReady();
+    this.browserStart = start;
+    try {
+      return await start;
+    } finally {
+      if (this.browserStart === start) this.browserStart = null;
+    }
+  }
+
+  private async ensureBrowserReady(): Promise<BrowserHandle> {
+    if (this.browser?.cdpUrl) {
+      try {
+        await cdpList(this.browser.cdpUrl);
+        return this.browser;
+      } catch {
+        const stale = this.browser;
+        this.stopBrowser();
+        if (stale.proc) {
+          await Promise.race([
+            stale.proc.exited.catch(() => undefined),
+            Bun.sleep(1_000),
+          ]);
+        }
+      }
+    }
     const userDataDir = join(this.desk, ".openbot", "chromium");
     mkdirSync(userDataDir, { recursive: true });
     mkdirSync(chromiumTmpDir(this.desk), { recursive: true });
@@ -564,6 +603,7 @@ export class LocalHostRunner implements ComputeContract, ComputeDriver {
   }
 
   stopBrowser(): void {
+    this.stopTakeover();
     try {
       this.browser?.proc?.kill();
     } catch {
@@ -1280,21 +1320,37 @@ async function launchChromium(
       "about:blank",
     ],
     env,
-    stdout: "pipe",
+    // Chrome can be verbose. Leaving either child pipe unread eventually blocks
+    // the browser process and makes CDP accept connections without responding.
+    stdout: "ignore",
     stderr: "pipe",
   });
+  let stderrTail = "";
+  const stderr = proc.stderr;
+  void (async () => {
+    if (!stderr || typeof stderr === "number") return;
+    const reader = stderr.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        stderrTail = (stderrTail + Buffer.from(value).toString("utf8")).slice(-8_000);
+      }
+    } catch {
+      /* process teardown */
+    }
+  })();
   const deadline = Date.now() + 15_000;
   let lastErr: unknown;
   while (Date.now() < deadline) {
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/json/version`);
+      const res = await cdpFetch(`http://127.0.0.1:${port}/json/version`, undefined, 1_000);
       if (res.ok) return { proc, pid: proc.pid };
     } catch (err) {
       lastErr = err;
     }
     if (proc.exitCode != null) {
-      const err = proc.stderr ? await new Response(proc.stderr).text() : String(lastErr);
-      throw new Error(`chromium_exited: ${err}`);
+      throw new Error(`chromium_exited: ${stderrTail || String(lastErr)}`);
     }
     await Bun.sleep(100);
   }
@@ -1332,15 +1388,28 @@ type CdpTarget = {
   title?: string;
 };
 
+const CDP_HTTP_TIMEOUT_MS = 3_000;
+const CDP_OPEN_TIMEOUT_MS = 5_000;
+const CDP_COMMAND_TIMEOUT_MS = 10_000;
+
+async function cdpFetch(
+  url: string,
+  init?: RequestInit,
+  timeoutMs = CDP_HTTP_TIMEOUT_MS,
+): Promise<Response> {
+  return fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+}
+
 async function cdpList(cdpHttp: string): Promise<CdpTarget[]> {
-  const res = await fetch(`${cdpHttp}/json/list`);
+  const res = await cdpFetch(`${cdpHttp}/json/list`);
+  if (!res.ok) throw new Error(`CDP target list failed with HTTP ${res.status}`);
   return (await res.json()) as CdpTarget[];
 }
 
 async function cdpNewPage(cdpHttp: string): Promise<{ id: string; webSocketDebuggerUrl: string }> {
   for (const method of ["PUT", "GET"] as const) {
     try {
-      const res = await fetch(`${cdpHttp}/json/new?about:blank`, { method });
+      const res = await cdpFetch(`${cdpHttp}/json/new?about:blank`, { method });
       if (!res.ok) continue;
       const created = (await res.json()) as CdpTarget;
       if (created.webSocketDebuggerUrl && created.id) {
@@ -1369,11 +1438,25 @@ async function cdpConnect(
   const url = pageWsUrl ?? (await cdpPageWsUrl(cdpHttp));
   const ws = new WebSocket(url);
   await new Promise<void>((resolve, reject) => {
-    ws.onopen = () => resolve();
-    ws.onerror = (e) => reject(e);
+    const timer = setTimeout(() => {
+      try { ws.close(); } catch { /* already closed */ }
+      reject(new Error("CDP websocket open timed out"));
+    }, CDP_OPEN_TIMEOUT_MS);
+    ws.onopen = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    ws.onerror = () => {
+      clearTimeout(timer);
+      reject(new Error("CDP websocket failed to open"));
+    };
   });
   let next = 1;
-  const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  const pending = new Map<number, {
+    resolve: (v: unknown) => void;
+    reject: (e: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
   ws.onmessage = (ev) => {
     const msg = JSON.parse(String(ev.data)) as {
       id?: number;
@@ -1385,16 +1468,29 @@ async function cdpConnect(
     if (msg.id != null && pending.has(msg.id)) {
       const p = pending.get(msg.id)!;
       pending.delete(msg.id);
+      clearTimeout(p.timer);
       if (msg.error) p.reject(new Error(msg.error.message));
       else p.resolve(msg.result);
       return;
     }
     if (msg.method) onEvent?.(msg.method, msg.params);
   };
+  ws.onclose = () => {
+    for (const [id, item] of pending) {
+      clearTimeout(item.timer);
+      item.reject(new Error("CDP websocket closed"));
+      pending.delete(id);
+    }
+  };
   const send = (method: string, params?: unknown) =>
     new Promise((resolve, reject) => {
       const id = next++;
-      pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`CDP command timed out: ${method}`));
+        try { ws.close(); } catch { /* already closed */ }
+      }, CDP_COMMAND_TIMEOUT_MS);
+      pending.set(id, { resolve, reject, timer });
       ws.send(JSON.stringify({ id, method, params }));
     });
   return { ws, send };

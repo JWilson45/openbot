@@ -2,9 +2,9 @@
 
 OpenBot is a process on a machine you run. That process **is** the desk **and** the org: Grok, Chromium, SQLite, and the web UI. OpenBot does **not** provision cloud VMs (no Fly Machines). Closing a browser tab does not stop the teammate. Stopping `openbot server` — or the VM it runs on — does. If you want work to continue while a laptop is closed, run the service on a host that stays up.
 
-This document is how to run that process as a **user** service (systemd `--user` or a launchd LaunchAgent) and how to federate **two** such hosts. `openbot install` never requires root. Do not run Chromium as root.
+This document is how to run that process as a **user** service (systemd `--user` or a launchd LaunchAgent) and expose the supported protocol endpoints. `openbot install` never requires root. Do not run Chromium as root.
 
-Version: `openbot version` prints `{"openbot":"0.7.0","grokPin":"1.0.5","grok":"…"}`. Pin lives in `packages/acp-grok/src/pin.ts`.
+Version: `openbot version` prints `{"openbot":"0.8.0","grokPin":"1.0.5","grok":"…"}`. Pin lives in `packages/acp-grok/src/pin.ts`.
 
 ---
 
@@ -12,13 +12,31 @@ Version: `openbot version` prints `{"openbot":"0.7.0","grokPin":"1.0.5","grok":"
 
 - **Closing the browser does not stop OpenBot.** The SPA is a client. Turns continue on the host.
 - **Stopping the service does.** `systemctl --user stop openbot`, `launchctl bootout …`, or killing the process ends Grok, Chromium, and in-flight turns.
-- **Stopping the VM makes that org unreachable.** Peers get timeouts. There is no hosted retry queue. sqlite, `org.ed25519`, and inbox rows stay on disk (`held` / `pending`).
+- **Stopping the VM makes that org unreachable.** Protocol clients get connection failures. There is no hosted retry queue. SQLite state stays on disk.
 - **Laptop-closed:** the **service host** must stay powered and reachable. A sleeping laptop is a stopped desk. Use a VPS, home server, or a Mac/PC that does not sleep.
 - **The calendar clock is the process.** Calendar fire does not survive a stopped unit, a stopped VM, or a closed laptop: the 9am did not happen. At most one catch-up if you were down less than a day; OpenBot will not replay a weekend of missed summaries. Closing the tab does not stop a turn the calendar already queued. Stopping the process stops the clock **and** the turn.
-- `$OPENBOT_HOME/desk` is a shared computer, not a security boundary **inside** an org. Cross-org is messages only (one hop: A→B). Ada on A cannot spawn Grok on B. Grok’s process `HOME` is `$OPENBOT_HOME/grok-home`, not the service user’s home. Vault files are outside `desk/` and blocked by the ACP path guard (and by `OPENBOT_SANDBOX` when a backend is present). That is not Ada-vs-Bob isolation and not a dedicated-user jail. Skills live in `desk/skills/` (shared; overlay names only). Optional `desk/projects/<botId>/SOUL.md` is never auto-created. Operator `~/.grok/skills` are not loaded. Standing notes live in sqlite, not on the desk.
-- Bind defaults to **127.0.0.1**. OpenBot does **not** implement TLS. Put Caddy or nginx in front if you need a hostname. Caddy **must** 404 `/mcp/v1`; `/fed/v1` is the public federation surface.
-- **Federation is off until you turn it on** (`openbot gateway on` on **both** sides). Off does not delete the Gateway row or `org.ed25519`.
+- `$OPENBOT_HOME/desk` is a shared computer, not a security boundary **inside** an org. Grok’s process `HOME` is `$OPENBOT_HOME/grok-home`, not the service user’s home. Vault files are outside `desk/` and blocked by the ACP path guard (and by `OPENBOT_SANDBOX` when a backend is present). That is not Ada-vs-Bob isolation and not a dedicated-user jail. Skills live in `desk/skills/` (shared; overlay names only). Optional `desk/projects/<botId>/SOUL.md` is never auto-created. Operator `~/.grok/skills` are not loaded. Standing notes live in SQLite, not on the desk.
+- Bind defaults to **127.0.0.1**. OpenBot does **not** implement TLS. Put Caddy or nginx in front if you need a hostname, and explicitly deny the private runtime bridge.
+- The old federation HTTP API and peer-deployment workflow are not part of the frozen protocol stack. Do not deploy or configure them.
 - OpenBot does **not** provision Fly Machines or any cloud VM API. You bring the hosts.
+
+---
+
+## Protocol surface at the cutover
+
+These are the only externally routable agent-protocol surfaces:
+
+| Surface | Path | Exposure |
+| --- | --- | --- |
+| MCP | `/mcp` | Public route; Streamable HTTP clients authenticate as required by the server. |
+| A2A | `/a2a/v1` | Public A2A JSON-RPC route. |
+| A2A Agent Card | `/.well-known/agent-card.json` | Public discovery document advertising `/a2a/v1`. |
+| AG-UI | `/ag-ui/v1/*` | Public AG-UI run, replay, and cancel routes. |
+| Grok runtime bridge | `/internal/runtime/mcp` | **Private.** Loopback-only compatibility bridge for the Grok runtime; never a client integration endpoint. |
+
+`/mcp/v1` and every `/fed/v1/*` route were removed. There is no compatibility alias or federation deployment path. Update clients to `/mcp` or A2A as appropriate.
+
+The server itself rejects a non-loopback `Host` for `/internal/runtime/mcp`. A public reverse proxy must also return `404` for that path so the request never reaches OpenBot. Proxy `/mcp`, `/a2a/v1`, `/.well-known/agent-card.json`, and `/ag-ui/v1/*` normally; “public” here means externally routable, not unauthenticated.
 
 ---
 
@@ -134,6 +152,7 @@ loginctl enable-linger "$USER"
 | `OPENBOT_GITHUB_CLIENT_ID` / `OPENBOT_GITHUB_CLIENT_SECRET` | GitHub OAuth app. |
 | `OPENBOT_GITHUB_ALLOWLIST` | Extra comma-separated GitHub logins (also `openbot allowlist add`). |
 | `OPENBOT_DEV_LOGIN` | `1` enables `/auth/local` (loopback Host only). `demo` sets this. Do not enable on a public origin. |
+| `OPENBOT_HTTP_LOG` | `1` logs all HTTP request start/completion records. Slow, failed, aborted, and streaming lifecycle records are emitted regardless. Request logs omit query strings, headers, and bodies. |
 | `OPENBOT_MASTER_KEY` | Override vault master. Prefer `$OPENBOT_HOME/master.key` (`0600`). |
 | `OPENBOT_CHROME` | Chromium/Chrome binary if not on PATH. |
 | `OPENBOT_ACP_IDLE_MS` | Kill idle **desk** Grok ACP children after this many ms. Default 7200000 (2 hours). `0` disables **desk** idle kill only — it does **not** disable Gateway. |
@@ -141,8 +160,6 @@ loginctl enable-linger "$USER"
 | `OPENBOT_ACP_COMPACT_TURNS` | Warm compact after this many successful ACP turns on the session. Default 20. `0` disables this trigger. Desk and Gateway share the knob. |
 | `OPENBOT_ACP_COMPACT_CHARS` | Warm compact when accumulated sent prompt chars plus the next inner body is `>=` this. Default 48000. `0` disables this trigger only. |
 | `OPENBOT_ACP_COMPACT_ON_SWITCH` | `1` compact (`session/new` + cold digest) on thread switch instead of a switch-banner prefix. Default `0`. |
-| `OPENBOT_FEDERATION` | Panic **off:** `0` makes federation effective-off even if the DB flag is on. Unset/`1` does **not** force on. Restart the unit so the process sees env. `GET /fed/v1/info` still works. |
-| `OPENBOT_FED_ALLOW_HTTP` | `1` allows RFC1918 `http://` peer URLs (LAN). Default is https, plus loopback `http://127.0.0.1` / `localhost`. |
 | `OPENBOT_SANDBOX` | Optional Grok-child sandbox (`auto` / `none` / `bwrap` / `seatbelt` / `required`). Default `auto`. The **server** process is not sandboxed. |
 
 Units from `install` bind `--host 127.0.0.1` and snapshot `PATH` so `grok` is found. Do not point the **unit** `HOME` at `OPENBOT_HOME` or at `grok-home`; the server still reads `~/.grok/auth.json` of the **service user** and copies it into `grok-home/`. Only the Grok child gets `HOME=grok-home`.
@@ -202,11 +219,18 @@ Prefer: bind 127.0.0.1 + reverse proxy on 443, and set `OPENBOT_PUBLIC_ORIGIN=ht
 
 OpenBot speaks HTTP on loopback. Terminate HTTPS yourself.
 
-Example Caddyfile: `contrib/caddy/Caddyfile.example`. MCP is loopback-only (Grok talks to `http://127.0.0.1:{port}/mcp/v1`, not through Caddy). `/fed/v1` **must** be proxied — that is the public federation surface.
+Example Caddyfile: `contrib/caddy/Caddyfile.example`. Proxy the public protocol routes `/mcp`, `/a2a/v1`, `/.well-known/agent-card.json`, and `/ag-ui/v1/*`. The Grok adapter talks to `/internal/runtime/mcp` directly over loopback; Caddy must deny that private route.
 
 ```caddy
 desk.example.com {
+	handle /internal/runtime/mcp* {
+		respond 404
+	}
+	# Retired protocol paths stay unavailable during the cutover.
 	handle /mcp/v1* {
+		respond 404
+	}
+	handle /fed/v1* {
 		respond 404
 	}
 	handle {
@@ -225,7 +249,16 @@ server {
     server_name desk.example.com;
     # ssl_certificate / ssl_certificate_key — your certs
 
-    location /mcp/v1 {
+    location ^~ /internal/runtime/mcp {
+        return 404;
+    }
+
+    # Retired protocol paths stay unavailable during the cutover.
+    location ^~ /mcp/v1 {
+        return 404;
+    }
+
+    location ^~ /fed/v1 {
         return 404;
     }
 
@@ -280,9 +313,9 @@ To change what OpenBot considers current, edit `PINNED_GROK_CLI` in `packages/ac
 | --- | --- |
 | Close the tab, reload, crash Chrome | Keep running |
 | `systemctl --user stop openbot` / `launchctl bootout` / Ctrl-C | Stop |
-| Host sleeps, shuts down, loses power, or you stop the VM | Org **unreachable**. Peers time out. Disk identity and inbox remain. |
+| Host sleeps, shuts down, loses power, or you stop the VM | Org **unreachable**. Protocol clients fail. SQLite state remains. |
 
-Restarting the service starts a new Grok ACP process. Chat history is in SQLite; OpenBot injects a thread digest on the next turn. Federation inbox already stored stays on disk (`held` or `pending`).
+Restarting the service starts a new Grok ACP process. Chat history is in SQLite; OpenBot injects a thread digest on the next turn.
 
 ---
 
@@ -298,241 +331,10 @@ Disk for `$OPENBOT_HOME` and Chromium also live on that host. Stopping that VM m
 
 ---
 
-## Two VMs, two orgs (federation)
+## Retired federation deployment
 
-One `openbot server` process is one org: one `$OPENBOT_HOME`, one sqlite, one Ed25519 key, one GitHub allowlist, one set of `sk-ob_…` keys. A second VM is a **second process**. Switching org in a client means switching **base URL** (and the key minted on that VM).
+> **Removed at the protocol cutover. This is a migration warning, not a runbook.**
 
-OpenBot does **not** provision the VMs. No Fly Machines, no Machines API, no remote runner (Grok on B driven from A). You install the same binary twice.
+The former two-host peer/federation workflow is unsupported, and its `/fed/v1/*` routes no longer exist. Do not reuse legacy gateway/peer CLI procedures, federation environment variables, copied Ed25519 identities, or old reverse-proxy rules. Existing federation rows or key files in an upgraded data directory are inert legacy state, not evidence that the public API is available.
 
-Trust is **bidirectional**. A `peers add` B **and** B `peers add` A **and both** `openbot gateway on`. One-way allowlist = `401 unknown_peer` on the reverse path. **hop is 1:** a message is A→B only. B does not forward it to C.
-
-### Assumptions
-
-| | VM A | VM B |
-| --- | --- | --- |
-| Public origin | `https://org-a.example.com` | `https://org-b.example.com` |
-| Slug | `acme` | `beta` |
-| Bind | `127.0.0.1:8787` | `127.0.0.1:8787` |
-
-Do every step on **each** VM unless a heading says otherwise. Do not copy `$OPENBOT_HOME`, `org.ed25519`, or `OPENBOT_ORG_ID` from one VM to the other (`OPENBOT_ORG_ID` mismatch with stored `org_id` refuses to boot).
-
-### 1. Install the unit
-
-Binary or git checkout (same as above):
-
-```bash
-# curl -fsSL https://github.com/JWilson45/openbot/releases/latest/download/install.sh | bash
-openbot version
-openbot install --user --org acme --port 8787   # VM B: --org beta
-# then load / enable --now, or pass --start
-```
-
-`grok login` as the **same user** the unit runs as, on **that** VM. A laptop Grok login does not count.
-
-GitHub OAuth callback is `$OPENBOT_PUBLIC_ORIGIN/auth/callback/github` **on that VM**. Add both callbacks to the OAuth app (or use two apps). Allowlist the operator login on each home:
-
-```bash
-bun run openbot -- allowlist add your-github-login
-```
-
-### 2. Origin + TLS
-
-Bind **127.0.0.1**. Terminate HTTPS at Caddy. Set origin on the **service**, not in the Caddyfile. `createApp` snapshots `publicOrigin` from env at boot — reload the unit after writing env or OAuth/cookies still use the listen origin.
-
-**systemd** drop-in (VM A). Path: `~/.config/systemd/user/openbot.service.d/oauth.conf`:
-
-```ini
-[Service]
-Environment=OPENBOT_PUBLIC_ORIGIN=https://org-a.example.com
-Environment=OPENBOT_GITHUB_CLIENT_ID=…
-Environment=OPENBOT_GITHUB_CLIENT_SECRET=…
-```
-
-Then:
-
-```bash
-systemctl --user daemon-reload && systemctl --user restart openbot
-```
-
-On VM B use `OPENBOT_PUBLIC_ORIGIN=https://org-b.example.com` in the same drop-in path, then daemon-reload/restart there.
-
-**launchd:** add the same keys to `EnvironmentVariables` in `~/Library/LaunchAgents/ai.openbot.plist`, then:
-
-```bash
-launchctl bootout gui/$UID/ai.openbot    # ignore errors if not loaded
-launchctl bootstrap gui/$UID ~/Library/LaunchAgents/ai.openbot.plist
-```
-
-Caddy on **each** VM **must** 404 MCP and proxy the rest (including `/fed/v1`). Install the site block and reload Caddy (`sudo systemctl reload caddy`, or `caddy reload --config /etc/caddy/Caddyfile`).
-
-```caddy
-# VM A
-org-a.example.com {
-	handle /mcp/v1* {
-		respond 404
-	}
-	handle {
-		reverse_proxy 127.0.0.1:8787
-	}
-}
-
-# VM B — that host's Caddyfile
-org-b.example.com {
-	handle /mcp/v1* {
-		respond 404
-	}
-	handle {
-		reverse_proxy 127.0.0.1:8787
-	}
-}
-```
-
-`--host 0.0.0.0` remains the warned hatch. `/auth/local` is loopback `Host` only — do not enable `OPENBOT_DEV_LOGIN` on a public origin.
-
-### 3. Org init (zero users)
-
-Identity and the Ed25519 key exist **before the first login**. Gateway does not. The CLI does **not** read the systemd drop-in — export origin in this shell.
-
-```bash
-# VM A
-export OPENBOT_PUBLIC_ORIGIN=https://org-a.example.com
-bun run openbot -- org init acme --name "Acme"
-bun run openbot -- org
-# { orgId, slug, name, publicOrigin, pubkey, federationEnabled: false, gateway: null, home, profile }
-
-# VM B
-export OPENBOT_PUBLIC_ORIGIN=https://org-b.example.com
-bun run openbot -- org init beta --name "Beta"
-bun run openbot -- org
-```
-
-`org init <slug>` registers a profile (first init on a machine that already has `~/.openbot/openbot.sqlite` **adopts** that directory; otherwise `$HOME/.openbot/orgs/<slug>`). It writes `org.json` and upserts `org_meta` (it never rotates `org_id`). FQDN origins such as `org-a.example.com` do **not** auto-slug — they become `local` unless you pass the slug / `OPENBOT_ORG_SLUG` / `org.json`. `--home` still pins a path when you need it.
-
-Restart the unit again so the process is up with that origin, **then** probe (repeat on VM B with `org-b.example.com`):
-
-```bash
-systemctl --user daemon-reload && systemctl --user restart openbot
-# launchd: bootout / bootstrap as in step 2
-
-curl -sS -o /dev/null -w '%{http_code}\n' https://org-a.example.com/mcp/v1
-# 404
-
-curl -sS https://org-a.example.com/fed/v1/info
-# JSON: gateway null (no login yet), caps.federation: "off", caps.hopLimit: 1, pubkey set
-```
-
-`GET /fed/v1/info` is public (rate-limited) and is **not** a solicitation.
-
-### 4. First login (Gateway row, federation still off)
-
-Sign in with an allowlisted GitHub user on each origin. First login creates the org account and auto-provisions a **Gateway** bot (`role='gateway'`, not a seventh desk slot).
-
-```bash
-bun run openbot -- org
-# gateway: { id, name: "Gateway" }, federationEnabled: still false
-```
-
-`GET /v1/bots.bots[]` stays desk-only. Gateway is an API sidecar (`GET /v1/bots.gateway`, `enabled: false`). `GET /v1/models` lists `openbot/Gateway` once the row exists; listing it does **not** send org mail. This cut has **no SPA Gateway rail** — talk to the diplomat from Open WebUI as `openbot/Gateway`.
-
-Federation **off** means: no Gateway ACP child (RAM valve), `POST /fed/v1/messages` from a trusted peer is `403 federation_disabled` with inbox `held`, `SendToOrg` would fail `federation_off`. An Open WebUI / `openbot/Gateway` completion gets a system line, not a Grok turn.
-
-### 5. `openbot gateway on` on **both**
-
-```bash
-# VM A
-bun run openbot -- gateway on
-# VM B
-bun run openbot -- gateway on
-```
-
-Writes `org_meta.federation_enabled`. Does **not** delete the Gateway row or keys. `OPENBOT_FEDERATION=0` in the unit env still wins (panic; cannot force on). Cookie API (not `sk-ob_…`): `PATCH /v1/org { "federationEnabled": true }`.
-
-| Control | Live? | Can force ON? | Can force OFF? |
-| --- | --- | --- | --- |
-| `openbot gateway on` / `off` | Yes (DB) | Yes, unless env is `0` | Yes |
-| `PATCH /v1/org { federationEnabled }` | Yes (DB) | Yes, unless env is `0` | Yes |
-| `OPENBOT_FEDERATION=0` in the unit env | After the process sees env (restart the unit) | **No** | **Yes** |
-
-Turning **on** flips `held` → `pending` and may spawn Gateway ACP on the next inbound mail or Open WebUI / `openbot/Gateway` completion.
-
-### 6. Peers add both ways (A→B and B→A)
-
-Copy identity from the **peer** with the public GET or local CLI (no cookie). Map fields 1:1:
-
-| Peer JSON (`openbot org` or `GET /fed/v1/info`) | `peers add` flag |
-| --- | --- |
-| `orgId` | `--org-id` |
-| `pubkey` | `--pubkey` — standard base64 of the **raw 32-byte** Ed25519 key, **not PEM** |
-| `publicOrigin` | `--url` (origin only, no path) |
-| `slug` | `--slug` |
-
-```bash
-# on VM B — print what Acme will paste
-bun run openbot -- org
-# or: curl -sS https://org-b.example.com/fed/v1/info
-
-# on VM A: allow Beta (paste Beta's orgId / pubkey / publicOrigin)
-bun run openbot -- peers add \
-  --slug beta \
-  --url https://org-b.example.com \
-  --pubkey "$BETA_PUBKEY" \
-  --org-id "$BETA_ORG_ID"
-
-# on VM B: allow Acme (paste Acme's orgId / pubkey / publicOrigin)
-bun run openbot -- peers add \
-  --slug acme \
-  --url https://org-a.example.com \
-  --pubkey "$ACME_PUBKEY" \
-  --org-id "$ACME_ORG_ID"
-
-bun run openbot -- peers
-```
-
-Optional preview (no insert): `POST /v1/org/peers/from-info` needs a cookie **session** (`openbot_session`), not `sk-ob_…`. Prefer the public GET above.
-
-`org_peers.slug` is UNIQUE on that sqlite (`SendToOrg({ org: "beta" })` must be unambiguous). Outbound `baseUrl` is **https** except loopback `http://127.0.0.1` / `localhost` (or RFC1918 http when `OPENBOT_FED_ALLOW_HTTP=1`). Link-local and metadata IPs are blocked. There is **no TOFU** and **no auto-add**.
-
-Unsigned “please add me”, unknown org, bad signature, `hop ≠ 1`: **not mail**. See [Off, held, solicit](#off-held-solicit).
-
-### 7. Open WebUI: second connection = second org
-
-There is no OpenAI `organization` object. Each VM is another OpenAI provider.
-
-| Org | Base URL | API key | Model |
-| --- | --- | --- | --- |
-| Acme | `https://org-a.example.com/v1` | `sk-ob_…` minted **on Acme** | `openbot/Ada`, `openbot/Gateway` |
-| Beta | `https://org-b.example.com/v1` | `sk-ob_…` minted **on Beta** | `openbot/Ada`, `openbot/Gateway` |
-
-Mint the key in that VM’s Settings (or `POST /v1/api-keys` with **that** origin’s cookie). Keys do not work on the other sqlite. Completions enqueue the bot’s **human** thread on that process. Completions to `openbot/Gateway` are a local DM on that VM (this cut has no SPA Gateway rail); they send org mail only if federation is on and Gateway calls `SendToOrg`.
-
-### Off, held, solicit
-
-| Inbound | Federation **on** | Federation **off** |
-| --- | --- | --- |
-| Trusted (allowlisted + valid JWS + `hop=1`) | `org_inbox` `pending`, at most one Gateway turn | `org_inbox` `held`, **403** `federation_disabled`, **no** ACP |
-| Untrusted (unknown peer, bad sig, `hop ≠ 1`, oversize, …) | **Not mail.** 401/400. Capped solicitation notice. No inbox pending. | Same (untrusted never becomes `held`) |
-
-Untrusted solicits are **not mail** (no `org_inbox` row). They are a capped Gateway-DM `origin='system'` notice (Open WebUI `openbot/Gateway`; Settings → Peers/Trust when that UI exists) plus `audit_events` `fed.solicit` / `org_solicit`. Coalesced **one per (peer org id or IP /24) per hour**. Copy looks like: `Org acme (https://…) tried to send mail. Not on your peer list — ignored.` Bad signature on a claimed peer: `Claimed acme but the signature failed — ignored.` `GET /v1/org/inbox` is **trusted** `pending`/`held` only — it will not show “not on your peer list” notices. `GET /fed/v1/info` is not a solicitation.
-
-Turn federation **off** anytime: `openbot gateway off`, `PATCH /v1/org { "federationEnabled": false }`, or `OPENBOT_FEDERATION=0`. Schema, Gateway row, peers, and keys stay. Held mail waits until you turn it on.
-
-### Hop = 1
-
-A federation message **never leaves the second org**. `hop` MUST be 1 (reject missing / `0` / `2` — not mail). Gateway may reply to the **sender** (new `id`, hop=1). It must not forward inbound mail to a third org. There is no A→B→C.
-
-### RAM and mention cap
-
-Idle TTL is the laptop valve. Chromium lazy-starts. Gateway turns must not start it. Stopping the VM makes the org unreachable; disk stays.
-
-| Layout | RAM ballpark |
-| --- | --- |
-| 1 desk bot + Gateway cold + no Chrome | ~2–4 GB |
-| 3 desk bots warm + Gateway + Chrome | ~8 GB |
-| 6 desk + Gateway warm + Chrome | **16 GB** comfortable; 8 GB will OOM under parallel turns |
-| `@mention` of 3 bots (when groups ship) | 3 concurrent Grok turns — planning warning even with the cap |
-
-This cut has no group threads. When groups ship, `@mention` (and `SendToThread` fan-out) caps at **3 distinct member bots** per message; a bare “hello” queues nobody. `@Ada @Bob @Cara @Dana @Eve @Frank` would still burn three Groks. Desk cap stays 6; Gateway does not consume a roster slot.
-
-### Non-goal: Fly Machines
-
-This runbook is **BYO host or VM**. OpenBot does not call Fly, Docker-as-provisioner, or any Machines API. A catalog of org URLs you edit by hand is not a provisioner. Remote runner (orchestrator on A, grok on B) is out. Same binary, two installs.
+For standards-based agent-to-agent traffic, discover this host at `/.well-known/agent-card.json` and use the advertised `/a2a/v1` endpoint with the required bearer credential. A second host is still a separate OpenBot installation and data store; OpenBot does not provision it.

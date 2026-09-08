@@ -1,21 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { OpenbotDb, id } from "@openbot/db";
-import { loadOrCreateMasterKey } from "@openbot/vault";
-import { verifyFedJws } from "@openbot/federation";
 import { createApp } from "../apps/server/src/app.ts";
 import {
-  clientRateKey,
   currentOrgMeta,
   deriveOrgSlug,
-  ensureOrgKeypair,
   ensureOrgMeta,
-  FED_INFO_RATE_LIMIT,
-  FED_INFO_RATE_WINDOW_MS,
-  loadOrgKeypair,
-  orgEd25519Path,
-  SlidingWindowRateLimiter,
 } from "../apps/server/src/org.ts";
 import { loginCookie, startTestServer } from "../apps/server/src/test-helpers.ts";
 import { tempHome } from "./helpers.ts";
@@ -32,7 +23,6 @@ async function runOpenbot(
     "OPENBOT_ORG_SLUG",
     "OPENBOT_ORG_NAME",
     "OPENBOT_PUBLIC_ORIGIN",
-    "OPENBOT_FEDERATION",
   ] as const) {
     if (env && Object.prototype.hasOwnProperty.call(env, key)) continue;
     delete spawned[key];
@@ -73,9 +63,7 @@ describe("ensureOrgMeta", () => {
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
     );
     expect(row.slug).toBe("local");
-    expect(row.federation_enabled).toBe(0);
     expect(row.timezone).toBe("UTC");
-    expect(row.pubkey).toBe("");
     expect(row.account_id == null).toBe(true);
     const again = ensureOrgMeta(db, { advertisedOrigin: "http://127.0.0.1:8787" });
     expect(again.org_id).toBe(row.org_id);
@@ -175,31 +163,28 @@ describe("ensureOrgMeta", () => {
 });
 
 describe("org HTTP", () => {
-  test("GET /fed/v1/info is public, gateway null, federation off, 32-byte pubkey", async () => {
-    const { server, origin, ctx } = startTestServer({
-      home: tempHome(),
-      publicOrigin: "http://127.0.0.1:8787",
-    });
-    const res = await fetch(`${origin}/fed/v1/info`);
-    expect(res.status).toBe(200);
-    const json = (await res.json()) as {
-      orgId: string;
-      slug: string;
-      pubkey: string;
-      gateway: unknown;
-      caps: { protocol: string; federation: string; hopLimit: number; attachments: boolean };
-    };
-    const row = currentOrgMeta(ctx.db)!;
-    expect(json.orgId).toBe(row.org_id);
-    expect(json.slug).toBe("local");
-    expect(json.gateway).toBeNull();
-    expect(json.caps.federation).toBe("off");
-    expect(json.caps.protocol).toBe("openbot-fed/1");
-    expect(json.caps.hopLimit).toBe(1);
-    expect(json.caps.attachments).toBe(false);
-    expect(json.pubkey).toBe(row.pubkey);
-    expect(Buffer.from(json.pubkey, "base64").length).toBe(32);
-    server.stop(true);
+  test("legacy federation transport routes are removed", async () => {
+    const { server, origin, ctx } = startTestServer({ home: tempHome() });
+    try {
+      const { cookie } = loginCookie({ ctx }, "alice");
+      const headers = { cookie, "content-type": "application/json" };
+      const statuses = {
+        info: (await fetch(`${origin}/fed/v1/info`)).status,
+        messages: (await fetch(`${origin}/fed/v1/messages`, { method: "POST", body: "{}" })).status,
+        inbox: (await fetch(`${origin}/v1/org/inbox`, { headers })).status,
+        peers: (await fetch(`${origin}/v1/org/peers`, { headers })).status,
+        peerDiscovery: (
+          await fetch(`${origin}/v1/org/peers/from-info`, {
+            method: "POST",
+            headers,
+            body: "{}",
+          })
+        ).status,
+      };
+      expect(statuses).toEqual({ info: 404, messages: 404, inbox: 404, peers: 404, peerDiscovery: 404 });
+    } finally {
+      server.stop(true);
+    }
   });
 
   test("GET /v1/readyz stays { ok, home, desk } without orgId", async () => {
@@ -228,62 +213,19 @@ describe("org HTTP", () => {
       slug: string;
       name: string;
       publicOrigin: string | null;
-      federationEnabled: boolean;
       timezone: string;
     };
     const row = currentOrgMeta(ctx.db)!;
     expect(json.orgId).toBe(row.org_id);
     expect(json.slug).toBe(row.slug);
-    expect(json.federationEnabled).toBe(false);
     expect(json.timezone).toBe("UTC");
+    expect(json).not.toHaveProperty("federationEnabled");
+    expect(json).not.toHaveProperty("pubkey");
     expect(json).not.toHaveProperty("gateway");
     server.stop(true);
   });
 
-  test("PATCH /v1/org toggles federationEnabled; env 0 still wins", async () => {
-    const { server, origin, ctx } = startTestServer({ home: tempHome() });
-    const { cookie } = loginCookie({ ctx }, "alice");
-    const headers = { cookie, "content-type": "application/json" };
-    const anon = await fetch(`${origin}/v1/org`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ federationEnabled: true }),
-    });
-    expect(anon.status).toBe(401);
-    const on = await fetch(`${origin}/v1/org`, {
-      method: "PATCH",
-      headers,
-      body: JSON.stringify({ federationEnabled: true }),
-    });
-    expect(on.status).toBe(200);
-    const stored = (await on.json()) as { federationEnabled: boolean };
-    expect(stored.federationEnabled).toBe(true);
-    expect(currentOrgMeta(ctx.db)?.federation_enabled).toBe(1);
-    const prev = process.env.OPENBOT_FEDERATION;
-    process.env.OPENBOT_FEDERATION = "0";
-    try {
-      const info = (await fetch(`${origin}/fed/v1/info`).then((r) => r.json())) as {
-        caps: { federation: string };
-      };
-      expect(info.caps.federation).toBe("off");
-      const org = (await fetch(`${origin}/v1/org`, { headers }).then((r) => r.json())) as {
-        federationEnabled: boolean;
-      };
-      expect(org.federationEnabled).toBe(false);
-    } finally {
-      if (prev === undefined) delete process.env.OPENBOT_FEDERATION;
-      else process.env.OPENBOT_FEDERATION = prev;
-    }
-    const off = await fetch(`${origin}/v1/org`, {
-      method: "PATCH",
-      headers,
-      body: JSON.stringify({ federationEnabled: false }),
-    });
-    expect(((await off.json()) as { federationEnabled: boolean }).federationEnabled).toBe(false);
-    server.stop(true);
-  });
-
-  test("PATCH /v1/org timezone is IANA, default UTC, unknown keys ignored", async () => {
+  test("PATCH /v1/org timezone is IANA, default UTC, and unknown keys are rejected atomically", async () => {
     const { server, origin, ctx } = startTestServer({ home: tempHome() });
     const { cookie } = loginCookie({ ctx }, "alice");
     const headers = { cookie, "content-type": "application/json" };
@@ -297,15 +239,23 @@ describe("org HTTP", () => {
     expect(bad.status).toBe(400);
     expect(((await bad.json()) as { error: string }).error).toBe("invalid_timezone");
     expect(currentOrgMeta(ctx.db)?.timezone).toBe("UTC");
-    const on = await fetch(`${origin}/v1/org`, {
+    const unknown = await fetch(`${origin}/v1/org`, {
       method: "PATCH",
       headers,
       body: JSON.stringify({ timezone: "America/New_York", ignored: true }),
     });
+    expect(unknown.status).toBe(400);
+    expect(currentOrgMeta(ctx.db)?.timezone).toBe("UTC");
+    const on = await fetch(`${origin}/v1/org`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ timezone: "America/New_York" }),
+    });
     expect(on.status).toBe(200);
-    const stored = (await on.json()) as { timezone: string; federationEnabled: boolean };
+    const stored = (await on.json()) as { timezone: string };
     expect(stored.timezone).toBe("America/New_York");
-    expect(stored.federationEnabled).toBe(false);
+    expect(stored).not.toHaveProperty("federationEnabled");
+    expect(stored).not.toHaveProperty("pubkey");
     expect(currentOrgMeta(ctx.db)?.timezone).toBe("America/New_York");
     server.stop(true);
   });
@@ -320,15 +270,13 @@ describe("openbot org CLI", () => {
     const json = JSON.parse(stdout.trim()) as {
       orgId: string;
       slug: string;
-      federationEnabled: boolean;
-      gateway: unknown;
-      pubkey: string;
+      gateway?: unknown;
     };
     expect(json.orgId).toMatch(/^[0-9a-f-]{36}$/i);
     expect(json.slug).toBe("local");
-    expect(json.federationEnabled).toBe(false);
-    expect(json.gateway).toBeNull();
-    expect(Buffer.from(json.pubkey, "base64").length).toBe(32);
+    expect(json).not.toHaveProperty("federationEnabled");
+    expect(json).not.toHaveProperty("pubkey");
+    expect(json).not.toHaveProperty("gateway");
     const db = OpenbotDb.open(join(home, "openbot.sqlite"));
     expect(db.all("SELECT id FROM users").length).toBe(0);
     db.close();
@@ -385,45 +333,6 @@ describe("openbot org CLI", () => {
     expect(fqdn.code).not.toBe(0);
   });
 
-  test("openbot gateway on|off writes DB and does not delete Gateway", async () => {
-    const home = tempHome();
-    const created = startTestServer({ home });
-    loginCookie({ ctx: created.ctx }, "alice");
-    const gw = created.ctx.db.get<{ id: string; name: string }>(
-      "SELECT id, name FROM bots WHERE IFNULL(role, 'desk') = 'gateway'",
-    );
-    expect(gw).toBeTruthy();
-    created.server.stop(true);
-
-    const on = await runOpenbot(["gateway", "on", "--home", home]);
-    expect(on.code).toBe(0);
-    const onJson = JSON.parse(on.stdout.trim()) as {
-      federationEnabled: boolean;
-      gateway: { id: string; name: string } | null;
-    };
-    expect(onJson.federationEnabled).toBe(true);
-    expect(onJson.gateway?.id).toBe(gw!.id);
-
-    const prev = process.env.OPENBOT_FEDERATION;
-    const envOff = await runOpenbot(["gateway", "on", "--home", home], { OPENBOT_FEDERATION: "0" });
-    expect(envOff.code).toBe(0);
-    expect((JSON.parse(envOff.stdout.trim()) as { federationEnabled: boolean }).federationEnabled).toBe(
-      false,
-    );
-    if (prev === undefined) delete process.env.OPENBOT_FEDERATION;
-    else process.env.OPENBOT_FEDERATION = prev;
-
-    const off = await runOpenbot(["gateway", "off", "--home", home]);
-    expect(off.code).toBe(0);
-    expect((JSON.parse(off.stdout.trim()) as { federationEnabled: boolean }).federationEnabled).toBe(false);
-    const db = OpenbotDb.open(join(home, "openbot.sqlite"));
-    expect(db.get<{ n: number }>("SELECT COUNT(*) as n FROM bots WHERE id = ?", [gw!.id])?.n).toBe(1);
-    expect(db.get<{ federation_enabled: number }>("SELECT federation_enabled FROM org_meta")?.federation_enabled).toBe(
-      0,
-    );
-    db.close();
-  });
-
   test("openbot demo does not persist listen origin over org.json", async () => {
     const home = tempHome();
     writeFileSync(
@@ -466,118 +375,3 @@ async function readUntil(stream: ReadableStream<Uint8Array>, needle: string): Pr
   }
   return text;
 }
-
-describe("org.ed25519 keypair", () => {
-  test("createApp writes sealed file, no lastFour, no credentials row", () => {
-    const home = tempHome();
-    const created = createApp({ home, port: 0, env: {} });
-    try {
-      const path = orgEd25519Path(home);
-      expect(existsSync(path)).toBe(true);
-      expect(statSync(path).mode & 0o777).toBe(0o600);
-      const file = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-      expect(file.v).toBe(1);
-      expect(file).not.toHaveProperty("lastFour");
-      expect(Object.keys(file).sort()).toEqual(["ciphertext", "dekWrapped", "keyId", "pubkey", "v"]);
-      expect(readFileSync(path, "utf8")).not.toContain("BEGIN PRIVATE KEY");
-      expect(created.ctx.db.all("SELECT id FROM credentials")).toHaveLength(0);
-      expect(created.ctx.db.all("SELECT id FROM users")).toHaveLength(0);
-      expect(Buffer.from(String(file.pubkey), "base64").length).toBe(32);
-    } finally {
-      created.stop();
-    }
-  });
-
-  test("round-trip: generate, reopen home, new process signs fixture JWS", async () => {
-    const home = tempHome();
-    const first = createApp({ home, port: 0, env: {} });
-    const orgId = currentOrgMeta(first.ctx.db)!.org_id;
-    const pubkey = currentOrgMeta(first.ctx.db)!.pubkey;
-    first.stop();
-
-    const second = createApp({ home, port: 0, env: {} });
-    expect(currentOrgMeta(second.ctx.db)!.pubkey).toBe(pubkey);
-    second.stop();
-
-    const msgId = "11111111-1111-1111-1111-111111111111";
-    const aud = "22222222-2222-2222-2222-222222222222";
-    const body = JSON.stringify({ id: msgId });
-    const repo = join(import.meta.dir, "..");
-    const proc = Bun.spawn({
-      cmd: [
-        process.execPath,
-        "-e",
-        `import { join } from "node:path";
-import { OpenbotDb } from "./packages/db/src/index.ts";
-import { loadOrCreateMasterKey } from "./packages/vault/src/index.ts";
-import { signFedJws } from "./packages/federation/src/index.ts";
-import { currentOrgMeta, loadOrgKeypair } from "./apps/server/src/org.ts";
-const home = process.env.OPENBOT_ROUNDTRIP_HOME;
-if (!home) throw new Error("missing home");
-const master = loadOrCreateMasterKey(home);
-const key = loadOrgKeypair(home, master);
-const db = OpenbotDb.open(join(home, "openbot.sqlite"));
-const org = currentOrgMeta(db);
-if (!org) throw new Error("missing org");
-const jws = signFedJws({
-  privateKey: key.privateKey,
-  fromOrgId: org.org_id,
-  toOrgId: process.env.OPENBOT_ROUNDTRIP_AUD,
-  messageId: process.env.OPENBOT_ROUNDTRIP_JTI,
-  rawBody: process.env.OPENBOT_ROUNDTRIP_BODY,
-});
-console.log(jws);
-db.close();
-`,
-      ],
-      cwd: repo,
-      stdout: "pipe",
-      stderr: "pipe",
-      env: {
-        ...process.env,
-        OPENBOT_ROUNDTRIP_HOME: home,
-        OPENBOT_ROUNDTRIP_AUD: aud,
-        OPENBOT_ROUNDTRIP_JTI: msgId,
-        OPENBOT_ROUNDTRIP_BODY: body,
-      },
-    });
-    const stdout = await new Response(proc.stdout).text();
-    const stderr = await new Response(proc.stderr).text();
-    const code = await proc.exited;
-    expect(stderr).toBe("");
-    expect(code).toBe(0);
-    verifyFedJws(stdout.trim(), {
-      publicKey: pubkey,
-      expectedAud: aud,
-      expectedJti: msgId,
-      rawBody: body,
-    });
-
-    const master = loadOrCreateMasterKey(home);
-    const loaded = loadOrgKeypair(home, master);
-    expect(loaded.pubkey).toBe(pubkey);
-    const db = OpenbotDb.open(join(home, "openbot.sqlite"));
-    ensureOrgKeypair(home, master, db);
-    expect(currentOrgMeta(db)!.org_id).toBe(orgId);
-    db.close();
-  });
-});
-
-describe("fed info rate limit helper", () => {
-  test("31st request in a minute is denied; X-Forwarded-For only from loopback", () => {
-    let t = 1_000_000;
-    const limiter = new SlidingWindowRateLimiter(FED_INFO_RATE_LIMIT, FED_INFO_RATE_WINDOW_MS, () => t);
-    const key = "203.0.113.9";
-    for (let i = 0; i < FED_INFO_RATE_LIMIT; i++) expect(limiter.take(key)).toBe(true);
-    expect(limiter.take(key)).toBe(false);
-    t += FED_INFO_RATE_WINDOW_MS;
-    expect(limiter.take("other")).toBe(true);
-    expect(limiter.size).toBe(1);
-    expect(limiter.take(key)).toBe(true);
-
-    expect(clientRateKey("127.0.0.1", "203.0.113.9, 10.0.0.1")).toBe("203.0.113.9");
-    expect(clientRateKey("::1", "198.51.100.2")).toBe("198.51.100.2");
-    expect(clientRateKey("8.8.8.8", "203.0.113.9")).toBe("8.8.8.8");
-    expect(clientRateKey("192.0.2.1", "203.0.113.9")).toBe("192.0.2.1");
-  });
-});

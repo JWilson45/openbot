@@ -23,25 +23,24 @@ import {
 import { loginCookie, startTestServer } from "../apps/server/src/test-helpers.ts";
 import { fakeAgentCommand, insertTurn, seedWorld, tempHome } from "./helpers.ts";
 
-const ADA_BOB_GATEWAY = {
+const ADA_BOB = {
   desks: [
     { name: "Ada", description: "research" },
     { name: "Bob", description: "writer" },
   ],
-  gateway: { name: "Gateway", description: "Diplomat for this org. Not a desk coder." },
 };
 
 function harnessReq(partial: Partial<EnsureHarnessRequest> = {}): EnsureHarnessRequest {
   return {
     botId: "bot",
     env: {},
-    mcpUrl: "http://127.0.0.1/mcp/v1",
+    mcpUrl: "http://127.0.0.1/internal/runtime/mcp",
     mcpToken: "tok",
     cwd: "/",
     botName: "Ada",
     botDescription: "research",
     permissionMode: "auto",
-    roster: ADA_BOB_GATEWAY,
+    roster: ADA_BOB,
     ...partial,
   };
 }
@@ -85,16 +84,16 @@ function sendBodies(messages: Array<{ origin: string; body: string }>): string[]
 }
 
 describe("formatRosterBlock", () => {
-  test("Ada/Bob/Gateway fixture is frozen (em dash, header, Gateway last)", () => {
-    expect(formatRosterBlock(ADA_BOB_GATEWAY)).toBe(
+  test("agent-facing roster contains desk teammates only", () => {
+    expect(formatRosterBlock(ADA_BOB)).toBe(
       [
-        "Who is here (do not invent names; SendToAgent only these):",
+        "Desk teammates (SendToAgent targets only these names):",
         "- Ada — research",
         "- Bob — writer",
-        "- Gateway — Diplomat for this org. Not a desk coder.",
       ].join("\n"),
     );
-    expect(rosterFingerprint(ADA_BOB_GATEWAY)).toBe(formatRosterBlock(ADA_BOB_GATEWAY));
+    expect(rosterFingerprint(ADA_BOB)).toBe(formatRosterBlock(ADA_BOB));
+    expect(formatRosterBlock(ADA_BOB)).not.toContain("- Gateway");
   });
 
   test("clip 160, slice 6, empty is empty string", () => {
@@ -105,7 +104,7 @@ describe("formatRosterBlock", () => {
     expect(clipRosterDesc("  short\nrole  ")).toBe("short role");
 
     const desks = Array.from({ length: 8 }, (_, i) => ({ name: `B${i}`, description: "d" }));
-    const sliced = formatRosterBlock({ desks, gateway: null });
+    const sliced = formatRosterBlock({ desks });
     expect(sliced).toContain("- B0 — d");
     expect(sliced).toContain("- B5 — d");
     expect(sliced).not.toContain("- B6");
@@ -113,35 +112,33 @@ describe("formatRosterBlock", () => {
 
     expect(formatRosterBlock(undefined)).toBe("");
     expect(formatRosterBlock({ desks: [] })).toBe("");
-    expect(formatRosterBlock({ desks: [], gateway: null })).toBe("");
+    expect(formatRosterBlock({ desks: [] })).toBe("");
   });
 
-  test("6x160-char desks plus Gateway degrade to names-only without end-slice", () => {
+  test("6x160-char desks degrade to names-only without admitting Gateway", () => {
     const desc = "d".repeat(160);
     const names = ["Ada", "Bob", "Cara", "Dana", "Eve", "Fay"];
     const block = formatRosterBlock({
       desks: names.map((name) => ({ name, description: desc })),
-      gateway: { name: "Gateway", description: desc },
     });
     const withDescLen =
-      "Who is here (do not invent names; SendToAgent only these):\n".length +
-      names.reduce((n, name) => n + `- ${name} — ${desc}\n`.length, 0) +
-      `- Gateway — ${desc}`.length;
+      "Desk teammates (SendToAgent targets only these names):\n".length +
+      names.reduce((n, name) => n + `- ${name} — ${desc}\n`.length, 0);
     expect(withDescLen).toBeGreaterThan(ROSTER_BLOCK_MAX);
     expect(block.length).toBeLessThanOrEqual(ROSTER_BLOCK_MAX);
     expect(block).not.toContain(" — ");
     for (const name of names) expect(block).toContain(`- ${name}`);
-    expect(block).toContain("- Gateway");
-    expect(block.startsWith("Who is here (do not invent names; SendToAgent only these):")).toBe(true);
-    expect(block.trimEnd().endsWith("- Gateway")).toBe(true);
+    expect(block).not.toContain("- Gateway");
+    expect(block.startsWith("Desk teammates (SendToAgent targets only these names):")).toBe(true);
+    expect(block.trimEnd().endsWith("- Fay")).toBe(true);
   });
 });
 
 describe("composeIdentityRules", () => {
-  test("desk overlay lists Bob/Gateway, compose sentence, no ListBots call", () => {
+  test("desk overlay lists desk teammates but never Gateway", () => {
     const rules = composeIdentityRules(harnessReq());
     expect(rules).toContain("- Bob — writer");
-    expect(rules).toContain("- Gateway — Diplomat for this org. Not a desk coder.");
+    expect(rules).not.toContain("- Gateway");
     expect(rules).toMatch(/do not forward/i);
     expect(rules).toMatch(/thread-switch block/i);
     expect(rules).not.toMatch(/call ListBots/i);
@@ -150,15 +147,19 @@ describe("composeIdentityRules", () => {
     expect(deskIdentityRules("Ada", "research")).toMatch(/never tell the human you switched/i);
   });
 
-  test("Gateway overlay stays distinct and still gets the roster", () => {
+  test("Gateway overlay sees desk targets but never lists itself as a target", () => {
     const gw = composeIdentityRules(
       harnessReq({ role: "gateway", orgSlug: "alpha", orgId: "org-id", botName: "Gateway" }),
     );
     expect(gw).toContain("You are Gateway for org alpha (org-id)");
     expect(gw).toContain("You are not a desk coder");
-    expect(gw).toContain("SendToOrg");
-    expect(gw).toContain("hop=1");
+    expect(gw).toContain("authenticated A2A tasks");
+    expect(gw).not.toContain("SendToOrg");
+    expect(gw).not.toContain("Inbox");
+    expect(gw).not.toMatch(/federation|hop=1/i);
     expect(gw).toContain("- Ada — research");
+    expect(gw).toContain("- Bob — writer");
+    expect(gw).not.toContain("- Gateway");
     expect(gw).toMatch(/do not forward/i);
     expect(gw).toMatch(/thread-switch block/i);
     expect(gw).not.toMatch(/Hire a new teammate: CreateBot/);
@@ -169,7 +170,7 @@ describe("composeIdentityRules", () => {
 });
 
 describe("loadOverlayRoster / MCP copy", () => {
-  test("SQL matches listBots order; Gateway last; no ids", () => {
+  test("overlay roster and ListBots expose desk agents only", async () => {
     const db = OpenbotDb.open(join(tempHome(), "openbot.sqlite"));
     const w = seedWorld(db);
     const t = Date.now();
@@ -185,12 +186,28 @@ describe("loadOverlayRoster / MCP copy", () => {
     );
     const roster = loadOverlayRoster(db, w.accountId);
     expect(roster.desks.map((b) => b.name)).toEqual(["Ada", "Bob"]);
-    expect(roster.gateway).toEqual({
-      name: "Gateway",
-      description: "Diplomat for this org. Not a desk coder.",
-    });
+    expect(roster).not.toHaveProperty("gateway");
+    expect(JSON.stringify(roster)).not.toContain("Gateway");
     expect(JSON.stringify(roster)).not.toContain("gw1");
     expect(JSON.stringify(roster)).not.toContain(w.botId);
+
+    const listed = await handleMcpJsonRpc(db, new McpInflight(), `Bearer ${w.token}`, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "ListBots", arguments: {} },
+    });
+    expect(listed.status).toBe(200);
+    const listText = (listed.json as { result?: { content?: Array<{ text?: string }> } })
+      .result?.content?.[0]?.text ?? "{}";
+    const listPayload = JSON.parse(listText) as {
+      bots?: Array<{ id: string; name: string }>;
+      gateway?: unknown;
+    };
+    expect(listPayload.bots?.map((bot) => bot.name)).toEqual(["Ada", "Bob"]);
+    expect(listPayload).not.toHaveProperty("gateway");
+    expect(JSON.stringify(listPayload)).not.toContain("Gateway");
+    expect(JSON.stringify(listPayload)).not.toContain("gw1");
     db.close();
   });
 
@@ -211,8 +228,17 @@ describe("loadOverlayRoster / MCP copy", () => {
     expect(err?.message).toContain("CreateBot");
     expect(err?.message).toContain("/auth/local");
     expect(err?.message).not.toMatch(/ListBots/i);
-    expect(mcpToolsForRole("desk").map((t) => (t as { name: string }).name)).toContain("ListBots");
-    expect(mcpToolsForRole("gateway").map((t) => (t as { name: string }).name)).toContain("ListBots");
+    const deskTools = mcpToolsForRole("desk").map((t) => (t as { name: string }).name);
+    const gatewayTools = mcpToolsForRole("gateway").map((t) => (t as { name: string }).name);
+    expect(deskTools).toContain("ListBots");
+    expect(gatewayTools).toContain("ListBots");
+    expect(gatewayTools).toContain("SendToAgent");
+    expect(gatewayTools).not.toContain("SendMessage");
+    expect(gatewayTools).not.toContain("SendToThread");
+    expect(deskTools).not.toContain("SendToOrg");
+    expect(deskTools).not.toContain("Inbox");
+    expect(gatewayTools).not.toContain("SendToOrg");
+    expect(gatewayTools).not.toContain("Inbox");
     expect(LIST_BOTS_TOOL.description).not.toMatch(/Use this before SendToAgent/i);
     expect(SEND_TO_AGENT_TOOL.description).toMatch(/do not forward/i);
     expect(SEND_TO_AGENT_TOOL.description).not.toMatch(/ListBots/i);
@@ -221,7 +247,7 @@ describe("loadOverlayRoster / MCP copy", () => {
 });
 
 describe("roster overlay on session/new", () => {
-  test("echo-roster lists Ada/Bob/Gateway and compose sentence is present", async () => {
+  test("echo-roster lists desk bots only and compose sentence is present", async () => {
     process.env.OPENBOT_ACP_COMMAND = fakeAgentCommand();
     const { ctx, server, origin } = startTestServer({ home: tempHome() });
     try {
@@ -250,18 +276,18 @@ describe("roster overlay on session/new", () => {
       const messages = await waitMessages(origin, headers, (msgs) => {
         const bodies = sendBodies(msgs);
         return (
-          bodies.some((b) => b.includes("Ada") && b.includes("Bob") && b.includes("Gateway") && b.includes("got-rules")) &&
+          bodies.some((b) => b.includes("Ada") && b.includes("Bob") && b.includes("got-rules")) &&
           bodies.some((b) => b === "got-compose") &&
-          bodies.some((b) => b.includes("Who is here"))
+          bodies.some((b) => b.includes("Desk teammates"))
         );
       });
       const bodies = sendBodies(messages);
       const rosterEcho = bodies.find((b) => b.includes("got-rules")) ?? "";
       expect(rosterEcho).toContain("Ada");
       expect(rosterEcho).toContain("Bob");
-      expect(rosterEcho).toContain("Gateway");
+      expect(rosterEcho).not.toContain("Gateway");
       expect(bodies).toContain("got-compose");
-      const rulesEcho = bodies.find((b) => b.includes("Who is here")) ?? "";
+      const rulesEcho = bodies.find((b) => b.includes("Desk teammates")) ?? "";
       expect(rulesEcho).toMatch(/do not forward/i);
       expect(rulesEcho).not.toMatch(/call ListBots/i);
       expect(rulesEcho).toContain("You are Ada");
@@ -310,12 +336,12 @@ describe("roster overlay on session/new", () => {
         body: JSON.stringify({ body: "[[echo-roster]]" }),
       });
       const messages = await waitMessages(origin, headers, (msgs) =>
-        sendBodies(msgs).some((b) => b.includes("Bob") && b.includes("Gateway") && b.includes("got-rules")),
+        sendBodies(msgs).some((b) => b.includes("Bob") && b.includes("got-rules")),
       );
       const rosterEcho = sendBodies(messages).find((b) => b.includes("got-rules")) ?? "";
       expect(rosterEcho).toContain("Ada");
       expect(rosterEcho).toContain("Bob");
-      expect(rosterEcho).toContain("Gateway");
+      expect(rosterEcho).not.toContain("Gateway");
       expect(runner.acpPid(ada.bot.id)).toBeTruthy();
       expect(runner.acpPid(ada.bot.id)).not.toBe(pid1);
     } finally {
@@ -371,7 +397,9 @@ describe("roster overlay on session/new", () => {
         return bodies.some((b) => b.includes("Fay") && b.includes("got-rules")) && bodies.includes("got-digest");
       });
       const bodies = sendBodies(messages);
-      expect(bodies.some((b) => b.includes("Fay") && b.includes("Ada") && b.includes("Gateway"))).toBe(true);
+      const rosterEcho = bodies.find((b) => b.includes("Fay") && b.includes("got-rules")) ?? "";
+      expect(rosterEcho).toContain("Ada");
+      expect(rosterEcho).not.toContain("Gateway");
       expect(bodies).toContain("got-digest");
       expect(bodies).not.toContain("no-digest");
       const live = (await fetch(`${origin}/v1/turns/${turnId}/live-work`, { headers }).then((r) => r.json())) as {
@@ -537,4 +565,3 @@ describe("roster overlay on session/new", () => {
     }
   });
 });
-

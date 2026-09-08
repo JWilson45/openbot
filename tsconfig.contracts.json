@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.base.json",
+  "include": [
+    "packages/core/**/*",
+    "packages/application/**/*",
+    "scripts/check-boundaries.ts",
+    "tests/core-contracts.test.ts",
+    "tests/event-contracts.test.ts",
+    "tests/application-contracts.test.ts",
+    "tests/application-service.test.ts"
+  ]
+}

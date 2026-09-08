@@ -1,5 +1,5 @@
 import { completeGithubLogin, cookieHeader, writeAllowlistFile } from "@openbot/auth";
-import { createApp, type HomeConfig } from "./app.ts";
+import { createApp, openbotFetch, type HomeConfig } from "./app.ts";
 import { provisionOrgGateway } from "./gateway.ts";
 
 export function startTestServer(cfg: Partial<HomeConfig> & { home: string; port?: number }) {
@@ -14,11 +14,12 @@ export function startTestServer(cfg: Partial<HomeConfig> & { home: string; port?
     publicOrigin: cfg.publicOrigin,
     logger: cfg.logger,
     env: cfg.env,
+    requestLogging: cfg.requestLogging ?? false,
   });
   const server = Bun.serve({
     port,
     hostname: "127.0.0.1",
-    fetch: created.app.fetch,
+    fetch: openbotFetch(created.app),
     websocket: (created as { websocket: unknown }).websocket as never,
   });
   created.ctx.port = server.port;

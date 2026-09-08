@@ -236,6 +236,57 @@ test("schema applies on a fresh sqlite file", () => {
     expect(enrollCols).toContain(col);
   }
   expect(moreIndexes).toContain("runner_enroll_account");
+  const protocolIdentityCols = db.all<{ name: string; notnull: number }>(
+    "PRAGMA table_info(protocol_identities)",
+  );
+  expect(protocolIdentityCols.map((column) => column.name)).toContain("subject_id");
+  expect(protocolIdentityCols.find((column) => column.name === "subject_id")?.notnull).toBe(1);
+});
+
+test("migrate replaces unsafe account-only protocol identities without deleting the database", () => {
+  const path = join(tempHome(), "openbot.sqlite");
+  const raw = new Database(path);
+  raw.exec(`
+    CREATE TABLE accounts (
+      id text PRIMARY KEY,
+      auth_user_id text NOT NULL UNIQUE,
+      created_at integer NOT NULL
+    );
+    INSERT INTO accounts(id, auth_user_id, created_at) VALUES ('account-one', 'user-one', 1);
+    CREATE TABLE protocol_identities (
+      id text PRIMARY KEY,
+      account_id text NOT NULL REFERENCES accounts(id),
+      protocol text NOT NULL,
+      namespace text NOT NULL,
+      entity_kind text NOT NULL,
+      external_id text NOT NULL,
+      internal_id text NOT NULL,
+      created_at integer NOT NULL,
+      UNIQUE(account_id, protocol, namespace, entity_kind, external_id),
+      UNIQUE(account_id, protocol, namespace, entity_kind, internal_id)
+    );
+    INSERT INTO protocol_identities
+      (id, account_id, protocol, namespace, entity_kind, external_id, internal_id, created_at)
+    VALUES ('legacy', 'account-one', 'a2a', 'peer', 'task', 'remote-task', 'local-task', 1);
+  `);
+  raw.close();
+
+  let db = OpenbotDb.open(path);
+  expect(db.all<{ name: string }>("PRAGMA table_info(protocol_identities)").map((column) => column.name))
+    .toContain("subject_id");
+  expect(db.get<{ n: number }>("SELECT COUNT(*) AS n FROM protocol_identities")?.n).toBe(0);
+  expect(db.get<{ n: number }>("SELECT COUNT(*) AS n FROM accounts WHERE id = 'account-one'")?.n).toBe(1);
+  db.run(
+    `INSERT INTO protocol_identities
+      (id, account_id, subject_id, protocol, namespace, entity_kind, external_id, internal_id, created_at)
+     VALUES ('scoped', 'account-one', 'peer-one', 'a2a', 'peer', 'task', 'remote-task', 'local-task', 2)`,
+  );
+  db.close();
+
+  db = OpenbotDb.open(path);
+  expect(db.get<{ subject_id: string }>("SELECT subject_id FROM protocol_identities WHERE id = 'scoped'")?.subject_id)
+    .toBe("peer-one");
+  db.close();
 });
 
 test("migrate adds bots.role on a pre-gateway sqlite", () => {

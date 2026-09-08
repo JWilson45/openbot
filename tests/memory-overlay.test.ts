@@ -8,25 +8,24 @@ import {
 } from "@openbot/acp-grok";
 import type { EnsureHarnessRequest } from "@openbot/compute-protocol";
 
-const ADA_BOB_GATEWAY = {
+const ADA_BOB = {
   desks: [
     { name: "Ada", description: "research" },
     { name: "Bob", description: "writer" },
   ],
-  gateway: { name: "Gateway", description: "Diplomat for this org. Not a desk coder." },
 };
 
 function harnessReq(partial: Partial<EnsureHarnessRequest> = {}): EnsureHarnessRequest {
   return {
     botId: "bot",
     env: {},
-    mcpUrl: "http://127.0.0.1/mcp/v1",
+    mcpUrl: "http://127.0.0.1/internal/runtime/mcp",
     mcpToken: "tok",
     cwd: "/",
     botName: "Ada",
     botDescription: "research",
     permissionMode: "auto",
-    roster: ADA_BOB_GATEWAY,
+    roster: ADA_BOB,
     ...partial,
   };
 }
@@ -81,11 +80,14 @@ describe("composeIdentityRules standing", () => {
     expect(huge.startsWith("You are Ada")).toBe(true);
   });
 
-  test("Gateway overlay forbids SendToOrg of standing notes", () => {
+  test("Gateway overlay retains standing-note safety without removed federation tools", () => {
     const gw = composeIdentityRules(
       harnessReq({ role: "gateway", orgSlug: "alpha", orgId: "org-id", orgNotes: "secret" }),
     );
-    expect(gw).toContain("Do not SendToOrg standing notes or search dumps");
+    expect(gw).toContain("Do not paste transcripts into Memory");
+    expect(gw).not.toContain("SendToOrg");
+    expect(gw).not.toContain("Inbox");
+    expect(gw).not.toMatch(/federation/i);
     expect(gw).toContain("secret");
     expect(gw).toContain("<<<OPENBOT_ORG_NOTES");
   });

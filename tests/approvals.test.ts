@@ -11,10 +11,19 @@ describe("SendMessage approvals", () => {
     const w = seedWorld(db);
     const turnId = insertTurn(db, w, "running");
     const inflight = new McpInflight();
+    const delivered: Array<{ legacyMessageId: string }> = [];
+    const pending: Array<{ legacyMessageId: string }> = [];
+    const hooks = {
+      onSendMessage: (message: { legacyMessageId: string }) => { delivered.push(message); },
+      onPendingMessage: (message: { legacyMessageId: string }) => { pending.push(message); },
+    };
     const result = sendMessage(db, inflight, `Bearer ${w.token}`, {
       body: "please confirm",
       urgency: "needs_user",
-    });
+    }, hooks);
+    expect(delivered).toHaveLength(0);
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({ legacyMessageId: result.messageId });
     const parked = db.get<{ origin: string }>("SELECT origin FROM messages WHERE id = ?", [result.messageId]);
     expect(parked?.origin).toBe("pending_approval");
     promote(db, turnId, { kind: "acp_done", assistantText: "leftover" });
@@ -23,8 +32,12 @@ describe("SendMessage approvals", () => {
       [turnId],
     );
     expect(fallback?.n).toBe(0);
-    const ok = approveMessage(db, w.accountId, result.messageId);
+    const ok = approveMessage(db, w.accountId, result.messageId, hooks);
     expect(ok).toBe(true);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toMatchObject({ legacyMessageId: result.messageId });
+    expect(approveMessage(db, w.accountId, result.messageId, hooks)).toBe(false);
+    expect(delivered).toHaveLength(1);
     const after = db.get<{ origin: string }>("SELECT origin FROM messages WHERE id = ?", [result.messageId]);
     expect(after?.origin).toBe("send_message");
   });

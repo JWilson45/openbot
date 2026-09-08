@@ -54,10 +54,10 @@ describe("CreateBot / ListBots", () => {
     const listed = await call(db, w.token, "ListBots");
     const roster = payload(listed.json) as {
       bots: Array<{ name: string }>;
-      gateway: { name: string } | null;
+      gateway?: unknown;
     };
     expect(roster.bots.map((b) => b.name).sort()).toEqual(["Ada", "ONE"]);
-    expect(roster.gateway).toBeNull();
+    expect(roster).not.toHaveProperty("gateway");
 
     const handoff = await call(db, w.token, "SendToAgent", { name: "ONE", body: "do the thing" });
     expect(handoff.status).toBe(200);

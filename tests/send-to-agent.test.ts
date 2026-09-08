@@ -41,6 +41,20 @@ describe("SendToAgent mailbox", () => {
       headers,
       body: JSON.stringify({ key: "xai-a2akey0001" }),
     });
+    const pushed: Array<{
+      type?: string;
+      agentId?: string;
+      messageId?: string;
+      message?: { origin?: string; body?: string };
+    }> = [];
+    const ws = new WebSocket(`${origin.replace(/^http/, "ws")}/v1/push`, { headers: { cookie } });
+    await new Promise<void>((resolve, reject) => {
+      ws.addEventListener("open", () => resolve());
+      ws.addEventListener("error", () => reject(new Error("push websocket failed")));
+    });
+    ws.addEventListener("message", (event) => {
+      pushed.push(JSON.parse(String(event.data)) as (typeof pushed)[number]);
+    });
     const posted = await fetch(`${origin}/v1/threads/${ada.threadId}/messages`, {
       method: "POST",
       headers,
@@ -63,6 +77,37 @@ describe("SendToAgent mailbox", () => {
     expect(bobHuman.some((m) => m.body.includes("write a draft"))).toBe(true);
     expect(adaMsgs.filter((m) => m.body.includes("write a draft") && m.origin === "agent").length).toBe(0);
     expect(bobHuman.some((m) => m.origin === "agent")).toBe(false);
+
+    const canonicalResponse = await fetch(`${origin}/v1/agents/${bob.bot.id}/conversation`, { headers });
+    expect(canonicalResponse.status).toBe(200);
+    const canonical = await canonicalResponse.json() as {
+      conversation: null | {
+        messages: Array<{ role: string; body: string }>;
+        active: unknown;
+      };
+    };
+    const delivered = canonical.conversation?.messages.filter((message) => message.body === "write a draft") ?? [];
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toMatchObject({ role: "assistant", body: "write a draft" });
+    expect(canonical.conversation?.active).toBeNull();
+    expect(ctx.db.get<{ task_id: string | null; run_id: string | null; metadata_json: string }>(
+      `SELECT task_id, run_id, metadata_json FROM agent_messages
+       WHERE metadata_json LIKE '%openbot.legacy-message-id%'`,
+    )).toMatchObject({ task_id: null, run_id: null });
+    const pushStart = Date.now();
+    while (Date.now() - pushStart < 2_000 && !pushed.some((event) =>
+      event.type === "agent.conversation.updated" && event.agentId === bob.bot.id
+    )) await Bun.sleep(20);
+    const invalidation = pushed.find((event) =>
+      event.type === "agent.conversation.updated" && event.agentId === bob.bot.id
+    );
+    expect(invalidation).toMatchObject({
+      type: "agent.conversation.updated",
+      agentId: bob.bot.id,
+    });
+    expect(invalidation && "message" in invalidation).toBe(false);
+    expect(pushed.some((event) => event.type === "message.created" && event.message?.origin === "send_message")).toBe(false);
+    ws.close();
     server.stop(true);
   });
 });
@@ -139,6 +184,50 @@ describe("SendToAgent overlay", () => {
 });
 
 describe("SendToAgent typed errors", () => {
+  test("a Gateway target is hidden by both name and botId", async () => {
+    const db = OpenbotDb.open(join(tempHome(), "openbot.sqlite"));
+    const w = seedWorld(db);
+    insertTurn(db, w, "running");
+    const gateway = insertPeer(db, w.accountId, w.computeId, "Gateway");
+    db.run("UPDATE bots SET role = 'gateway' WHERE id = ?", [gateway.botId]);
+
+    const byName = await call(db, w.token, "SendToAgent", { name: "Gateway", body: "hi" });
+    expect(byName.status).toBe(404);
+    expect(rpc(byName.json).error?.data?.code).toBe("not_found");
+    expect(rpc(byName.json).error?.message).not.toMatch(/A2A|transport endpoint/i);
+
+    const byId = await call(db, w.token, "SendToAgent", { botId: gateway.botId, body: "hi" });
+    expect(byId.status).toBe(404);
+    expect(rpc(byId.json).error?.data?.code).toBe("not_found");
+    expect(rpc(byId.json).error?.message).not.toMatch(/A2A|transport endpoint/i);
+    expect(db.get<{ n: number }>("SELECT COUNT(*) AS n FROM turns WHERE bot_id = ?", [gateway.botId])?.n).toBe(0);
+    db.close();
+  });
+
+  test("a Gateway caller can target an active desk bot", async () => {
+    const db = OpenbotDb.open(join(tempHome(), "openbot.sqlite"));
+    const w = seedWorld(db);
+    db.run("UPDATE bots SET role = 'gateway', name = 'Gateway' WHERE id = ?", [w.botId]);
+    insertTurn(db, w, "running");
+    const bob = insertPeer(db, w.accountId, w.computeId, "Bob");
+
+    const listed = await call(db, w.token, "ListBots");
+    const listText = rpc(listed.json).result?.content?.[0]?.text ?? "{}";
+    const roster = JSON.parse(listText) as { bots?: Array<{ id: string; name: string }>; gateway?: unknown };
+    expect(roster.bots).toEqual([{ id: bob.botId, name: "Bob", description: "teammate" }]);
+    expect(roster).not.toHaveProperty("gateway");
+    expect(listText).not.toContain(w.botId);
+    expect(listText).not.toContain("Gateway");
+
+    const sent = await call(db, w.token, "SendToAgent", { name: "Bob", body: "handle this" });
+    expect(sent.status).toBe(200);
+    expect(db.get<{ bot_id: string; status: string }>(
+      "SELECT bot_id, status FROM turns WHERE bot_id = ? ORDER BY created_at DESC LIMIT 1",
+      [bob.botId],
+    )).toEqual({ bot_id: bob.botId, status: "queued" });
+    db.close();
+  });
+
   test("Ghost is not_found; archived Bob is target_archived; sixth queued is target_busy; self is bad_request; message is prefixed", async () => {
     const db = OpenbotDb.open(join(tempHome(), "openbot.sqlite"));
     const w = seedWorld(db);

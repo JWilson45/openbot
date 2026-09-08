@@ -5,9 +5,6 @@
  * Directives in the user prompt:
  *   [[send:body]]     POST SendMessage via MCP HTTP
  *   [[sendto:Name:body]]  POST SendToAgent
- *   [[sendorg:slug:body]] POST SendToOrg (Gateway)
- *   [[inbox]]         POST Inbox list, then SendMessage the JSON
- *   [[inboxack:id]]   POST Inbox ack
  *   [[echo-prompt]]   SendMessage "got-digest" or "no-digest" based on ACP reset block
  *   [[echo-prefix]]   SendMessage "got-group-prefix" if the group runTurn prefix is present
  *   [[echo-cal-prefix]] SendMessage "got-calendar-prefix" if the calendar runTurn block is present
@@ -99,6 +96,27 @@ function currentMessage(text: string): string {
   const marker = "\nCurrent message:\n";
   const idx = text.lastIndexOf(marker);
   return idx >= 0 ? text.slice(idx + marker.length) : text;
+}
+
+function canonicalResponse(text: string): string | undefined {
+  const prefix = "OpenBot canonical runtime request (JSON):\n";
+  if (!text.startsWith(prefix)) return undefined;
+  try {
+    const payload = JSON.parse(text.slice(prefix.length)) as {
+      messages?: Array<{ role?: unknown; parts?: Array<{ kind?: unknown; text?: unknown }> }>;
+    };
+    const message = payload.messages?.findLast((candidate) => candidate.role === "user");
+    const content = message?.parts
+      ?.filter((part) => part.kind === "text" && typeof part.text === "string")
+      .map((part) => String(part.text))
+      .join("\n");
+    if (!content) return undefined;
+    const send = /\[\[send:([\s\S]*?)\]\]/.exec(content);
+    const withoutDirective = send ? content.replace(send[0], "").trim() : content;
+    return withoutDirective || "canonical response";
+  } catch {
+    return undefined;
+  }
 }
 
 async function callTool(url: string, token: string, name: string, args: Record<string, unknown>): Promise<unknown> {
@@ -209,11 +227,13 @@ async function handle(msg: {
     const sess = sessions.get(sessionId);
     const text = extractText(params.prompt);
     const current = currentMessage(text);
+    const canonical = canonicalResponse(text);
+    const response = canonical ?? `working: ${text.slice(0, 200)}\n`;
     notify("session/update", {
       sessionId,
       update: {
         sessionUpdate: "agent_message_chunk",
-        content: { type: "text", text: `working: ${text.slice(0, 200)}\n` },
+        content: { type: "text", text: response },
       },
     });
 
@@ -269,15 +289,6 @@ async function handle(msg: {
     };
 
     if (mcpUrl && mcpToken) {
-      const sendorg = /\[\[sendorg:([^:\]]+):([\s\S]*?)\]\]/.exec(current);
-      if (sendorg) {
-        try {
-          await callTool(mcpUrl, mcpToken, "SendToOrg", { org: sendorg[1].trim(), body: sendorg[2].trim() });
-        } catch (err) {
-          noteMcpError(err);
-        }
-      }
-
       const sendto = /\[\[sendto:([^:\]]+):([\s\S]*?)\]\]/.exec(current);
       if (sendto) {
         try {
@@ -305,15 +316,6 @@ async function handle(msg: {
           const title = threadByName[1].trim();
           const body = threadByName[2].trim();
           await callTool(mcpUrl, mcpToken, "SendToThread", title ? { name: title, body } : { body });
-        } catch (err) {
-          noteMcpError(err);
-        }
-      }
-
-      if (current.includes("[[inbox]]")) {
-        try {
-          const listed = await callTool(mcpUrl, mcpToken, "Inbox", { limit: 20 });
-          await callSend(mcpUrl, mcpToken, JSON.stringify(listed));
         } catch (err) {
           noteMcpError(err);
         }
@@ -416,16 +418,6 @@ async function handle(msg: {
         try {
           const result = await callTool(mcpUrl, mcpToken, "Wait", { ms: Number(wait[1]) });
           await callSend(mcpUrl, mcpToken, JSON.stringify(result));
-        } catch (err) {
-          noteMcpError(err);
-        }
-      }
-
-      const inboxack = /\[\[inboxack:([^\]]+)\]\]/.exec(current);
-      if (inboxack) {
-        try {
-          const remaining = await callTool(mcpUrl, mcpToken, "Inbox", { ack: inboxack[1].trim() });
-          await callSend(mcpUrl, mcpToken, JSON.stringify(remaining));
         } catch (err) {
           noteMcpError(err);
         }
@@ -556,10 +548,8 @@ async function handle(msg: {
           !current.includes("[[type:") &&
           !current.includes("[[wait:") &&
           !current.includes("[[sendto:") &&
-          !current.includes("[[sendorg:") &&
-          !current.includes("[[inbox]]") &&
-          !current.includes("[[inboxack:") &&
           !current.includes("[[thread") &&
+          canonical === undefined &&
           !writeMatch &&
           !shell &&
           current.trim()

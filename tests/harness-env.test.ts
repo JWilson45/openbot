@@ -12,7 +12,7 @@ describe("harness spawn env", () => {
       openbotHome: home,
       extras: {
         XAI_API_KEY: "xai-secret",
-        OPENBOT_MCP_URL: "http://127.0.0.1:9/mcp/v1",
+        OPENBOT_MCP_URL: "http://127.0.0.1:9/internal/runtime/mcp",
         OPENBOT_MCP_TOKEN: "should-not-land",
         GROK_CONFIG: "{}",
       },
@@ -35,7 +35,7 @@ describe("harness spawn env", () => {
     expect(env.GPG_AGENT_INFO).toBeUndefined();
     expect(env.OPENBOT_GITHUB_CLIENT_SECRET).toBeUndefined();
     expect(env.OPENBOT_MCP_TOKEN).toBeUndefined();
-    expect(env.OPENBOT_MCP_URL).toBe("http://127.0.0.1:9/mcp/v1");
+    expect(env.OPENBOT_MCP_URL).toBe("http://127.0.0.1:9/internal/runtime/mcp");
     expect(env.XAI_API_KEY).toBe("xai-secret");
     const snap = snapshotChildEnv(env);
     expect(snap.hasSshAuthSock).toBe(false);

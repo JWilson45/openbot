@@ -319,7 +319,7 @@ export async function joinRunner(opts: JoinOpts): Promise<{ stop: () => void; pi
     protocol: RUNNER_PROTOCOL,
     hostname: osHostname(),
     platform: process.platform,
-    version: opts.version ?? "0.7.0",
+    version: opts.version ?? "0.8.0",
     grokCliSignedIn: grokCliSignedIn(),
     warmBotIds: [...local.acps.keys()],
     inFlightPromptBotIds: [],

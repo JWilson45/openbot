@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { summarizeLiveEvent } from "@openbot/live-work";
+import { id, now } from "@openbot/db";
+import { insertMessage, summarizeLiveEvent } from "@openbot/live-work";
 import {
   DEFAULT_ACP_COMPACT_CHARS,
   DEFAULT_ACP_COMPACT_TURNS,
@@ -836,41 +837,61 @@ describe("warm compact", () => {
     }
   });
 
-  test("Gateway turn-count compact", async () => {
+  test("Gateway turn-count compact resets context without a human message", async () => {
     const prevTurns = process.env.OPENBOT_ACP_COMPACT_TURNS;
     const prevChars = process.env.OPENBOT_ACP_COMPACT_CHARS;
-    const prevFedHttp = process.env.OPENBOT_FED_ALLOW_HTTP;
     process.env.OPENBOT_ACP_COMPACT_TURNS = "2";
     process.env.OPENBOT_ACP_COMPACT_CHARS = "0";
-    process.env.OPENBOT_FED_ALLOW_HTTP = "1";
     const { ctx, server, origin, headers, session } = startWorld();
     try {
-      const on = await fetch(`${origin}/v1/org`, {
-        method: "PATCH",
-        headers,
-        body: JSON.stringify({ federationEnabled: true }),
-      });
-      expect(on.status).toBe(200);
       const listed = (await fetch(`${origin}/v1/bots`, { headers }).then((r) => r.json())) as {
-        gateway: { id: string } | null;
+        a2aGateway: { available: boolean } | null;
+        gateway?: unknown;
       };
-      expect(listed.gateway?.id).toBeTruthy();
-      const gwId = listed.gateway!.id;
-      const thread = (await fetch(`${origin}/v1/threads?botId=${gwId}`, { headers }).then((r) => r.json())) as {
-        thread: { id: string };
+      expect(listed).not.toHaveProperty("gateway");
+      expect(listed.a2aGateway?.available).toBe(true);
+      const gateway = ctx.db.get<{ id: string }>(
+        "SELECT id FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'gateway'",
+        [session.accountId],
+      );
+      expect(gateway).toBeTruthy();
+      const gwId = gateway!.id;
+      const thread = ctx.db.get<{ id: string }>(
+        "SELECT id FROM threads WHERE account_id = ? AND bot_id = ? AND IFNULL(kind, 'human') = 'human'",
+        [session.accountId, gwId],
+      );
+      expect(thread).toBeTruthy();
+      const queueGatewayTurn = async (body: string, completed: number): Promise<string> => {
+        const turnId = id();
+        const createdAt = now();
+        ctx.db.immediate(() => {
+          ctx.db.run(
+            `INSERT INTO turns (id, thread_id, bot_id, status, sent_message_count, assistant_text, deadline_at, created_at)
+             VALUES (?, ?, ?, 'queued', 0, '', ?, ?)`,
+            [turnId, thread!.id, gwId, createdAt + 2 * 60 * 60 * 1000, createdAt],
+          );
+          insertMessage(ctx.db, {
+            threadId: thread!.id,
+            turnId,
+            role: "user",
+            origin: "user",
+            body,
+          });
+        });
+        ctx.engine.kick();
+        await waitCompletedTurns(ctx.db, gwId, completed);
+        return turnId;
       };
       await putKey(origin, headers, "xai-compactkey0017");
-      await postAndWait(origin, headers, ctx.db, thread.thread.id, gwId, "[[send:gw-one]]", 1);
+      await queueGatewayTurn("[[write:gw-one.txt]]", 1);
       const pid1 = ctx.engine.runnerFor(session.accountId).acpPid(gwId);
-      await postAndWait(origin, headers, ctx.db, thread.thread.id, gwId, "[[send:gw-two]]", 2);
-      const posted = await fetch(`${origin}/v1/threads/${thread.thread.id}/messages`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ body: "[[echo-prompt]]" }),
-      });
-      const { turnId } = (await posted.json()) as { turnId: string };
-      const messages = await waitDm(origin, headers, gwId, (m) => sendBodies(m).includes("got-digest"));
-      expect(sendBodies(messages)).toContain("got-digest");
+      await queueGatewayTurn("[[write:gw-two.txt]]", 2);
+      const turnId = await queueGatewayTurn("[[write:gw-three.txt]]", 3);
+      const sent = ctx.db.get<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM messages WHERE thread_id = ? AND origin = 'send_message'",
+        [thread!.id],
+      );
+      expect(sent?.n).toBe(0);
       expect(ctx.engine.runnerFor(session.accountId).acpPid(gwId)).toBe(pid1);
       const live = (await fetch(`${origin}/v1/turns/${turnId}/live-work`, { headers }).then((r) => r.json())) as {
         events: Array<{ kind: string; payload: { reason?: string; trigger?: string } }>;
@@ -886,8 +907,6 @@ describe("warm compact", () => {
       else process.env.OPENBOT_ACP_COMPACT_TURNS = prevTurns;
       if (prevChars === undefined) delete process.env.OPENBOT_ACP_COMPACT_CHARS;
       else process.env.OPENBOT_ACP_COMPACT_CHARS = prevChars;
-      if (prevFedHttp === undefined) delete process.env.OPENBOT_FED_ALLOW_HTTP;
-      else process.env.OPENBOT_FED_ALLOW_HTTP = prevFedHttp;
     }
   });
 });

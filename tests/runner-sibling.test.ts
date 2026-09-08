@@ -227,7 +227,7 @@ describe("runner admin dual-gate", () => {
       expect(cookiePublic.status).toBe(200);
 
       const caddy = await Bun.file(pathJoin(import.meta.dir, "../contrib/caddy/Caddyfile.example")).text();
-      expect(caddy).toContain("handle /mcp/v1*");
+      expect(caddy).toContain("handle /internal/runtime/mcp*");
       expect(caddy).toContain("respond 404");
     } finally {
       created.server.stop(true);

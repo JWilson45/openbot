@@ -8,25 +8,16 @@ import pkg from "../../../package.json" with { type: "json" };
 import launchdTemplate from "../../../contrib/launchd/ai.openbot.plist" with { type: "text" };
 import systemdTemplate from "../../../contrib/systemd/openbot.service" with { type: "text" };
 import { OpenbotDb } from "@openbot/db";
-import { loadOrCreateMasterKey } from "@openbot/vault";
 import { joinRunner, readMachineToken } from "@openbot/runner";
-import { createApp } from "./app.ts";
+import { createApp, openbotFetch } from "./app.ts";
 import {
   currentOrgMeta,
-  deleteOrgPeer,
   ensureOrgAccount,
-  ensureOrgKeypair,
   ensureOrgMeta,
-  insertOrgPeer,
-  listOrgPeers,
   orgCliSnapshot,
-  OrgPeerError,
-  orgPeerPublic,
-  setFederationEnabled,
   writeOrgJson,
 } from "./org.ts";
 import { enrollAccount, getRunnerRow, publicRunnerSnapshot, revokeAccount } from "./runner-admin.ts";
-import { findActiveGateway } from "./gateway.ts";
 import {
   listProfiles,
   openbotStateRoot,
@@ -197,10 +188,6 @@ Usage:
   openbot use [slug] [--home DIR]
   openbot org [slug]
   openbot org init <slug> [--name "Acme"] [--home DIR]
-  openbot gateway on | off [slug]
-  openbot peers [--org <slug>]
-  openbot peers add --slug beta --url https://beta.example.com --pubkey <b64> --org-id <uuid>
-  openbot peers remove --id <orgId>
   openbot version | -v | --version
   openbot allowlist add <github-login>
   openbot allowlist
@@ -217,8 +204,6 @@ Usage:
   use       switch the current org. No slug lists. --home DIR imports that data dir.
   org       print this org's identity JSON including pubkey. Works with zero users.
   org init  create/name an org, register the slug, make it current (org_id is never rotated).
-  gateway   write org_meta.federation_enabled. Env OPENBOT_FEDERATION=0 still wins. Does not delete Gateway.
-  peers     list, add, or remove federation peers.
   version   print {"openbot","grokPin","grok"} JSON.
   runner    enroll / join / leave / revoke / status a computer (desk on another process).
 
@@ -333,15 +318,12 @@ function orgCommand(): void {
       slug: init ? slug : undefined,
       name: init ? arg("--name") : undefined,
     });
-    const master = loadOrCreateMasterKey(home, process.env.OPENBOT_MASTER_KEY);
-    ensureOrgKeypair(home, master, db);
     const row = currentOrgMeta(db);
     if (!row) throw new Error("org_meta write failed");
     if (init) writeOrgJson(join(home, "org.json"), row);
     rememberProfile(init ? { ...inv, slug: row.slug, remember: inv.source !== "home-flag" && inv.source !== "env-home" } : inv, init);
-    const gw = row.account_id ? findActiveGateway(db, row.account_id) : undefined;
     const snapshot = {
-      ...orgCliSnapshot(row, gw ? { id: gw.id, name: gw.name } : null),
+      ...orgCliSnapshot(row),
       home,
       profile: inv.slug ?? row.slug,
     };
@@ -350,101 +332,6 @@ function orgCommand(): void {
       console.error(`not registered as a profile (because --home / OPENBOT_HOME). to switch later: openbot use ${row.slug} --home ${home}`);
     }
   } catch (err) {
-    console.error(err instanceof Error ? err.message : String(err));
-    process.exit(1);
-  } finally {
-    db.close();
-  }
-}
-
-function gatewayCommand(): void {
-  const sub = process.argv[3];
-  if (sub !== "on" && sub !== "off") {
-    console.error("usage: openbot gateway on|off [slug] [--org <slug>] [--home <dir>]");
-    process.exit(1);
-  }
-  const inv = mustInvocation({
-    orgFlag: firstPositional(["on", "off"]),
-    requireExisting: Boolean(firstPositional(["on", "off"]) || arg("--org") || arg("--profile")),
-  });
-  const home = inv.home;
-  applyOrgSlug(inv);
-  mkdirSync(home, { recursive: true });
-  const db = OpenbotDb.open(join(home, "openbot.sqlite"));
-  try {
-    ensureOrgMeta(db, {
-      env: process.env,
-      file: join(home, "org.json"),
-      publicOrigin: process.env.OPENBOT_PUBLIC_ORIGIN,
-      advertisedOrigin: `http://127.0.0.1:${arg("--port", process.env.PORT ?? "8787")}`,
-    });
-    const row = setFederationEnabled(db, sub === "on");
-    const gw = row.account_id ? findActiveGateway(db, row.account_id) : undefined;
-    console.log(
-      JSON.stringify({
-        ...orgCliSnapshot(row, gw ? { id: gw.id, name: gw.name } : null),
-        home,
-        profile: inv.slug ?? row.slug,
-      }),
-    );
-  } catch (err) {
-    console.error(err instanceof Error ? err.message : String(err));
-    process.exit(1);
-  } finally {
-    db.close();
-  }
-}
-
-function peersCommand(): void {
-  const sub = process.argv[3];
-  if (sub && sub !== "add" && sub !== "remove" && !sub.startsWith("-")) {
-    console.error("usage: openbot peers [add --slug <slug> --url <url> --pubkey <b64>] [remove --id <orgId>] [--org <slug>] [--home <dir>]");
-    process.exit(1);
-  }
-  const inv = mustInvocation();
-  const home = inv.home;
-  applyOrgSlug(inv);
-  mkdirSync(home, { recursive: true });
-  const db = OpenbotDb.open(join(home, "openbot.sqlite"));
-  try {
-    ensureOrgMeta(db, {
-      env: process.env,
-      file: join(home, "org.json"),
-      publicOrigin: process.env.OPENBOT_PUBLIC_ORIGIN,
-      advertisedOrigin: `http://127.0.0.1:${arg("--port", process.env.PORT ?? "8787")}`,
-    });
-    if (sub === "add") {
-      const slug = arg("--slug");
-      const url = arg("--url");
-      const pubkey = arg("--pubkey");
-      const orgId = arg("--org-id") ?? arg("--id");
-      if (!slug || !url || !pubkey || !orgId) {
-        console.error(
-          "usage: openbot peers add --slug <slug> --url <url> --pubkey <b64> --org-id <uuid> [--name <name>] [--home <dir>]",
-        );
-        process.exit(1);
-      }
-      const row = insertOrgPeer(db, { slug, orgId, baseUrl: url, pubkey, name: arg("--name") ?? "" });
-      console.log(JSON.stringify(orgPeerPublic(row)));
-    } else if (sub === "remove") {
-      const peerId = arg("--id");
-      if (!peerId) {
-        console.error("usage: openbot peers remove --id <orgId> [--home <dir>]");
-        process.exit(1);
-      }
-      if (!deleteOrgPeer(db, peerId)) {
-        console.error("not_found");
-        process.exit(1);
-      }
-      console.log(JSON.stringify({ ok: true }));
-    } else {
-      console.log(JSON.stringify({ peers: listOrgPeers(db).map(orgPeerPublic) }));
-    }
-  } catch (err) {
-    if (err instanceof OrgPeerError) {
-      console.error(err.code);
-      process.exit(1);
-    }
     console.error(err instanceof Error ? err.message : String(err));
     process.exit(1);
   } finally {
@@ -706,7 +593,7 @@ if (cmd === "version" || cmd === "-v" || cmd === "--version") {
   const server = Bun.serve({
     port,
     hostname: host,
-    fetch: created.app.fetch,
+    fetch: openbotFetch(created.app),
     websocket: (created as { websocket: unknown }).websocket as never,
   });
   created.ctx.port = server.port;
@@ -748,7 +635,7 @@ if (cmd === "version" || cmd === "-v" || cmd === "--version") {
   const server = Bun.serve({
     port,
     hostname: host,
-    fetch: created.app.fetch,
+    fetch: openbotFetch(created.app),
     websocket: (created as { websocket: unknown }).websocket as never,
   });
   created.ctx.port = server.port;
@@ -788,10 +675,6 @@ if (cmd === "version" || cmd === "-v" || cmd === "--version") {
   }
 } else if (cmd === "org") {
   orgCommand();
-} else if (cmd === "gateway") {
-  gatewayCommand();
-} else if (cmd === "peers") {
-  peersCommand();
 } else if (cmd === "orgs" || cmd === "profiles" || cmd === "profile") {
   try {
     const roster = orgRoster();

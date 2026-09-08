@@ -7,22 +7,33 @@
       "dependencies": {
         "@openbot/acp-grok": "workspace:*",
         "@openbot/api-types": "workspace:*",
+        "@openbot/application": "workspace:*",
+        "@openbot/attachments": "workspace:*",
         "@openbot/auth": "workspace:*",
         "@openbot/calendar": "workspace:*",
         "@openbot/compute-protocol": "workspace:*",
+        "@openbot/core": "workspace:*",
         "@openbot/db": "workspace:*",
         "@openbot/federation": "workspace:*",
         "@openbot/live-work": "workspace:*",
         "@openbot/mcp-send-message": "workspace:*",
+        "@openbot/protocol-a2a": "workspace:*",
+        "@openbot/protocol-ag-ui": "workspace:*",
+        "@openbot/protocol-mcp": "workspace:*",
         "@openbot/runner": "workspace:*",
+        "@openbot/runtime-grok": "workspace:*",
         "@openbot/server": "workspace:*",
         "@openbot/vault": "workspace:*",
         "hono": "^4.7.7",
         "zod": "^3.24.2",
       },
       "devDependencies": {
+        "@a2a-js/sdk": "1.1.0",
+        "@ag-ui/client": "0.0.59",
+        "@modelcontextprotocol/client": "2.0.0",
         "@types/bun": "^1.2.5",
         "playwright-core": "^1.52.0",
+        "typescript": "5.9.3",
       },
     },
     "apps/server": {
@@ -34,13 +45,20 @@
       "dependencies": {
         "@openbot/acp-grok": "workspace:*",
         "@openbot/api-types": "workspace:*",
+        "@openbot/application": "workspace:*",
+        "@openbot/attachments": "workspace:*",
         "@openbot/auth": "workspace:*",
         "@openbot/calendar": "workspace:*",
+        "@openbot/core": "workspace:*",
         "@openbot/db": "workspace:*",
         "@openbot/federation": "workspace:*",
         "@openbot/live-work": "workspace:*",
         "@openbot/mcp-send-message": "workspace:*",
+        "@openbot/protocol-a2a": "workspace:*",
+        "@openbot/protocol-ag-ui": "workspace:*",
+        "@openbot/protocol-mcp": "workspace:*",
         "@openbot/runner": "workspace:*",
+        "@openbot/runtime-grok": "workspace:*",
         "@openbot/vault": "workspace:*",
         "hono": "^4.7.7",
       },
@@ -59,6 +77,22 @@
         "zod": "^3.24.2",
       },
     },
+    "packages/application": {
+      "name": "@openbot/application",
+      "version": "1.0.0",
+      "dependencies": {
+        "@openbot/core": "workspace:*",
+      },
+    },
+    "packages/attachments": {
+      "name": "@openbot/attachments",
+      "version": "1.0.0",
+      "dependencies": {
+        "@openbot/application": "workspace:*",
+        "@openbot/core": "workspace:*",
+        "@openbot/db": "workspace:*",
+      },
+    },
     "packages/auth": {
       "name": "@openbot/auth",
       "version": "0.1.0",
@@ -74,11 +108,20 @@
       "name": "@openbot/compute-protocol",
       "version": "0.1.0",
     },
+    "packages/core": {
+      "name": "@openbot/core",
+      "version": "1.0.0",
+      "dependencies": {
+        "zod": "^3.24.2",
+      },
+    },
     "packages/db": {
       "name": "@openbot/db",
       "version": "0.1.0",
       "dependencies": {
+        "@openbot/application": "workspace:*",
         "@openbot/calendar": "workspace:*",
+        "@openbot/core": "workspace:*",
       },
     },
     "packages/federation": {
@@ -100,8 +143,35 @@
         "@openbot/api-types": "workspace:*",
         "@openbot/calendar": "workspace:*",
         "@openbot/db": "workspace:*",
-        "@openbot/federation": "workspace:*",
         "@openbot/live-work": "workspace:*",
+      },
+    },
+    "packages/protocol-a2a": {
+      "name": "@openbot/protocol-a2a",
+      "version": "1.0.0",
+      "dependencies": {
+        "@a2a-js/sdk": "1.1.0",
+        "@openbot/application": "workspace:*",
+        "@openbot/core": "workspace:*",
+      },
+    },
+    "packages/protocol-ag-ui": {
+      "name": "@openbot/protocol-ag-ui",
+      "version": "1.0.0",
+      "dependencies": {
+        "@ag-ui/core": "0.0.59",
+        "@ag-ui/encoder": "0.0.59",
+        "@openbot/application": "workspace:*",
+        "@openbot/core": "workspace:*",
+      },
+    },
+    "packages/protocol-mcp": {
+      "name": "@openbot/protocol-mcp",
+      "version": "1.0.0",
+      "dependencies": {
+        "@modelcontextprotocol/server": "2.0.0",
+        "@openbot/application": "workspace:*",
+        "@openbot/core": "workspace:*",
       },
     },
     "packages/runner": {
@@ -112,21 +182,54 @@
         "@openbot/compute-protocol": "workspace:*",
       },
     },
+    "packages/runtime-grok": {
+      "name": "@openbot/runtime-grok",
+      "version": "1.0.0",
+      "dependencies": {
+        "@openbot/application": "workspace:*",
+        "@openbot/compute-protocol": "workspace:*",
+        "@openbot/core": "workspace:*",
+      },
+    },
     "packages/vault": {
       "name": "@openbot/vault",
       "version": "0.1.0",
     },
   },
   "packages": {
+    "@a2a-js/sdk": ["@a2a-js/sdk@1.1.0", "", { "dependencies": { "jose": "^6.2.3" }, "peerDependencies": { "@bufbuild/protobuf": "^2.10.2", "@grpc/grpc-js": "^1.11.0", "express": "^4.21.2 || ^5.1.0" }, "optionalPeers": ["@bufbuild/protobuf", "@grpc/grpc-js", "express"] }, "sha512-/Mhzw9C6VW7pFbY2Rq0pnrjT0Fy9PV0c46A7Gx1ppRlYq2u/6OV/bNRIoVBKChb8UZ8bE0WzzCc0pIr2CdmG+w=="],
+
+    "@ag-ui/client": ["@ag-ui/client@0.0.59", "", { "dependencies": { "@ag-ui/core": "0.0.59", "@ag-ui/encoder": "0.0.59", "@ag-ui/proto": "0.0.59", "@types/uuid": "^10.0.0", "compare-versions": "^6.1.1", "fast-json-patch": "^3.1.1", "rxjs": "7.8.1", "untruncate-json": "^0.0.1", "uuid": "^11.1.0", "zod": "^3.22.4" } }, "sha512-d7++r8sBAq6z9G/D/WKrMznQ1Mdvew14pCqOVATReFIvl06mCi1BPqTwmos3zCDGAIiSgcvxc/8m472rYQgFFQ=="],
+
+    "@ag-ui/core": ["@ag-ui/core@0.0.59", "", { "dependencies": { "zod": "^3.22.4" } }, "sha512-hDgy4ipTqXieT8YG8Mr917Y+FD/f11VK1GefZ5CwTDCuNqS/oTwjJ5l/DZkicThgS8hQW/Y7wPylPBMBJ8BkUg=="],
+
+    "@ag-ui/encoder": ["@ag-ui/encoder@0.0.59", "", { "dependencies": { "@ag-ui/core": "0.0.59", "@ag-ui/proto": "0.0.59" } }, "sha512-wQCzBsStyZMm8nzhTdTx1G0B1C8yv5rbzZLnz1ka/l5LcJEsK3KTounU8CR9l+7QtcpOUUDJKd0xAbyI6gNcSw=="],
+
+    "@ag-ui/proto": ["@ag-ui/proto@0.0.59", "", { "dependencies": { "@ag-ui/core": "0.0.59", "@bufbuild/protobuf": "^2.2.5", "@protobuf-ts/protoc": "^2.11.1" } }, "sha512-X+uvDaegLEHw5kJu8tv2eSqHH8ouat+JCfFokGV1uuMquY8qCEQSlGsM7xzexwX9fujuxgHOWumg5kJDqa0+RA=="],
+
+    "@bufbuild/protobuf": ["@bufbuild/protobuf@2.14.1", "", {}, "sha512-agRJn3+EJDUe8AvxTx/LnHA/GErvLE62pSaSk7+MwFOtOv8eWBu/qCq2qoZjBjVZ3C2aiFJCveuSs17KMkYGOw=="],
+
+    "@modelcontextprotocol/client": ["@modelcontextprotocol/client@2.0.0", "", { "dependencies": { "@modelcontextprotocol/core": "2.0.0", "cross-spawn": "^7.0.5", "eventsource": "^3.0.2", "eventsource-parser": "^3.0.0", "jose": "^6.1.3", "pkce-challenge": "^5.0.0", "zod": "^4.2.0" } }, "sha512-8f1OghQ2rjzIOfqgUCP+8GiUWqRs89njoWLNqAe8kWmDePv3s1fZXseej+QXemssEuuOvLLmLO/kqM3IQHtISw=="],
+
+    "@modelcontextprotocol/core": ["@modelcontextprotocol/core@2.0.0", "", { "dependencies": { "zod": "^4.2.0" } }, "sha512-pJCEwGG7Lfr/+PQp9ZTwKXNeO5wzbfKL7H3MYpCorM4oFBoQrdjnBgEoqG+RjhsvS1FKrDbKux+M1HhlnGWqcA=="],
+
+    "@modelcontextprotocol/server": ["@modelcontextprotocol/server@2.0.0", "", { "dependencies": { "@modelcontextprotocol/core": "2.0.0", "zod": "^4.2.0" } }, "sha512-YhHWdHfpFMQfd0prsEnxKeS3Qz3ytIGmsS0sth4KDjnacIT7hxk6hXHkJ9KysxlkvTM+WZAtQbbcUhdoP4Hvtw=="],
+
     "@openbot/acp-grok": ["@openbot/acp-grok@workspace:packages/acp-grok"],
 
     "@openbot/api-types": ["@openbot/api-types@workspace:packages/api-types"],
+
+    "@openbot/application": ["@openbot/application@workspace:packages/application"],
+
+    "@openbot/attachments": ["@openbot/attachments@workspace:packages/attachments"],
 
     "@openbot/auth": ["@openbot/auth@workspace:packages/auth"],
 
     "@openbot/calendar": ["@openbot/calendar@workspace:packages/calendar"],
 
     "@openbot/compute-protocol": ["@openbot/compute-protocol@workspace:packages/compute-protocol"],
+
+    "@openbot/core": ["@openbot/core@workspace:packages/core"],
 
     "@openbot/db": ["@openbot/db@workspace:packages/db"],
 
@@ -136,24 +239,76 @@
 
     "@openbot/mcp-send-message": ["@openbot/mcp-send-message@workspace:packages/mcp-send-message"],
 
+    "@openbot/protocol-a2a": ["@openbot/protocol-a2a@workspace:packages/protocol-a2a"],
+
+    "@openbot/protocol-ag-ui": ["@openbot/protocol-ag-ui@workspace:packages/protocol-ag-ui"],
+
+    "@openbot/protocol-mcp": ["@openbot/protocol-mcp@workspace:packages/protocol-mcp"],
+
     "@openbot/runner": ["@openbot/runner@workspace:packages/runner"],
+
+    "@openbot/runtime-grok": ["@openbot/runtime-grok@workspace:packages/runtime-grok"],
 
     "@openbot/server": ["@openbot/server@workspace:apps/server"],
 
     "@openbot/vault": ["@openbot/vault@workspace:packages/vault"],
 
+    "@protobuf-ts/protoc": ["@protobuf-ts/protoc@2.11.1", "", { "bin": { "protoc": "protoc.js" } }, "sha512-mUZJaV0daGO6HUX90o/atzQ6A7bbN2RSuHtdwo8SSF2Qoe3zHwa4IHyCN1evftTeHfLmdz+45qo47sL+5P8nyg=="],
+
     "@types/bun": ["@types/bun@1.4.0", "", { "dependencies": { "bun-types": "1.4.0" } }, "sha512-K+lZULY23vRgK/CfTjFIV+tyifaNdSMlPh9j+6mQ/cLfpOznLyAuzgV/JQysyECpkBQLVMSyvjlr2fBUSA9wFQ=="],
 
     "@types/node": ["@types/node@26.3.0", "", { "dependencies": { "undici-types": "~8.3.0" } }, "sha512-L3fgrnchriRC2ExBflb8j4uZZURHZfQsmQeyVzhjcHW4kkwVyo8/0h1B2MVzMTrYUJYu6G7EWs14hW/L9putqw=="],
 
+    "@types/uuid": ["@types/uuid@10.0.0", "", {}, "sha512-7gqG38EyHgyP1S+7+xomFtL+ZNHcKv6DwNaCZmJmo1vgMugyF3TCnXVg4t1uk89mLNwnLtnY3TpOpCOyp1/xHQ=="],
+
     "bun-types": ["bun-types@1.4.0", "", { "dependencies": { "@types/node": "*" } }, "sha512-iIKw23BspnQQYd3prITOBxeUsxBHnwzX6YJfGMuNOZzeNcMmVqzIIVGRm1l69ogaPQmb4wB6BN8mA5bE9YuC5Q=="],
+
+    "compare-versions": ["compare-versions@6.1.1", "", {}, "sha512-4hm4VPpIecmlg59CHXnRDnqGplJFrbLG4aFEl5vl6cK1u76ws3LLvX7ikFnTDl5vo39sjWD6AaDPYodJp/NNHg=="],
+
+    "cross-spawn": ["cross-spawn@7.0.6", "", { "dependencies": { "path-key": "^3.1.0", "shebang-command": "^2.0.0", "which": "^2.0.1" } }, "sha512-uV2QOWP2nWzsy2aMp8aRibhi9dlzF5Hgh5SHaB9OiTGEyDTiJJyx0uy51QXdyWbtAHNua4XJzUKca3OzKUd3vA=="],
+
+    "eventsource": ["eventsource@3.0.7", "", { "dependencies": { "eventsource-parser": "^3.0.1" } }, "sha512-CRT1WTyuQoD771GW56XEZFQ/ZoSfWid1alKGDYMmkt2yl8UXrVR4pspqWNEcqKvVIzg6PAltWjxcSSPrboA4iA=="],
+
+    "eventsource-parser": ["eventsource-parser@3.1.1", "", {}, "sha512-EKN1vKAMcZ8MlYMpaNuxN6R9yakzH6uajHcHVTqWJzvu5pWw9DyhbP35HH8MVBQ+dZjAfDxk+A8NiR9KWaXiyQ=="],
+
+    "fast-json-patch": ["fast-json-patch@3.1.1", "", {}, "sha512-vf6IHUX2SBcA+5/+4883dsIjpBTqmfBjmYiWK1savxQmFk4JfBMLa7ynTYOs1Rolp/T1betJxHiGD3g1Mn8lUQ=="],
 
     "hono": ["hono@4.13.4", "", {}, "sha512-AGEwKIyRMHRv1t8Wjwa3LHxQ61X5CqrdFT+4BRNTpqS5aJNnpl5WLjADb7vFlJzI/8uK7T5QLVApCMQKNa3LgQ=="],
 
+    "isexe": ["isexe@2.0.0", "", {}, "sha512-RHxMLp9lnKHGHRng9QFhRCMbYAcVpn69smSGcq3f36xjgVVWThj4qqLbTLlq7Ssj8B+fIQ1EuCEGI2lKsyQeIw=="],
+
+    "jose": ["jose@6.2.10", "", {}, "sha512-iiW7J9qRFlGxvCOIBDBDxFePQSn7ZMAnrYGhrrOo6siO/MIqwfyilLR27pkfDgUk+raLuzADS8A3S/KLBisc0g=="],
+
+    "path-key": ["path-key@3.1.1", "", {}, "sha512-ojmeN0qd+y0jszEtoY48r0Peq5dwMEkIlCOu6Q5f41lfkswXuKtYrhgoTpLnyIcHm24Uhqx+5Tqm2InSwLhE6Q=="],
+
+    "pkce-challenge": ["pkce-challenge@5.0.1", "", {}, "sha512-wQ0b/W4Fr01qtpHlqSqspcj3EhBvimsdh0KlHhH8HRZnMsEa0ea2fTULOXOS9ccQr3om+GcGRk4e+isrZWV8qQ=="],
+
     "playwright-core": ["playwright-core@1.62.1", "", { "bin": { "playwright-core": "cli.js" } }, "sha512-wPYSwEBJY9GHraISXqyqtx0na0LpO3XEX7jNDhntbex7tzUS7kLnZsOlFruFJB4Hi/rhDMjXGqHewDZ68nYZVw=="],
+
+    "rxjs": ["rxjs@7.8.1", "", { "dependencies": { "tslib": "^2.1.0" } }, "sha512-AA3TVj+0A2iuIoQkWEK/tqFjBq2j+6PO6Y0zJcvzLAFhEFIO3HL0vls9hWLncZbAAbK0mar7oZ4V079I/qPMxg=="],
+
+    "shebang-command": ["shebang-command@2.0.0", "", { "dependencies": { "shebang-regex": "^3.0.0" } }, "sha512-kHxr2zZpYtdmrN1qDjrrX/Z1rR1kG8Dx+gkpK1G4eXmvXswmcE1hTWBWYUzlraYw1/yZp6YuDY77YtvbN0dmDA=="],
+
+    "shebang-regex": ["shebang-regex@3.0.0", "", {}, "sha512-7++dFhtcx3353uBaq8DDR4NuxBetBzC7ZQOhmTQInHEd6bSrXdiEyzCvG07Z44UYdLShWUyXt5M/yhz8ekcb1A=="],
+
+    "tslib": ["tslib@2.8.1", "", {}, "sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w=="],
+
+    "typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
 
     "undici-types": ["undici-types@8.3.0", "", {}, "sha512-j375ScV60dom+YkPFIfTLcOiPxkN/buHz5GobjLhixFuANaNs3C9l4GmrWqejgXWJ7BbJcFYpTEUkS1Ge8bpZQ=="],
 
+    "untruncate-json": ["untruncate-json@0.0.1", "", {}, "sha512-4W9enDK4X1y1s2S/Rz7ysw6kDuMS3VmRjMFg7GZrNO+98OSe+x5Lh7PKYoVjy3lW/1wmhs6HW0lusnQRHgMarA=="],
+
+    "uuid": ["uuid@11.1.1", "", { "bin": { "uuid": "dist/esm/bin/uuid" } }, "sha512-vIYxrBCC/N/K+Js3qSN88go7kIfNPssr/hHCesKCQNAjmgvYS2oqr69kIufEG+O4+PfezOH4EbIeHCfFov8ZgQ=="],
+
+    "which": ["which@2.0.2", "", { "dependencies": { "isexe": "^2.0.0" }, "bin": { "node-which": "./bin/node-which" } }, "sha512-BLI3Tl1TW3Pvl70l3yq3Y64i+awpwXqsGBYWkkqMtnbXgrMD+yj7rhW0kuEDxzJaYXGjEW5ogapKNMEKNMjibA=="],
+
     "zod": ["zod@3.25.76", "", {}, "sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ=="],
+
+    "@modelcontextprotocol/client/zod": ["zod@4.5.4", "", {}, "sha512-sC95tT5iHHH9gtpj6A81kh+NEaRAUFN+qlUPDUbRfOMvNf5QCBqsb3WgvnpVtK5Y+4UfA6KqufotuTvMGiTlsA=="],
+
+    "@modelcontextprotocol/core/zod": ["zod@4.5.4", "", {}, "sha512-sC95tT5iHHH9gtpj6A81kh+NEaRAUFN+qlUPDUbRfOMvNf5QCBqsb3WgvnpVtK5Y+4UfA6KqufotuTvMGiTlsA=="],
+
+    "@modelcontextprotocol/server/zod": ["zod@4.5.4", "", {}, "sha512-sC95tT5iHHH9gtpj6A81kh+NEaRAUFN+qlUPDUbRfOMvNf5QCBqsb3WgvnpVtK5Y+4UfA6KqufotuTvMGiTlsA=="],
   }
 }

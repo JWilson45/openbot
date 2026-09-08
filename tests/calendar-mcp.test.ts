@@ -102,16 +102,14 @@ describe("calendar MCP", () => {
       (t) => t.name,
     );
     expect(names).toEqual([
-      "SendMessage",
       "SendToAgent",
-      "SendToThread",
       "ListBots",
       "Memory",
       "SearchMessages",
       "SearchThreads",
-      "SendToOrg",
-      "Inbox",
     ]);
+    expect(names).not.toContain("SendToOrg");
+    expect(names).not.toContain("Inbox");
     expect(names).not.toContain("ListCalendar");
     expect(names).not.toContain("CreateEvent");
     expect(names).not.toContain("ProposeRoutine");

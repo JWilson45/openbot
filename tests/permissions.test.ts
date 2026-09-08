@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import { id, now } from "@openbot/db";
+import { insertMessage } from "@openbot/live-work";
 import { denyGatewayExec, deskPathGuard, pathIsDenied, resolvePermissionPath } from "@openbot/runner";
 import { grokHomeDir } from "@openbot/acp-grok";
 import { fakeAgentCommand, tempHome } from "./helpers.ts";
@@ -235,25 +237,40 @@ describe("ACP session/request_permission", () => {
     const { ctx, server, origin } = startTestServer({ home });
     const { cookie, session } = loginCookie({ ctx }, "alice");
     const headers = { cookie, "content-type": "application/json" };
-    await fetch(`${origin}/v1/org`, {
-      method: "PATCH",
-      headers,
-      body: JSON.stringify({ federationEnabled: true }),
-    });
     const listed = (await fetch(`${origin}/v1/bots`, { headers }).then((r) => r.json())) as {
-      gateway: { id: string };
+      a2aGateway: { available: boolean } | null;
+      gateway?: unknown;
     };
-    const gwId = listed.gateway.id;
-    const thread = (await fetch(`${origin}/v1/threads?botId=${gwId}`, { headers }).then((r) => r.json())) as {
-      thread: { id: string };
-    };
-    const posted = await fetch(`${origin}/v1/threads/${thread.thread.id}/messages`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ body: "[[permission]] [[send:gateway-denied-exec]]" }),
+    expect(listed).not.toHaveProperty("gateway");
+    expect(listed.a2aGateway?.available).toBe(true);
+    const gateway = ctx.db.get<{ id: string }>(
+      "SELECT id FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'gateway'",
+      [session.accountId],
+    );
+    expect(gateway).toBeTruthy();
+    const gwId = gateway!.id;
+    const thread = ctx.db.get<{ id: string }>(
+      "SELECT id FROM threads WHERE account_id = ? AND bot_id = ? AND IFNULL(kind, 'human') = 'human'",
+      [session.accountId, gwId],
+    );
+    expect(thread).toBeTruthy();
+    const turnId = id();
+    const createdAt = now();
+    ctx.db.immediate(() => {
+      ctx.db.run(
+        `INSERT INTO turns (id, thread_id, bot_id, status, sent_message_count, assistant_text, deadline_at, created_at)
+         VALUES (?, ?, ?, 'queued', 0, '', ?, ?)`,
+        [turnId, thread!.id, gwId, createdAt + 2 * 60 * 60 * 1000, createdAt],
+      );
+      insertMessage(ctx.db, {
+        threadId: thread!.id,
+        turnId,
+        role: "user",
+        origin: "user",
+        body: "[[permission]]",
+      });
     });
-    expect(posted.status).toBe(202);
-    const { turnId } = (await posted.json()) as { turnId: string };
+    ctx.engine.kick();
     const start = Date.now();
     while (Date.now() - start < 10_000) {
       const t = ctx.db.get<{ status: string }>(
@@ -264,11 +281,11 @@ describe("ACP session/request_permission", () => {
       await Bun.sleep(40);
     }
     expect(ctx.engine.runnerFor(session.accountId).acpFor(gwId)?.permissionHandler).toBe(denyGatewayExec);
-    const msgs = ctx.db.all<{ origin: string; body: string }>(
-      "SELECT origin, body FROM messages WHERE thread_id = ? ORDER BY created_at",
-      [thread.thread.id],
+    const sent = ctx.db.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM messages WHERE thread_id = ? AND origin = 'send_message'",
+      [thread!.id],
     );
-    expect(msgs.some((m) => m.origin === "send_message" && m.body === "gateway-denied-exec")).toBe(true);
+    expect(sent?.n).toBe(0);
     const events = (await fetch(`${origin}/v1/turns/${turnId}/live-work`, { headers }).then((r) =>
       r.json(),
     )) as { events: Array<{ kind: string }> };

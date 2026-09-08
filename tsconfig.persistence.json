@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.base.json",
+  "include": [
+    "packages/core/**/*",
+    "packages/application/**/*",
+    "packages/db/**/*",
+    "tests/db-task-store.test.ts",
+    "tests/schema.test.ts"
+  ]
+}

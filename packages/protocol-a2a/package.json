@@ -1,0 +1,13 @@
+{
+  "name": "@openbot/protocol-a2a",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@a2a-js/sdk": "1.1.0",
+    "@openbot/application": "workspace:*",
+    "@openbot/core": "workspace:*"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

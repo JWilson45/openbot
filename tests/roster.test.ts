@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { ARCHIVE_TTL_MS, now } from "@openbot/db";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { ARCHIVE_TTL_MS, id, now } from "@openbot/db";
+import { insertMessage } from "@openbot/live-work";
 import { fakeAgentCommand, tempHome } from "./helpers.ts";
 import { loginCookie, startTestServer } from "../apps/server/src/test-helpers.ts";
 
@@ -34,13 +37,18 @@ describe("roster", () => {
     expect(dup.status).toBe(409);
     const list = (await fetch(`${origin}/v1/bots`, { headers }).then((r) => r.json())) as {
       bots: Array<{ name: string }>;
-      gateway: { id: string; name: string; enabled: boolean; role: string } | null;
+      a2aGateway: { available: boolean; endpoint: string; agentCard: string } | null;
+      gateway?: unknown;
     };
     expect(list.bots.length).toBe(6);
-    expect(list.bots.some((b) => b.name === list.gateway?.name)).toBe(false);
-    expect(list.gateway).toBeTruthy();
-    expect(list.gateway!.role).toBe("gateway");
-    expect(list.gateway!.enabled).toBe(false);
+    expect(list).not.toHaveProperty("gateway");
+    expect(list.a2aGateway).toEqual({
+      available: true,
+      endpoint: "/a2a/v1",
+      agentCard: "/.well-known/agent-card.json",
+    });
+    expect(list.a2aGateway).not.toHaveProperty("id");
+    expect(list.a2aGateway).not.toHaveProperty("name");
     const arch = await fetch(`${origin}/v1/bots/${created[0]}/archive`, { method: "POST", headers });
     expect(arch.status).toBe(200);
     const again = await fetch(`${origin}/v1/bots`, {
@@ -164,21 +172,33 @@ describe("roster", () => {
     server.stop(true);
   });
 
-  test("Gateway is a sidecar, not a desk slot, and locked fields 409", async () => {
+  test("A2A status is ID-free and Gateway has no human bot surface", async () => {
     process.env.OPENBOT_ACP_COMMAND = fakeAgentCommand();
     const { ctx, server, origin } = startTestServer({ home: tempHome() });
-    const { cookie } = loginCookie({ ctx }, "alice");
+    const { cookie, session } = loginCookie({ ctx }, "alice");
     const headers = { cookie, "content-type": "application/json" };
     const listed = (await fetch(`${origin}/v1/bots`, { headers }).then((r) => r.json())) as {
       bots: Array<{ name: string }>;
-      gateway: { id: string; name: string; enabled: boolean } | null;
+      a2aGateway: { available: boolean; endpoint: string; agentCard: string } | null;
+      gateway?: unknown;
       bot: { id: string } | null;
     };
     expect(listed.bots.length).toBe(0);
     expect(listed.bot).toBeNull();
-    expect(listed.gateway).toBeTruthy();
-    expect(listed.gateway!.enabled).toBe(false);
-    const gwId = listed.gateway!.id;
+    expect(listed).not.toHaveProperty("gateway");
+    expect(listed.a2aGateway).toEqual({
+      available: true,
+      endpoint: "/a2a/v1",
+      agentCard: "/.well-known/agent-card.json",
+    });
+    expect(listed.a2aGateway).not.toHaveProperty("id");
+    expect(listed.a2aGateway).not.toHaveProperty("name");
+    const gateway = ctx.db.get<{ id: string }>(
+      "SELECT id FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'gateway'",
+      [session.accountId],
+    );
+    expect(gateway).toBeTruthy();
+    const gwId = gateway!.id;
     const activity = (await fetch(`${origin}/v1/activity`, { headers }).then((r) => r.json())) as {
       bots: Array<{ id: string }>;
     };
@@ -197,141 +217,109 @@ describe("roster", () => {
     expect(asRole.status).toBe(400);
     expect(((await asRole.json()) as { error: string }).error).toBe("invalid_role");
 
+    const getBot = await fetch(`${origin}/v1/bots/${gwId}`, { headers });
+    expect(getBot.status).toBe(404);
+    expect(((await getBot.json()) as { error: string }).error).toBe("not_found");
     const arch = await fetch(`${origin}/v1/bots/${gwId}/archive`, { method: "POST", headers });
-    expect(arch.status).toBe(409);
-    expect(((await arch.json()) as { error: string }).error).toBe("gateway_protected");
+    expect(arch.status).toBe(404);
+    expect(((await arch.json()) as { error: string }).error).toBe("not_found");
     const purge = await fetch(`${origin}/v1/bots/${gwId}/purge`, {
       method: "POST",
       headers,
       body: JSON.stringify({ confirm: "DELETE" }),
     });
-    expect(purge.status).toBe(409);
+    expect(purge.status).toBe(404);
+    expect(((await purge.json()) as { error: string }).error).toBe("not_found");
     const rename = await fetch(`${origin}/v1/bots/${gwId}`, {
       method: "PATCH",
       headers,
       body: JSON.stringify({ name: "NotGateway" }),
     });
-    expect(rename.status).toBe(409);
+    expect(rename.status).toBe(404);
+    expect(((await rename.json()) as { error: string }).error).toBe("not_found");
     const perm = await fetch(`${origin}/v1/bots/${gwId}/settings`, {
       method: "PATCH",
       headers,
       body: JSON.stringify({ permissionMode: "auto" }),
     });
-    expect(perm.status).toBe(409);
+    expect(perm.status).toBe(404);
+    expect(((await perm.json()) as { error: string }).error).toBe("not_found");
     const harness = await fetch(`${origin}/v1/bots/${gwId}/settings`, {
       method: "PATCH",
       headers,
       body: JSON.stringify({ harness: "codex" }),
     });
-    expect(harness.status).toBe(409);
+    expect(harness.status).toBe(404);
+    expect(((await harness.json()) as { error: string }).error).toBe("not_found");
     const effort = await fetch(`${origin}/v1/bots/${gwId}/settings`, {
       method: "PATCH",
       headers,
       body: JSON.stringify({ reasoningEffort: "medium" }),
     });
-    expect(effort.status).toBe(200);
+    expect(effort.status).toBe(404);
+    expect(((await effort.json()) as { error: string }).error).toBe("not_found");
 
-    const on = await fetch(`${origin}/v1/org`, {
-      method: "PATCH",
-      headers,
-      body: JSON.stringify({ federationEnabled: true }),
-    });
-    expect(on.status).toBe(200);
-    const enabled = (await fetch(`${origin}/v1/bots`, { headers }).then((r) => r.json())) as {
-      gateway: { enabled: boolean };
-    };
-    expect(enabled.gateway.enabled).toBe(true);
-    const prevFed = process.env.OPENBOT_FEDERATION;
-    process.env.OPENBOT_FEDERATION = "0";
-    try {
-      const forcedOff = (await fetch(`${origin}/v1/bots`, { headers }).then((r) => r.json())) as {
-        gateway: { enabled: boolean };
-      };
-      expect(forcedOff.gateway.enabled).toBe(false);
-    } finally {
-      if (prevFed === undefined) delete process.env.OPENBOT_FEDERATION;
-      else process.env.OPENBOT_FEDERATION = prevFed;
-    }
-    server.stop(true);
-  });
-
-  test("federation off completes a Gateway DM without an ACP pid", async () => {
-    process.env.OPENBOT_ACP_COMMAND = fakeAgentCommand();
-    const { ctx, server, origin } = startTestServer({ home: tempHome() });
-    const { cookie, session } = loginCookie({ ctx }, "alice");
-    const headers = { cookie, "content-type": "application/json" };
-    const listed = (await fetch(`${origin}/v1/bots`, { headers }).then((r) => r.json())) as {
-      gateway: { id: string };
-    };
-    const gwId = listed.gateway.id;
-    const thread = (await fetch(`${origin}/v1/threads?botId=${gwId}`, { headers }).then((r) => r.json())) as {
-      thread: { id: string };
-    };
-    const posted = await fetch(`${origin}/v1/threads/${thread.thread.id}/messages`, {
+    const conversation = await fetch(`${origin}/v1/agents/${gwId}/conversation`, { headers });
+    expect(conversation.status).toBe(404);
+    const internalThread = ctx.db.get<{ id: string }>(
+      "SELECT id FROM threads WHERE account_id = ? AND bot_id = ? AND IFNULL(kind, 'human') = 'human'",
+      [session.accountId, gwId],
+    );
+    expect(internalThread).toBeTruthy();
+    const threadRead = await fetch(`${origin}/v1/threads/${internalThread!.id}`, { headers });
+    expect(threadRead.status).toBe(404);
+    const threadPost = await fetch(`${origin}/v1/threads/${internalThread!.id}/messages`, {
       method: "POST",
       headers,
-      body: JSON.stringify({ body: "hello diplomat" }),
+      body: JSON.stringify({ body: "not a human DM" }),
     });
-    expect(posted.status).toBe(202);
-    const start = Date.now();
-    while (Date.now() - start < 10_000) {
-      const t = ctx.db.get<{ status: string }>(
-        "SELECT status FROM turns WHERE bot_id = ? ORDER BY created_at DESC LIMIT 1",
-        [gwId],
-      );
-      if (t?.status === "completed") break;
-      await Bun.sleep(40);
-    }
-    expect(ctx.engine.runnerFor(session.accountId).acpPid(gwId)).toBeUndefined();
-    const msgs = ctx.db.all<{ origin: string; body: string }>(
-      "SELECT origin, body FROM messages WHERE thread_id = ? ORDER BY created_at",
-      [thread.thread.id],
-    );
-    expect(msgs.some((m) => m.origin === "system" && /Federation is off/.test(m.body))).toBe(true);
+    expect(threadPost.status).toBe(404);
+
     server.stop(true);
   });
 
-  test("federation on runs Gateway ACP in desk/.openbot/gateway", async () => {
+  test("internal Gateway runtime runs ACP in desk/.openbot/gateway", async () => {
     process.env.OPENBOT_ACP_COMMAND = fakeAgentCommand();
     const home = tempHome();
-    const { ctx, server, origin } = startTestServer({ home });
-    const { cookie, session } = loginCookie({ ctx }, "alice");
-    const headers = { cookie, "content-type": "application/json" };
-    await fetch(`${origin}/v1/org`, {
-      method: "PATCH",
-      headers,
-      body: JSON.stringify({ federationEnabled: true }),
-    });
-    const listed = (await fetch(`${origin}/v1/bots`, { headers }).then((r) => r.json())) as {
-      gateway: { id: string; enabled: boolean };
-    };
-    expect(listed.gateway.enabled).toBe(true);
-    const gwId = listed.gateway.id;
-    const thread = (await fetch(`${origin}/v1/threads?botId=${gwId}`, { headers }).then((r) => r.json())) as {
-      thread: { id: string };
-    };
-    const posted = await fetch(`${origin}/v1/threads/${thread.thread.id}/messages`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ body: "[[cwd]]" }),
-    });
-    expect(posted.status).toBe(202);
-    const start = Date.now();
-    let body = "";
-    while (Date.now() - start < 10_000) {
-      const msgs = ctx.db.all<{ origin: string; body: string }>(
-        "SELECT origin, body FROM messages WHERE thread_id = ? ORDER BY created_at",
-        [thread.thread.id],
+    const { ctx, server } = startTestServer({ home });
+    const { session } = loginCookie({ ctx }, "alice");
+    const gateway = ctx.db.get<{ id: string }>(
+      "SELECT id FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'gateway'",
+      [session.accountId],
+    );
+    expect(gateway).toBeTruthy();
+    const gwId = gateway!.id;
+    const thread = ctx.db.get<{ id: string }>(
+      "SELECT id FROM threads WHERE account_id = ? AND bot_id = ? AND IFNULL(kind, 'human') = 'human'",
+      [session.accountId, gwId],
+    );
+    expect(thread).toBeTruthy();
+    const turnId = id();
+    const createdAt = now();
+    ctx.db.immediate(() => {
+      ctx.db.run(
+        `INSERT INTO turns (id, thread_id, bot_id, status, sent_message_count, assistant_text, deadline_at, created_at)
+         VALUES (?, ?, ?, 'queued', 0, '', ?, ?)`,
+        [turnId, thread!.id, gwId, createdAt + 2 * 60 * 60 * 1000, createdAt],
       );
-      const send = msgs.find((m) => m.origin === "send_message");
-      if (send) {
-        body = send.body;
-        break;
-      }
+      insertMessage(ctx.db, {
+        threadId: thread!.id,
+        turnId,
+        role: "user",
+        origin: "user",
+        body: "[[write:gateway-cwd.txt]]",
+      });
+    });
+    ctx.engine.kick();
+    const start = Date.now();
+    while (Date.now() - start < 10_000) {
+      const turn = ctx.db.get<{ status: string }>("SELECT status FROM turns WHERE id = ?", [turnId]);
+      if (turn?.status === "completed") break;
       await Bun.sleep(40);
     }
-    expect(body).toContain(".openbot/gateway");
-    expect(body).not.toContain("/projects/");
+    const workspaceProof = readFileSync(join(home, "desk", ".openbot", "gateway", "gateway-cwd.txt"), "utf8");
+    expect(workspaceProof).toContain(join(home, "desk", ".openbot", "gateway"));
+    expect(workspaceProof).not.toContain("/projects/");
     expect(ctx.engine.runnerFor(session.accountId).acpPid(gwId)).toBeTruthy();
     server.stop(true);
   });

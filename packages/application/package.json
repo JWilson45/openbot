@@ -1,0 +1,11 @@
+{
+  "name": "@openbot/application",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@openbot/core": "workspace:*"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

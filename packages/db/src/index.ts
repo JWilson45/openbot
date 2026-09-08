@@ -3,6 +3,11 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { materializeHorizon } from "@openbot/calendar";
 import { FTS_SCHEMA } from "./memory.ts";
+import { PROTOCOL_IDENTITIES_SCHEMA, TASK_SCHEMA } from "./task-schema.ts";
+
+export { PROTOCOL_IDENTITIES_SCHEMA, TASK_SCHEMA } from "./task-schema.ts";
+export { SqliteApplicationStore, SqliteConversationRepository, SqliteRunQueue } from "./task-store.ts";
+export { uuidIdGenerator } from "./ids.ts";
 
 export {
   ORG_NOTES_MAX,
@@ -62,11 +67,14 @@ CREATE TABLE IF NOT EXISTS bots (
   status text NOT NULL DEFAULT 'active',
   permission_mode text NOT NULL DEFAULT 'auto',
   harness text NOT NULL DEFAULT 'grok',
+  provider_id text NOT NULL DEFAULT 'grok',
+  runtime_config_json text NOT NULL DEFAULT '{"providerId":"grok","modelId":"grok-4.6","options":{"reasoningEffort":"high"}}',
   require_human_approval integer NOT NULL DEFAULT 0,
   model text NOT NULL DEFAULT 'grok-4.6',
   reasoning_effort text NOT NULL DEFAULT 'high',
   role text NOT NULL DEFAULT 'desk',
-  created_at integer NOT NULL
+  created_at integer NOT NULL,
+  updated_at integer NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS bots_active_name ON bots(account_id, name) WHERE status = 'active';
 
@@ -412,9 +420,18 @@ export class OpenbotDb {
 
   migrate(): void {
     this.raw.exec(SCHEMA);
+    this.raw.exec(TASK_SCHEMA);
+    this.migrateProtocolIdentityScope();
     this.raw.exec("DROP INDEX IF EXISTS bots_one_active");
     this.raw.exec("DROP INDEX IF EXISTS threads_one_per_bot");
     this.ensureColumn("bots", "harness", "text NOT NULL DEFAULT 'grok'");
+    this.ensureColumn("bots", "provider_id", "text NOT NULL DEFAULT 'grok'");
+    this.ensureColumn(
+      "bots",
+      "runtime_config_json",
+      `text NOT NULL DEFAULT '{"providerId":"grok","modelId":"grok-4.6","options":{"reasoningEffort":"high"}}'`,
+    );
+    this.ensureColumn("bots", "updated_at", "integer NOT NULL DEFAULT 0");
     this.ensureColumn("bots", "require_human_approval", "integer NOT NULL DEFAULT 0");
     this.ensureColumn("threads", "kind", "text NOT NULL DEFAULT 'human'");
     this.ensureColumn("threads", "peer_bot_id", "text");
@@ -432,6 +449,20 @@ export class OpenbotDb {
     this.ensureColumn("harness_sessions", "compact_turns", "integer NOT NULL DEFAULT 0");
     this.ensureColumn("harness_sessions", "compact_chars", "integer NOT NULL DEFAULT 0");
     this.ensureColumn("bots", "require_memory_approval", "integer NOT NULL DEFAULT 0");
+    this.ensureColumn("turns", "agent_task_id", "text");
+    this.ensureColumn("turns", "agent_run_id", "text");
+    this.ensureColumn("application_outbox", "last_error", "text");
+    this.raw.exec("UPDATE bots SET updated_at = created_at WHERE updated_at = 0");
+    this.raw.exec(`
+      UPDATE bots
+      SET provider_id = CASE WHEN harness = 'codex' THEN 'codex' ELSE 'grok' END,
+          runtime_config_json = json_object(
+            'providerId', CASE WHEN harness = 'codex' THEN 'codex' ELSE 'grok' END,
+            'modelId', model,
+            'options', json_object('reasoningEffort', reasoning_effort)
+          )
+      WHERE runtime_config_json = '{"providerId":"grok","modelId":"grok-4.6","options":{"reasoningEffort":"high"}}'
+    `);
     this.raw.exec(FTS_SCHEMA);
     this.backfillFts();
     this.raw.exec(
@@ -449,12 +480,29 @@ export class OpenbotDb {
     this.raw.exec(
       "CREATE UNIQUE INDEX IF NOT EXISTS threads_a2a_pair ON threads(account_id, bot_id, peer_bot_id) WHERE kind = 'a2a'",
     );
+    this.raw.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS turns_agent_task ON turns(agent_task_id) WHERE agent_task_id IS NOT NULL",
+    );
+    this.raw.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS turns_agent_run ON turns(agent_run_id) WHERE agent_run_id IS NOT NULL",
+    );
+    this.migrateCanonicalTasks();
   }
 
   private ensureColumn(table: string, column: string, decl: string): void {
     const cols = this.all<{ name: string }>(`PRAGMA table_info(${table})`);
     if (cols.some((c) => c.name === column)) return;
     this.raw.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+  }
+
+  /** Old account-only protocol mappings cannot be safely attributed to an authenticated subject. */
+  private migrateProtocolIdentityScope(): void {
+    const columns = this.all<{ name: string }>("PRAGMA table_info(protocol_identities)");
+    if (columns.some((column) => column.name === "subject_id")) return;
+    this.immediate(() => {
+      this.raw.exec("DROP TABLE protocol_identities");
+      this.raw.exec(PROTOCOL_IDENTITIES_SCHEMA);
+    });
   }
 
   private backfillFts(): void {
@@ -475,6 +523,95 @@ export class OpenbotDb {
         SELECT title, id, account_id, kind FROM threads
       `);
     }
+  }
+
+  private migrateCanonicalTasks(): void {
+    type LegacyTurn = TurnRow & { agent_task_id: string | null; agent_run_id: string | null };
+    const turns = this.all<LegacyTurn>("SELECT * FROM turns ORDER BY created_at, id");
+    const messages = this.all<MessageRow>("SELECT * FROM messages ORDER BY created_at, id");
+    if (turns.length === 0 && messages.length === 0) return;
+
+    this.immediate(() => {
+      this.raw.exec(`
+        INSERT OR IGNORE INTO agent_conversations
+          (id, account_id, title, metadata_json, created_at, updated_at)
+        SELECT id, account_id, NULLIF(title, ''),
+               json_object('legacy_kind', kind), created_at, created_at
+        FROM threads
+      `);
+
+      const turnIds = new Map<string, { taskId: string; runId: string }>();
+      for (const turn of turns) {
+        const taskId = turn.agent_task_id ?? crypto.randomUUID();
+        const runId = turn.agent_run_id ?? crypto.randomUUID();
+        if (!turn.agent_task_id || !turn.agent_run_id) {
+          this.run("UPDATE turns SET agent_task_id = ?, agent_run_id = ? WHERE id = ?", [taskId, runId, turn.id]);
+        }
+        turnIds.set(turn.id, { taskId, runId });
+        const thread = this.get<{ account_id: string }>("SELECT account_id FROM threads WHERE id = ?", [turn.thread_id]);
+        if (!thread) continue;
+        const taskStatus =
+          turn.status === "running"
+            ? "working"
+            : turn.status === "completed"
+              ? "completed"
+              : turn.status === "failed"
+                ? "failed"
+                : turn.status === "cancelled" || turn.status === "canceled"
+                  ? "canceled"
+                  : "submitted";
+        const runStatus =
+          turn.status === "running"
+            ? "running"
+            : turn.status === "completed"
+              ? "completed"
+              : turn.status === "failed"
+                ? "failed"
+                : turn.status === "cancelled" || turn.status === "canceled"
+                  ? "canceled"
+                  : "queued";
+        this.run(
+          `INSERT OR IGNORE INTO agent_tasks
+           (id, account_id, thread_id, agent_id, status, metadata_json, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, '{"migrated_from":"turn"}', ?, ?)`,
+          [taskId, thread.account_id, turn.thread_id, turn.bot_id, taskStatus, turn.created_at,
+            turn.finished_at ?? turn.started_at ?? turn.created_at],
+        );
+        const session = turn.harness_session_id
+          ? this.get<{ acp_session_id: string | null }>("SELECT acp_session_id FROM harness_sessions WHERE id = ?", [turn.harness_session_id])
+          : undefined;
+        this.run(
+          `INSERT OR IGNORE INTO agent_runs
+           (id, account_id, task_id, thread_id, agent_id, attempt, status, provider_session_ref,
+            metadata_json, created_at, started_at, finished_at)
+           VALUES (?, ?, ?, ?, ?, 1, ?, ?, '{"migrated_from":"turn"}', ?, ?, ?)`,
+          [runId, thread.account_id, taskId, turn.thread_id, turn.bot_id, runStatus,
+            session?.acp_session_id ?? null, turn.created_at, turn.started_at, turn.finished_at],
+        );
+      }
+
+      for (const message of messages) {
+        const thread = this.get<{ account_id: string }>("SELECT account_id FROM threads WHERE id = ?", [message.thread_id]);
+        if (!thread) continue;
+        const linked = message.turn_id ? turnIds.get(message.turn_id) : undefined;
+        const role =
+          message.role === "assistant" || message.role === "agent"
+            ? "agent"
+            : message.role === "tool"
+              ? "tool"
+              : message.role === "system"
+                ? "system"
+                : "user";
+        this.run(
+          `INSERT OR IGNORE INTO agent_messages
+           (id, account_id, thread_id, task_id, run_id, role, parts_json, metadata_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [message.id, thread.account_id, message.thread_id, linked?.taskId ?? null,
+            linked?.runId ?? null, role, JSON.stringify([{ kind: "text", text: message.body }]),
+            JSON.stringify({ legacy_origin: message.origin }), message.created_at],
+        );
+      }
+    });
   }
 
   close(): void {

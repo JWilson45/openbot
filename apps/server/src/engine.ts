@@ -3,7 +3,6 @@ import {
   id,
   now,
   purgeExpiredArchivedBots,
-  purgeExpiredOrgInbox,
   readNotes,
   scanMemoryText,
   sha256Hex,
@@ -32,8 +31,7 @@ import type { RunnerSession } from "@openbot/compute-protocol";
 import { RunnerUnavailable } from "@openbot/compute-protocol";
 import type { RemoteRunnerClient, TakeoverBridge } from "./remote-runner.ts";
 import { DEFAULT_GROK_MODEL, DEFAULT_REASONING_EFFORT, grokCliSignedIn, rosterFingerprint } from "@openbot/acp-grok";
-import { currentOrgMeta, FEDERATION_OFF_NOTICE, federationEffective } from "./org.ts";
-import { maybeEnqueueGatewayDrain } from "./inbox.ts";
+import { currentOrgMeta } from "./org.ts";
 import {
   markCalendarPendingAsSend,
   reconcileCalendarInstance,
@@ -75,6 +73,18 @@ export class TurnEngine {
   private runningBots = new Set<string>();
 
   constructor(public readonly opts: EngineOpts) {}
+
+  /** Reserves a bot for a canonical runtime worker without exposing engine internals. */
+  beginExternalRun(botId: string): boolean {
+    if (this.runningBots.has(botId)) return false;
+    this.runningBots.add(botId);
+    return true;
+  }
+
+  /** Releases a reservation created by beginExternalRun. */
+  endExternalRun(botId: string): void {
+    this.runningBots.delete(botId);
+  }
 
   enrolledRow(accountId: string): { status: string; machine_token_hash: string | null } | undefined {
     const row = this.opts.db.get<{ status: string; machine_token_hash: string | null }>(
@@ -233,26 +243,11 @@ export class TurnEngine {
     return runTickCalendar(this.opts.db, nowMs);
   }
 
-  /** Reap orphans, idle ACPs, archived bots, and expired inbox rows. Does not start turns. */
+  /** Reap orphans, idle ACPs, and archived bots. Does not start turns. */
   maintenance(): void {
     this.reapOrphans();
     this.reapIdleHarnesses();
     this.purgeExpiredArchives();
-    purgeExpiredOrgInbox(this.opts.db);
-  }
-
-  maybeKickGatewayDrain(gatewayBotId: string, finishedTurnId?: string): void {
-    const result = maybeEnqueueGatewayDrain(this.opts.db, gatewayBotId, finishedTurnId);
-    const bot = this.opts.db.get<{ account_id: string }>("SELECT account_id FROM bots WHERE id = ?", [
-      gatewayBotId,
-    ]);
-    if (bot) {
-      for (const m of result.push) {
-        if (m.origin === "prompt" || m.origin === "calendar") continue;
-        this.opts.onPush(bot.account_id, { type: "message.created", message: m });
-      }
-    }
-    if (result.kick) this.kick();
   }
 
   /** DB-purge expired archives, then best-effort delete each `desk/projects/<id>` only (not isolation). */
@@ -270,7 +265,10 @@ export class TurnEngine {
   }
 
   reapIdleHarnesses(): void {
-    const federationOff = !federationEffective(currentOrgMeta(this.opts.db));
+    // Gateway is the always-available local agent behind the A2A endpoint.
+    // The runner option keeps its historical name, but the removed federation
+    // switch can no longer force the Gateway process to be reaped.
+    const federationOff = false;
     const skipBotIds = new Set(this.runningBots);
     for (const row of this.opts.db.all<{ bot_id: string }>(
       "SELECT DISTINCT bot_id FROM turns WHERE status IN ('queued', 'running')",
@@ -332,7 +330,7 @@ export class TurnEngine {
           [turn.id],
         );
         for (const m of msgs) {
-          if (m.origin === "prompt" || m.origin === "calendar") continue; // per-turn clones, not transcript bubbles
+          if (m.origin === "prompt" || m.origin === "calendar" || m.origin === "send_message" || m.origin === "pending_approval") continue;
           this.opts.onPush(bot.account_id, { type: "message.created", message: m });
         }
       }
@@ -412,37 +410,6 @@ export class TurnEngine {
     );
     const isGateway = bot.role === "gateway";
     const org = currentOrgMeta(this.opts.db);
-
-    if (isGateway && !federationEffective(org)) {
-      this.runners.get(bot.account_id)?.invalidateAcp(bot.id);
-      this.opts.db.run("UPDATE turns SET status = 'running', started_at = ? WHERE id = ?", [
-        now(),
-        turn.id,
-      ]);
-      this.opts.onPush(bot.account_id, { type: "turn.updated", turnId: turn.id, status: "running" });
-      insertMessage(this.opts.db, {
-        threadId: turn.thread_id,
-        turnId: turn.id,
-        role: "system",
-        origin: "system",
-        body: FEDERATION_OFF_NOTICE,
-      });
-      // skip promote() empty-turn placeholder; the system line is the reply
-      this.opts.db.run("UPDATE turns SET sent_message_count = 1 WHERE id = ?", [turn.id]);
-      promote(this.opts.db, turn.id, { kind: "acp_done", stopReason: "end_turn", assistantText: "" });
-      this.opts.onPush(bot.account_id, { type: "turn.updated", turnId: turn.id, status: "completed" });
-      const msgs = this.opts.db.all<{ origin: string }>(
-        "SELECT * FROM messages WHERE turn_id = ? ORDER BY created_at",
-        [turn.id],
-      );
-      for (const m of msgs) {
-        if (m.origin === "prompt" || m.origin === "calendar") continue;
-        this.opts.onPush(bot.account_id, { type: "message.created", message: m });
-      }
-      this.maybeKickGatewayDrain(bot.id, turn.id);
-      return;
-    }
-
     let runner: RunnerSession;
     try {
       runner = this.runnerFor(bot.account_id);
@@ -566,7 +533,6 @@ export class TurnEngine {
       promote(this.opts.db, turn.id, { kind: "crash", assistantText: "" });
       reconcileCalendarInstance(this.opts.db, turn.id);
       this.opts.onPush(bot.account_id, { type: "turn.updated", turnId: turn.id, status: "failed" });
-      if (isGateway) this.maybeKickGatewayDrain(bot.id, turn.id);
       return;
     }
 
@@ -597,7 +563,7 @@ export class TurnEngine {
       );
     }
 
-    const mcpUrl = `http://127.0.0.1:${this.opts.mcpPort()}/mcp/v1`;
+    const mcpUrl = `http://127.0.0.1:${this.opts.mcpPort()}/internal/runtime/mcp`;
     if ("harnessSessionId" in runner) {
       (runner as LocalHostRunner).harnessSessionId = harnessId;
     }
@@ -790,10 +756,9 @@ export class TurnEngine {
       [turn.id],
     );
     for (const m of msgs) {
-      if (m.origin === "prompt" || m.origin === "calendar") continue;
+      if (m.origin === "prompt" || m.origin === "calendar" || m.origin === "send_message" || m.origin === "pending_approval") continue;
       this.opts.onPush(bot.account_id, { type: "message.created", message: m });
     }
-    if (isGateway) this.maybeKickGatewayDrain(bot.id, turn.id);
   }
 
   /** Test/explicit compact between turns. Remints MCP; refuses slot.inTurn. */
@@ -868,7 +833,7 @@ export class TurnEngine {
     const result = await runner.compactSession(botId, {
       botId: bot.id,
       env: apiKey ? { XAI_API_KEY: apiKey } : {},
-      mcpUrl: `http://127.0.0.1:${this.opts.mcpPort()}/mcp/v1`,
+      mcpUrl: `http://127.0.0.1:${this.opts.mcpPort()}/internal/runtime/mcp`,
       mcpToken: token,
       cwd,
       botName: bot.name,

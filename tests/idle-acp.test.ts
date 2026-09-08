@@ -6,6 +6,7 @@ import {
   gatewayAcpIdleTtlMs,
 } from "@openbot/runner";
 import { id, now } from "@openbot/db";
+import { insertMessage } from "@openbot/live-work";
 import { CAL_MIN_INTERVAL_MS } from "@openbot/calendar";
 import { fakeAgentCommand, tempHome } from "./helpers.ts";
 import { loginCookie, startTestServer } from "../apps/server/src/test-helpers.ts";
@@ -169,33 +170,50 @@ describe("idle ACP TTL", () => {
     try {
       const { cookie, session } = loginCookie({ ctx }, "alice");
       const headers = { cookie, "content-type": "application/json" };
-      await fetch(`${origin}/v1/org`, {
-        method: "PATCH",
-        headers,
-        body: JSON.stringify({ federationEnabled: true }),
-      });
       const ada = (await fetch(`${origin}/v1/bots`, {
         method: "POST",
         headers,
         body: JSON.stringify({ name: "Ada" }),
       }).then((r) => r.json())) as { bot: { id: string }; threadId: string };
       const listed = (await fetch(`${origin}/v1/bots`, { headers }).then((r) => r.json())) as {
-        gateway: { id: string };
+        a2aGateway: { available: boolean } | null;
+        gateway?: unknown;
       };
-      const gwId = listed.gateway.id;
-      const gwThread = (await fetch(`${origin}/v1/threads?botId=${gwId}`, { headers }).then((r) =>
-        r.json(),
-      )) as { thread: { id: string } };
+      expect(listed).not.toHaveProperty("gateway");
+      expect(listed.a2aGateway?.available).toBe(true);
+      const gateway = ctx.db.get<{ id: string }>(
+        "SELECT id FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'gateway'",
+        [session.accountId],
+      );
+      expect(gateway).toBeTruthy();
+      const gwId = gateway!.id;
+      const gwThread = ctx.db.get<{ id: string }>(
+        "SELECT id FROM threads WHERE account_id = ? AND bot_id = ? AND IFNULL(kind, 'human') = 'human'",
+        [session.accountId, gwId],
+      );
+      expect(gwThread).toBeTruthy();
       await fetch(`${origin}/v1/threads/${ada.threadId}/messages`, {
         method: "POST",
         headers,
         body: JSON.stringify({ body: "[[send:desk]]" }),
       });
-      await fetch(`${origin}/v1/threads/${gwThread.thread.id}/messages`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ body: "[[send:gw]]" }),
+      const gatewayTurnId = id();
+      const gatewayCreatedAt = now();
+      ctx.db.immediate(() => {
+        ctx.db.run(
+          `INSERT INTO turns (id, thread_id, bot_id, status, sent_message_count, assistant_text, deadline_at, created_at)
+           VALUES (?, ?, ?, 'queued', 0, '', ?, ?)`,
+          [gatewayTurnId, gwThread!.id, gwId, gatewayCreatedAt + 2 * 60 * 60 * 1000, gatewayCreatedAt],
+        );
+        insertMessage(ctx.db, {
+          threadId: gwThread!.id,
+          turnId: gatewayTurnId,
+          role: "user",
+          origin: "user",
+          body: "[[send:gw]]",
+        });
       });
+      ctx.engine.kick();
       const start = Date.now();
       while (Date.now() - start < 10_000) {
         const deskDone = ctx.db.get<{ n: number }>(
