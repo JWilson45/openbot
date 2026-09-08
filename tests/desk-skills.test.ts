@@ -15,25 +15,24 @@ import {
 import { loginCookie, startTestServer } from "../apps/server/src/test-helpers.ts";
 import { fakeAgentCommand, tempHome } from "./helpers.ts";
 
-const ADA_BOB_GATEWAY = {
+const ADA_BOB = {
   desks: [
     { name: "Ada", description: "research" },
     { name: "Bob", description: "writer" },
   ],
-  gateway: { name: "Gateway", description: "Diplomat for this org. Not a desk coder." },
 };
 
 function harnessReq(partial: Partial<EnsureHarnessRequest> = {}): EnsureHarnessRequest {
   return {
     botId: "bot",
     env: {},
-    mcpUrl: "http://127.0.0.1/mcp/v1",
+    mcpUrl: "http://127.0.0.1/internal/runtime/mcp",
     mcpToken: "tok",
     cwd: "/",
     botName: "Ada",
     botDescription: "research",
     permissionMode: "auto",
-    roster: ADA_BOB_GATEWAY,
+    roster: ADA_BOB,
     skillNames: ["confirm-series", "shared-chromium"],
     ...partial,
   };
@@ -156,6 +155,9 @@ describe("overlay catalog", () => {
     expect(gatewayIdentityRules("alpha", "org-id")).not.toContain("confirm-series");
     expect(deskIdentityRules("Ada", "research", { skillNames: ["zebra"] })).toContain("zebra");
     expect(deskIdentityRules("Ada", "research", { skillNames: ["zebra"] })).not.toContain("confirm-series, shared-chromium");
+    expect(deskIdentityRules("Ada", "research")).toMatch(/assistant text; it is the canonical public response/i);
+    expect(gatewayIdentityRules("alpha", "org-id")).toMatch(/canonical A2A response/i);
+    expect(deskIdentityRules("Ada", "research")).not.toMatch(/assistant text is a private work log/i);
   });
 
   test("tools/list is unchanged and has no ListSkills", () => {
@@ -163,6 +165,7 @@ describe("overlay catalog", () => {
     const gwNames = mcpToolsForRole("gateway").map((t) => (t as { name: string }).name);
     expect(deskNames).not.toContain("ListSkills");
     expect(gwNames).not.toContain("ListSkills");
+    expect(gwNames).toEqual(["SendToAgent", "ListBots", "Memory", "SearchMessages", "SearchThreads"]);
     expect(deskNames).toEqual([
       "SendMessage",
       "SendToAgent",

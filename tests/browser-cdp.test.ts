@@ -90,6 +90,17 @@ describe("CDP + takeover", () => {
       const html = await runner.snapshot();
       expect(html.html ?? "").toContain("clicked");
       log.push("navigate_ok");
+
+      const stale = runner.browser!;
+      const stalePort = stale.cdpPort;
+      stale.proc?.kill();
+      if (stale.proc) {
+        await Promise.race([stale.proc.exited, Bun.sleep(2_000)]);
+      }
+      const recovered = await runner.ensureBrowser();
+      expect(recovered.cdpPort).not.toBe(stalePort);
+      expect((await runner.navigate(`${origin}/`)).ok).toBe(true);
+      log.push("browser_recovered");
     }
 
     const bad = await fetch(`${origin}/v1/compute/takeover`, { method: "POST", headers, body: "{}" });
@@ -137,16 +148,20 @@ describe("CDP + takeover", () => {
     const { SPA_JS, spaSource } = await import("../apps/server/src/spa.ts");
     const source = spaSource();
     expect(SPA_JS).toContain("/v1/turns/");
-    expect(SPA_JS).toContain("live-work");
-    expect(SPA_JS).toContain("catchUpLive");
+    expect(SPA_JS).not.toContain("live-work");
+    expect(SPA_JS).not.toContain("catchUpLive");
+    expect(SPA_JS).toContain("replayAgUiRun");
+    expect(SPA_JS).toContain("/ag-ui/v1/runs/");
     expect(SPA_JS).toContain("mousedown");
     expect(SPA_JS).toContain("keydown");
-    expect(SPA_JS).toContain("permission_request");
+    expect(SPA_JS).not.toContain("permission_request");
+    expect(SPA_JS).toContain("showAgUiInterrupt");
+    expect(SPA_JS).toContain("responseSchema");
     expect(SPA_JS).toContain("el.querySelector(sel)");
     expect(SPA_JS).toContain("SendToAgent");
     expect(SPA_JS).toContain("New bot");
     expect(SPA_JS).toContain("/v1/messages/");
-    expect(source).toContain("catchUpLive");
+    expect(source).toContain("replayAgUiRun");
 
     server.stop(true);
     runner.stopBrowser();

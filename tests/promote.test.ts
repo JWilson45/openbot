@@ -281,7 +281,7 @@ describe("thread digest", () => {
     expect(wrapPromptWithDigest(null, " hello ")).toBe("hello");
   });
 
-  test("uses from_bot_id for peer thread/send_message; includes federation; skips prompt", () => {
+  test("uses from_bot_id for peer thread/send_message and skips prompt clones", () => {
     const db = openDb();
     const w = seedWorld(db);
     const bobId = insertBot(db, w, "Bob");
@@ -304,13 +304,8 @@ describe("thread digest", () => {
     );
     db.run(
       `INSERT INTO messages (id, thread_id, turn_id, role, origin, body, urgency, from_bot_id, created_at)
-       VALUES (?, ?, ?, 'user', 'federation', 'mail from peer org', 'normal', NULL, ?)`,
-      ["m-fed", groupId, old, 4],
-    );
-    db.run(
-      `INSERT INTO messages (id, thread_id, turn_id, role, origin, body, urgency, from_bot_id, created_at)
        VALUES (?, ?, ?, 'user', 'prompt', 'secret prompt clone', 'normal', NULL, ?)`,
-      ["m-prompt", groupId, old, 5],
+      ["m-prompt", groupId, old, 4],
     );
     const current = insertTurn(db, w, "queued", { threadId: groupId });
     const digest = buildThreadDigest(db, {
@@ -322,7 +317,6 @@ describe("thread digest", () => {
     expect(digest).toContain("You: ada spoke");
     expect(digest).toContain("Bob: bob spoke");
     expect(digest).toContain("Bob: bob dm in group");
-    expect(digest).toContain("Org: mail from peer org");
     expect(digest).not.toContain("secret prompt clone");
   });
 
@@ -534,7 +528,7 @@ describe("thread digest", () => {
 });
 
 describe("SendToThread + group promote", () => {
-  test("tools/list includes SendToThread and server is 0.7.0", async () => {
+  test("tools/list includes SendToThread and server is 0.8.0", async () => {
     const db = openDb();
     seedWorld(db);
     const inflight = new McpInflight();
@@ -545,7 +539,7 @@ describe("SendToThread + group promote", () => {
     });
     expect(
       (init.json as { result: { serverInfo: { version: string } } }).result.serverInfo.version,
-    ).toBe("0.7.0");
+    ).toBe("0.8.0");
     const list = await handleMcpJsonRpc(db, inflight, undefined, {
       jsonrpc: "2.0",
       id: 2,

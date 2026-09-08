@@ -1,0 +1,14 @@
+{
+  "name": "@openbot/protocol-ag-ui",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@ag-ui/core": "0.0.59",
+    "@ag-ui/encoder": "0.0.59",
+    "@openbot/application": "workspace:*",
+    "@openbot/core": "workspace:*"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

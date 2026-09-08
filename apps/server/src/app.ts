@@ -60,7 +60,6 @@ import {
 import { insertMessage, notifyA2aSender, parseLivePayload, promote, summarizeLiveEvent } from "@openbot/live-work";
 import { sha256Hex } from "@openbot/db";
 import { detectCliLogins, listGrokModels, resolveBotInference } from "@openbot/acp-grok";
-import { FED_MAX_REQUEST_BYTES } from "@openbot/federation";
 import {
   CAL_MAX_SERIES,
   CAL_MIN_INTERVAL_MS,
@@ -76,31 +75,13 @@ import { TurnEngine } from "./engine.ts";
 import { reconcileCalendarInstance } from "./calendar-tick.ts";
 import { mountOpenAiCompat } from "./openai.ts";
 import {
-  clientRateKey,
   currentOrgMeta,
-  deleteOrgPeer,
-  disableOrgPeer,
   ensureOrgAccount,
-  ensureOrgKeypair,
   ensureOrgMeta,
-  federationEffective,
-  fedInfoPayload,
-  FED_INFO_RATE_LIMIT,
-  FED_INFO_RATE_WINDOW_MS,
-  fetchPeerFedInfo,
-  insertOrgPeer,
-  listOrgPeers,
-  loadOrgKeypair,
-  OrgPeerError,
   orgMemberSnapshot,
-  orgPeerPublic,
-  parsePeerBaseUrl,
-  setFederationEnabled,
   setOrgTimezone,
-  SlidingWindowRateLimiter,
 } from "./org.ts";
-import { findActiveGateway, provisionOrgGateway } from "./gateway.ts";
-import { handleFedInbound, parseContentLength, readCappedBody } from "./inbox.ts";
+import { provisionOrgGateway } from "./gateway.ts";
 import {
   RunnerUnavailable,
   RPC_PROTOCOL,
@@ -113,6 +94,11 @@ import {
 } from "@openbot/compute-protocol";
 import { JsonRpcPeer, RpcError } from "@openbot/runner";
 import { RemoteRunnerClient, type TakeoverBridge } from "./remote-runner.ts";
+import { createProtocolStack, enqueueHumanNotification, type ProtocolStack } from "./protocol-stack.ts";
+import { GrokRuntimeProvider } from "@openbot/runtime-grok";
+import type { AgentTaskPort, ProtocolPrincipal } from "@openbot/application";
+import { accountIdSchema, agentIdSchema, type AgentId, type Message, type Task } from "@openbot/core";
+import { OpenbotGrokRuntimeHost } from "./runtime.ts";
 import {
   consumeEnrollToken,
   enrollAccount,
@@ -137,6 +123,7 @@ export type HomeConfig = {
   logger?: RedactingLogger;
   devLogin?: boolean;
   env?: Record<string, string | undefined>;
+  requestLogging?: boolean;
 };
 
 export type AppContext = {
@@ -154,6 +141,7 @@ export type AppContext = {
   push: Map<string, Set<ServerWebSocket>>;
   devLogin: boolean;
   maintenanceTimer?: ReturnType<typeof setInterval>;
+  protocols: ProtocolStack;
 };
 
 function cookies(c: { req: { header: (n: string) => string | undefined } }): string | undefined {
@@ -162,6 +150,55 @@ function cookies(c: { req: { header: (n: string) => string | undefined } }): str
 
 const VISIBLE_MESSAGES_SQL =
   "SELECT * FROM messages WHERE thread_id = ? AND origin NOT IN ('prompt', 'calendar') ORDER BY created_at";
+
+const LEARN_CANONICAL_TASK_LIMIT = 100;
+const LEARN_CANONICAL_MESSAGE_LIMIT = 20;
+
+function isAgUiConversationTask(task: Task): boolean {
+  return task.metadata["openbot.protocol"] === "ag-ui";
+}
+
+function learnMessageBody(message: Message): string {
+  const chunks: string[] = [];
+  for (const part of message.parts) {
+    if (part.kind === "text") chunks.push(part.text);
+    else if (part.kind === "data") chunks.push(JSON.stringify(part.data));
+    else chunks.push(`[Attachment: ${part.attachment.name ?? part.attachment.mediaType}]`);
+  }
+  return clipText(chunks.join("\n"), 32_000);
+}
+
+async function canonicalLearnMessages(
+  tasks: AgentTaskPort,
+  principal: ProtocolPrincipal,
+  agentId: AgentId,
+): Promise<Array<{ role: string; origin: string; body: string }>> {
+  const recent = await tasks.list({ principal, agentId, limit: LEARN_CANONICAL_TASK_LIMIT });
+  const anchor = recent.items.find(isAgUiConversationTask);
+  if (!anchor) return [];
+  const candidates = recent.items
+    .filter((task) => isAgUiConversationTask(task) && task.threadId === anchor.threadId)
+    .slice(0, LEARN_CANONICAL_MESSAGE_LIMIT);
+  const byId = new Map<string, Message>();
+  for (const task of candidates) {
+    const view = await tasks.get(principal, { taskId: task.id }, { historyLength: LEARN_CANONICAL_MESSAGE_LIMIT });
+    if (!view) continue;
+    for (const message of view.messages) {
+      // Calendar learning consumes only the public human/agent transcript. Tool, system,
+      // reasoning, activity, and provider-private data are not workflow instructions.
+      if (message.threadId !== anchor.threadId || (message.role !== "user" && message.role !== "agent")) continue;
+      byId.set(message.id, message);
+    }
+  }
+  return [...byId.values()]
+    .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id))
+    .slice(-LEARN_CANONICAL_MESSAGE_LIMIT)
+    .map((message) => ({
+      role: message.role === "agent" ? "assistant" : "user",
+      origin: message.role === "agent" ? "ag-ui" : "user",
+      body: learnMessageBody(message),
+    }));
+}
 
 function groupMeetsMinimum(botCount: number, principalCount: number): boolean {
   return botCount >= 2 || principalCount >= 3;
@@ -184,15 +221,14 @@ export function createApp(cfg: HomeConfig): {
     advertisedOrigin,
   });
   const log = cfg.logger ?? new RedactingLogger();
+  const requestLogging = cfg.requestLogging ?? (cfg.env ?? process.env).OPENBOT_HTTP_LOG === "1";
+  const requestDiagnostics = cfg.requestLogging !== false;
   ensureOrgAccount(db, log);
   provisionOrgGateway(db, cfg.home);
   const master = loadOrCreateMasterKey(cfg.home, process.env.OPENBOT_MASTER_KEY);
-  ensureOrgKeypair(cfg.home, master, db);
   const allowlist = loadAllowlist(cfg.home, process.env.OPENBOT_GITHUB_ALLOWLIST);
   const inflight = new McpInflight();
   const push = new Map<string, Set<ServerWebSocket>>();
-  const fedInfoLimiter = new SlidingWindowRateLimiter(FED_INFO_RATE_LIMIT, FED_INFO_RATE_WINDOW_MS);
-  const fedUntrustedLimiter = new SlidingWindowRateLimiter(FED_INFO_RATE_LIMIT, FED_INFO_RATE_WINDOW_MS);
 
   const ctx: AppContext = {
     db,
@@ -208,6 +244,7 @@ export function createApp(cfg: HomeConfig): {
     publicOrigin: org.public_origin || advertisedOrigin,
     push,
     devLogin: cfg.devLogin ?? process.env.OPENBOT_DEV_LOGIN === "1",
+    protocols: null as unknown as ProtocolStack,
   };
 
   const onPush = (accountId: string, event: unknown) => {
@@ -250,10 +287,111 @@ export function createApp(cfg: HomeConfig): {
   const app = new Hono();
 
   app.use("/*", async (c, next) => {
-    await next();
-    const ct = c.res.headers.get("content-type") ?? "";
-    if (ct.includes("text/event-stream")) return;
-    c.header("Cache-Control", "no-store");
+    const requestId = httpRequestId(c.req.header("x-request-id"));
+    const method = c.req.method.toUpperCase();
+    const path = new URL(c.req.url).pathname;
+    const startedAt = Date.now();
+    const timeoutSeconds = openbotRequestIdleTimeoutSeconds(c.req.raw);
+    let active = true;
+    const aborted = (): void => {
+      if (active && requestDiagnostics) {
+        log.warn("http.request.aborted", {
+          requestId,
+          method,
+          path,
+          durationMs: Date.now() - startedAt,
+        });
+      }
+    };
+    c.req.raw.signal.addEventListener("abort", aborted, { once: true });
+    if (requestLogging) {
+      log.info("http.request.started", {
+        requestId,
+        method,
+        path,
+        ...(timeoutSeconds === undefined ? {} : { idleTimeoutSeconds: timeoutSeconds }),
+      });
+    }
+    const slow = setTimeout(() => {
+      if (active && requestDiagnostics) {
+        log.warn("http.request.slow", {
+          requestId,
+          method,
+          path,
+          durationMs: Date.now() - startedAt,
+        });
+      }
+    }, 5_000);
+    slow.unref();
+    try {
+      await next();
+      clearTimeout(slow);
+      c.header("X-Request-ID", requestId);
+      const contentType = c.res.headers.get("content-type") ?? "";
+      const streaming = contentType.includes("text/event-stream");
+      if (!streaming) c.header("Cache-Control", "no-store");
+      if (streaming && c.res.body && requestDiagnostics) {
+        log.info("http.stream.opened", {
+          requestId,
+          method,
+          path,
+          status: c.res.status,
+          durationMs: Date.now() - startedAt,
+          idleTimeoutSeconds: 0,
+        });
+        c.res = loggedStreamResponse(c.res, {
+          closed(reason) {
+            if (!active) return;
+            active = false;
+            c.req.raw.signal.removeEventListener("abort", aborted);
+            const detail = {
+              requestId,
+              method,
+              path,
+              durationMs: Date.now() - startedAt,
+              reason,
+            };
+            if (reason === "completed") log.info("http.stream.closed", detail);
+            else log.warn("http.stream.closed", detail);
+          },
+        });
+      } else {
+        active = false;
+        c.req.raw.signal.removeEventListener("abort", aborted);
+      }
+      if (!streaming && c.res.status >= 500 && requestDiagnostics) {
+        log.error("http.request.failed", {
+          requestId,
+          method,
+          path,
+          status: c.res.status,
+          durationMs: Date.now() - startedAt,
+        });
+      } else if (requestLogging && !streaming) {
+        log.info("http.request.completed", {
+          requestId,
+          method,
+          path,
+          status: c.res.status,
+          durationMs: Date.now() - startedAt,
+        });
+      }
+    } catch (error) {
+      active = false;
+      clearTimeout(slow);
+      c.req.raw.signal.removeEventListener("abort", aborted);
+      if (requestDiagnostics) {
+        log.error("http.request.failed", {
+          requestId,
+          method,
+          path,
+          durationMs: Date.now() - startedAt,
+          errorName: error instanceof Error ? error.name : "Error",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      throw error;
+    }
   });
 
   app.onError((err, c) => {
@@ -305,10 +443,15 @@ export function createApp(cfg: HomeConfig): {
         messageId?: string;
       };
       if (parsed.messageId) {
-        const msg = db.get("SELECT * FROM messages WHERE id = ?", [parsed.messageId]);
+        const msg = db.get<{ thread_id: string; origin: string } & Record<string, unknown>>(
+          "SELECT * FROM messages WHERE id = ?",
+          [parsed.messageId],
+        );
         if (msg) {
+          // Canonical proactive delivery emits its own body-free conversation invalidation.
+          if (msg.origin === "send_message" || msg.origin === "pending_approval") return;
           const thread = db.get<{ account_id: string }>("SELECT account_id FROM threads WHERE id = ?", [
-            (msg as { thread_id: string }).thread_id,
+            msg.thread_id,
           ]);
           if (thread) onPush(thread.account_id, { type: "message.created", message: msg });
         }
@@ -320,8 +463,26 @@ export function createApp(cfg: HomeConfig): {
     const browserOff = { ok: false as const, error: "browser_unavailable" };
     return {
       onKick: () => ctx.engine.kick(),
-      federationEffective: () => federationEffective(currentOrgMeta(db)),
-      orgPrivateKey: () => loadOrgKeypair(ctx.home, ctx.master).privateKey,
+      onSendMessage: (message) => {
+        enqueueHumanNotification(db, {
+          version: 1,
+          accountId: message.accountId,
+          agentId: message.botId,
+          legacyMessageId: message.legacyMessageId,
+          legacyThreadId: message.legacyThreadId,
+          body: message.body,
+          createdAt: message.createdAt,
+        });
+        // The callback runs inside the legacy acceptance transaction. A microtask
+        // begins projection only after that transaction has returned and committed.
+        queueMicrotask(() => { void ctx.protocols.processAgentNotifications(); });
+      },
+      onPendingMessage: (message) => {
+        queueMicrotask(() => onPush(message.accountId, {
+          type: "agent.conversation.updated",
+          agentId: message.botId,
+        }));
+      },
       onCreateBot: async ({ accountId, botId, name }) => {
         try {
           const runner = ctx.engine.runnerFor(accountId);
@@ -380,6 +541,29 @@ export function createApp(cfg: HomeConfig): {
     };
   }
 
+  ctx.protocols = createProtocolStack({
+    db,
+    home: cfg.home,
+    publicOrigin: ctx.publicOrigin,
+    signingKey: master,
+    inflight,
+    mcpHooks: mcpHooks(),
+    runtimeProviders: [new GrokRuntimeProvider(new OpenbotGrokRuntimeHost({
+      db,
+      engine: ctx.engine,
+      home: cfg.home,
+      master,
+      mcpPort: () => ctx.port,
+    }))],
+    onMcpResult: emitMcpSideEffects,
+    onAgentConversationUpdated: ({ accountId, agentId, messageId }) => onPush(accountId, {
+      type: "agent.conversation.updated",
+      agentId,
+      messageId,
+    }),
+    logError: (error) => log.error("protocol adapter error", { error: error.message }),
+  });
+
   async function forwardMcp(params: unknown): Promise<{ status: number; json: unknown }> {
     const p = (params ?? {}) as { bearer?: string; body?: unknown };
     try {
@@ -395,6 +579,17 @@ export function createApp(cfg: HomeConfig): {
   }
 
   mountOpenAiCompat(app, ctx, requireSession);
+
+  app.all("/mcp", (c) => ctx.protocols.fetchMcp(c.req.raw));
+  app.all("/a2a/v1", (c) => ctx.protocols.fetchA2a(c.req.raw));
+  app.all("/.well-known/agent-card.json", (c) => ctx.protocols.fetchA2a(c.req.raw));
+  app.post("/ag-ui/v1/run", (c) => ctx.protocols.agUi.run(c.req.raw));
+  app.get("/ag-ui/v1/runs/:runId/events", (c) => ctx.protocols.agUi.replay(c.req.raw));
+  app.delete("/ag-ui/v1/runs/:runId", (c) => ctx.protocols.agUi.cancel(c.req.raw));
+  app.get("/v1/agents/:agentId/conversation", (c) =>
+    ctx.protocols.fetchAgentConversation(c.req.raw, c.req.param("agentId")));
+  app.get("/v1/attachments/:attachmentId", (c) =>
+    ctx.protocols.fetchAttachment(c.req.raw, c.req.param("attachmentId")));
 
   app.get("/v1/healthz", (c) => c.json({ ok: true, process: "openbot-server" }));
   app.get("/v1/readyz", (c) => {
@@ -433,56 +628,6 @@ export function createApp(cfg: HomeConfig): {
   app.get("/v1/runner", (c) => {
     const s = requireSession(c);
     return c.json({ runner: publicRunnerSnapshot(getRunnerRow(db, s.accountId)) });
-  });
-
-  app.get("/fed/v1/info", (c) => {
-    const key = clientRateKey(bunRequestIp(c.env, c.req.raw), c.req.header("x-forwarded-for"));
-    if (!fedInfoLimiter.take(key)) return c.json({ error: "rate_limited" }, 429);
-    const row = currentOrgMeta(db);
-    if (!row) return c.json({ error: "no_org" }, 500);
-    const gw = row.account_id ? findActiveGateway(db, row.account_id) : undefined;
-    return c.json(fedInfoPayload(row, gw ? { name: gw.name } : null));
-  });
-
-  app.post("/fed/v1/messages", async (c) => {
-    if (c.req.header("cookie") && !parseBearer(c.req.header("authorization"))) {
-      return c.json({ error: "cookies_not_accepted" }, 401);
-    }
-    const cl = parseContentLength(c.req.header("content-length"));
-    if (cl == null || cl > FED_MAX_REQUEST_BYTES) {
-      return c.json({ error: "too_large" }, 413);
-    }
-    const raw = await readCappedBody(c.req.raw, FED_MAX_REQUEST_BYTES);
-    if (raw === "too_large") return c.json({ error: "too_large" }, 413);
-    const rawBody = Buffer.from(raw).toString("utf8");
-    let json: unknown;
-    try {
-      json = JSON.parse(rawBody);
-    } catch {
-      json = null;
-      const key = clientRateKey(bunRequestIp(c.env, c.req.raw), c.req.header("x-forwarded-for"));
-      if (!fedUntrustedLimiter.take(key)) return c.json({ error: "rate_limited" }, 429);
-      return c.json({ error: "invalid_json" }, 400);
-    }
-    const clientIp = bunRequestIp(c.env, c.req.raw);
-    const rateKey = clientRateKey(clientIp, c.req.header("x-forwarded-for"));
-    const result = handleFedInbound(db, {
-      rawBody,
-      json,
-      authorization: c.req.header("authorization"),
-      idempotencyKey: c.req.header("idempotency-key"),
-      clientIp,
-      takeUntrusted: () => fedUntrustedLimiter.take(rateKey),
-    });
-    for (const msg of result.push) {
-      if (msg.origin === "prompt") continue;
-      if (result.accountId) onPush(result.accountId, { type: "message.created", message: msg });
-    }
-    if (result.kick) ctx.engine.kick();
-    return c.json(
-      result.body,
-      result.status as 200 | 202 | 400 | 401 | 403 | 413 | 429 | 503,
-    );
   });
 
   app.get("/", (c) => c.html(SPA_HTML));
@@ -586,7 +731,6 @@ export function createApp(cfg: HomeConfig): {
         orgId: org?.org_id ?? "",
         orgSlug: org?.slug ?? "",
         orgName: org?.name ?? "",
-        pubkey: org?.pubkey ?? "",
         role: member?.role ?? "member",
       });
     } catch {
@@ -607,22 +751,17 @@ export function createApp(cfg: HomeConfig): {
 
   app.patch("/v1/org", async (c) => {
     requireSession(c);
-    const body = (await c.req.json()) as { federationEnabled?: unknown; timezone?: unknown };
+    const value = (await c.req.json()) as unknown;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      return c.json({ error: "bad_request" }, 400);
+    }
+    const body = value as Record<string, unknown>;
+    if (Object.keys(body).some((key) => key !== "timezone")) {
+      return c.json({ error: "unsupported_field" }, 400);
+    }
     if ("timezone" in body) {
       if (typeof body.timezone !== "string" || !isValidTimeZone(body.timezone.trim())) {
         return c.json({ error: "invalid_timezone" }, 400);
-      }
-    }
-    if ("federationEnabled" in body) {
-      if (typeof body.federationEnabled !== "boolean") {
-        return c.json({ error: "invalid_federation" }, 400);
-      }
-      setFederationEnabled(db, body.federationEnabled);
-      const after = currentOrgMeta(db);
-      if (!federationEffective(after)) ctx.engine.stopGatewayAcps();
-      else if (after?.account_id) {
-        const gw = findActiveGateway(db, after.account_id);
-        if (gw) ctx.engine.maybeKickGatewayDrain(gw.id);
       }
     }
     if ("timezone" in body && typeof body.timezone === "string") {
@@ -631,126 +770,6 @@ export function createApp(cfg: HomeConfig): {
     const row = currentOrgMeta(db);
     if (!row) return c.json({ error: "no_org" }, 500);
     return c.json(orgMemberSnapshot(row));
-  });
-
-  app.get("/v1/org/inbox", (c) => {
-    requireSession(c);
-    const rows = db.all<{
-      id: string;
-      message_id: string;
-      from_org_id: string;
-      from_slug: string;
-      to_org_id: string;
-      hop: number;
-      urgency: string;
-      body: string;
-      status: string;
-      acked_turn_id: string | null;
-      acked_at: number | null;
-      created_at: number;
-    }>("SELECT * FROM org_inbox ORDER BY created_at DESC, id DESC LIMIT 100");
-    return c.json({
-      inbox: rows.map((r) => ({
-        id: r.id,
-        messageId: r.message_id,
-        fromOrgId: r.from_org_id,
-        fromSlug: r.from_slug,
-        toOrgId: r.to_org_id,
-        hop: r.hop,
-        urgency: r.urgency,
-        body: r.body,
-        status: r.status,
-        ackedTurnId: r.acked_turn_id,
-        ackedAt: r.acked_at,
-        createdAt: r.created_at,
-      })),
-    });
-  });
-
-  const peerEnv = cfg.env ?? process.env;
-
-  function peerError(err: unknown) {
-    if (err instanceof OrgPeerError) {
-      const status = err.code.startsWith("duplicate") ? 409 : 400;
-      return { error: err.code, status: status as 400 | 409 };
-    }
-    return null;
-  }
-
-  async function readObjectJson(c: { req: { json: () => Promise<unknown> } }) {
-    try {
-      const parsed = await c.req.json();
-      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
-      return parsed as Record<string, unknown>;
-    } catch {
-      return null;
-    }
-  }
-
-  app.get("/v1/org/peers", (c) => {
-    requireSession(c);
-    return c.json({ peers: listOrgPeers(db).map(orgPeerPublic) });
-  });
-
-  app.post("/v1/org/peers/from-info", async (c) => {
-    requireSession(c);
-    const body = await readObjectJson(c);
-    if (!body) return c.json({ error: "invalid_json" }, 400);
-    const baseUrl = typeof body.baseUrl === "string" ? body.baseUrl : "";
-    let origin: string;
-    try {
-      origin = parsePeerBaseUrl(baseUrl, peerEnv);
-    } catch (err) {
-      const mapped = peerError(err);
-      if (mapped) return c.json({ error: mapped.error }, mapped.status);
-      throw err;
-    }
-    try {
-      const info = await fetchPeerFedInfo(origin);
-      return c.json(info);
-    } catch (err) {
-      const mapped = peerError(err);
-      if (mapped) return c.json({ error: mapped.error }, mapped.status);
-      return c.json({ error: "info_failed" }, 400);
-    }
-  });
-
-  app.post("/v1/org/peers", async (c) => {
-    requireSession(c);
-    const body = await readObjectJson(c);
-    if (!body) return c.json({ error: "invalid_json" }, 400);
-    try {
-      const row = insertOrgPeer(
-        db,
-        {
-          slug: typeof body.slug === "string" ? body.slug : "",
-          orgId: typeof body.orgId === "string" ? body.orgId : "",
-          baseUrl: typeof body.baseUrl === "string" ? body.baseUrl : "",
-          pubkey: typeof body.pubkey === "string" ? body.pubkey : "",
-          name: typeof body.name === "string" ? body.name : "",
-        },
-        peerEnv,
-      );
-      return c.json(orgPeerPublic(row));
-    } catch (err) {
-      const mapped = peerError(err);
-      if (mapped) return c.json({ error: mapped.error }, mapped.status);
-      throw err;
-    }
-  });
-
-  app.delete("/v1/org/peers/:orgId", (c) => {
-    requireSession(c);
-    const ok = deleteOrgPeer(db, c.req.param("orgId"));
-    if (!ok) return c.json({ error: "not_found" }, 404);
-    return c.json({ ok: true });
-  });
-
-  app.post("/v1/org/peers/:orgId/disable", (c) => {
-    requireSession(c);
-    const row = disableOrgPeer(db, c.req.param("orgId"));
-    if (!row) return c.json({ error: "not_found" }, 404);
-    return c.json(orgPeerPublic(row));
   });
 
   app.post("/v1/bots", async (c) => {
@@ -762,6 +781,7 @@ export function createApp(cfg: HomeConfig): {
     const description = String(body.description ?? "");
     if (!name) return c.json({ error: "name required" }, 400);
     const normalized = name.trim();
+    if (/^gateway(?:-\d+)?$/i.test(normalized)) return c.json({ error: "reserved_name" }, 409);
     const active = db.get<{ n: number }>(
       "SELECT COUNT(*) AS n FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'desk'",
       [s.accountId],
@@ -782,9 +802,21 @@ export function createApp(cfg: HomeConfig): {
     const desk = join(cfg.home, "desk");
     db.immediate(() => {
       db.run(
-        `INSERT INTO bots (id, account_id, name, description, status, permission_mode, model, reasoning_effort, created_at)
-         VALUES (?, ?, ?, ?, 'active', 'auto', ?, ?, ?)`,
-        [botId, s.accountId, normalized, description, inference.model, inference.reasoningEffort, now()],
+        `INSERT INTO bots
+         (id, account_id, name, description, status, permission_mode, provider_id,
+          runtime_config_json, model, reasoning_effort, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'active', 'auto', 'grok', ?, ?, ?, ?, ?)`,
+        [
+          botId,
+          s.accountId,
+          normalized,
+          description,
+          JSON.stringify({ providerId: "grok", modelId: inference.model, options: { reasoningEffort: inference.reasoningEffort } }),
+          inference.model,
+          inference.reasoningEffort,
+          now(),
+          now(),
+        ],
       );
       const compute = db.get("SELECT id FROM compute_instances WHERE account_id = ?", [s.accountId]);
       if (!compute) {
@@ -831,14 +863,13 @@ export function createApp(cfg: HomeConfig): {
       "SELECT * FROM bots WHERE account_id = ? AND IFNULL(role, 'desk') = 'gateway' AND status = 'active'",
       [s.accountId],
     ) as { id: string } | undefined;
-    const org = currentOrgMeta(db);
     return c.json({
       bots: bots.map((b) => ({ ...(b as object), presence: botPresence(ctx, (b as { id: string }).id) })),
-      gateway: gatewayRow
+      a2aGateway: gatewayRow
         ? {
-            ...(gatewayRow as object),
-            presence: botPresence(ctx, gatewayRow.id),
-            enabled: federationEffective(org),
+            available: true,
+            endpoint: "/a2a/v1",
+            agentCard: "/.well-known/agent-card.json",
           }
         : null,
       archived,
@@ -850,11 +881,10 @@ export function createApp(cfg: HomeConfig): {
   app.post("/v1/bots/:id/archive", async (c) => {
     const s = requireSession(c);
     const bot = db.get<{ id: string; name: string; status: string; role: string | null }>(
-      "SELECT id, name, status, role FROM bots WHERE id = ? AND account_id = ?",
+      "SELECT id, name, status, role FROM bots WHERE id = ? AND account_id = ? AND IFNULL(role, 'desk') = 'desk'",
       [c.req.param("id"), s.accountId],
     );
     if (!bot) return c.json({ error: "not_found" }, 404);
-    if (isGatewayRole(bot.role)) return c.json({ error: "gateway_protected" }, 409);
     if (bot.status !== "active") return c.json({ error: "not_active" }, 409);
     const t = now();
     const completeRows = db.immediate(() => {
@@ -892,11 +922,10 @@ export function createApp(cfg: HomeConfig): {
     const s = requireSession(c);
     ctx.engine.purgeExpiredArchives(s.accountId);
     const bot = db.get<{ id: string; name: string; status: string; role: string | null }>(
-      "SELECT id, name, status, role FROM bots WHERE id = ? AND account_id = ?",
+      "SELECT id, name, status, role FROM bots WHERE id = ? AND account_id = ? AND IFNULL(role, 'desk') = 'desk'",
       [c.req.param("id"), s.accountId],
     );
     if (!bot) return c.json({ error: "not_found" }, 404);
-    if (isGatewayRole(bot.role)) return c.json({ error: "gateway_protected" }, 409);
     if (bot.status !== "archived") return c.json({ error: "not_archived" }, 409);
     const active = db.get<{ n: number }>(
       "SELECT COUNT(*) AS n FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'desk'",
@@ -1227,42 +1256,76 @@ export function createApp(cfg: HomeConfig): {
     }
     const parsed = learnRoutineInput.safeParse(raw);
     if (!parsed.success) return c.json({ error: "bad_request" }, 400);
-    const thread = db.get<{ id: string; bot_id: string; kind: string; title: string }>(
-      "SELECT id, bot_id, kind, title FROM threads WHERE id = ? AND account_id = ?",
-      [parsed.data.threadId, s.accountId],
-    );
-    if (!thread) return c.json({ error: "not_found" }, 404);
-    if (!isCalendarFiringThreadKind(thread.kind)) return c.json({ error: "invalid_thread" }, 400);
-    const assigneeId = parsed.data.botId ?? thread.bot_id;
-    const bot = resolveCalendarAssignee(db, s.accountId, assigneeId);
-    if ("error" in bot) return c.json({ error: bot.error }, bot.status);
+    let thread: { id: string; bot_id: string; kind: "human" | "group"; title: string };
+    let bot: CalendarAssignee;
+    let messages: Array<{ role: string; origin: string; body: string }>;
+    let lastTurn: { id: string } | undefined;
+    let liveWork: string[];
+    let sourceThreadId: string | null;
+
+    if ("agentId" in parsed.data && parsed.data.agentId !== undefined) {
+      const agentId = agentIdSchema.parse(parsed.data.agentId);
+      const assignee = resolveCalendarAssignee(db, s.accountId, agentId);
+      if ("error" in assignee) return c.json({ error: assignee.error }, assignee.status);
+      const firingThread = humanThread(db, assignee.id);
+      if (!firingThread || firingThread.account_id !== s.accountId) return c.json({ error: "not_found" }, 404);
+      bot = assignee;
+      thread = {
+        id: firingThread.id,
+        bot_id: firingThread.bot_id,
+        kind: "human",
+        title: `Routine from ${assignee.name}`,
+      };
+      const principal: ProtocolPrincipal = {
+        accountId: accountIdSchema.parse(s.accountId),
+        subjectId: `user:${s.userId}`,
+        kind: "user",
+        scopes: ["tasks:read"],
+      };
+      messages = await canonicalLearnMessages(ctx.protocols.tasks, principal, agentId);
+      lastTurn = undefined;
+      liveWork = [];
+      sourceThreadId = null;
+    } else {
+      const sourceThread = db.get<{ id: string; bot_id: string; kind: string; title: string }>(
+        "SELECT id, bot_id, kind, title FROM threads WHERE id = ? AND account_id = ?",
+        [parsed.data.threadId, s.accountId],
+      );
+      if (!sourceThread) return c.json({ error: "not_found" }, 404);
+      if (sourceThread.kind !== "group") return c.json({ error: "invalid_thread" }, 400);
+      const assignee = resolveCalendarAssignee(db, s.accountId, parsed.data.botId ?? sourceThread.bot_id);
+      if ("error" in assignee) return c.json({ error: assignee.error }, assignee.status);
+      bot = assignee;
+      thread = { ...sourceThread, kind: "group" };
+      messages = db
+        .all<{ role: string; origin: string; body: string }>(
+          `SELECT role, origin, body FROM messages
+           WHERE thread_id = ? AND origin NOT IN ('prompt', 'calendar')
+           ORDER BY created_at DESC LIMIT 20`,
+          [thread.id],
+        )
+        .reverse();
+      lastTurn = db.get<{ id: string }>(
+        "SELECT id FROM turns WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1",
+        [thread.id],
+      );
+      liveWork = [];
+      if (lastTurn) {
+        const events = db.all<{ kind: string; payload: string }>(
+          "SELECT kind, payload FROM live_work_events WHERE turn_id = ? ORDER BY seq ASC LIMIT 40",
+          [lastTurn.id],
+        );
+        for (const ev of events) {
+          const text = summarizeLiveEvent(ev.kind, parseLivePayload(ev.payload));
+          if (text) liveWork.push(text);
+        }
+      }
+      sourceThreadId = thread.id;
+    }
     if (nonCancelledSeriesCount(db, s.accountId) >= CAL_MAX_SERIES) return c.json({ error: "cap" }, 409);
     const timezone = currentOrgMeta(db)?.timezone ?? "UTC";
     const t = now();
     const dtstartUtc = localNineTomorrow(timezone, t);
-    const messages = db
-      .all<{ role: string; origin: string; body: string }>(
-        `SELECT role, origin, body FROM messages
-         WHERE thread_id = ? AND origin NOT IN ('prompt', 'calendar')
-         ORDER BY created_at DESC LIMIT 20`,
-        [thread.id],
-      )
-      .reverse();
-    const lastTurn = db.get<{ id: string }>(
-      "SELECT id FROM turns WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1",
-      [thread.id],
-    );
-    const liveWork: string[] = [];
-    if (lastTurn) {
-      const events = db.all<{ kind: string; payload: string }>(
-        "SELECT kind, payload FROM live_work_events WHERE turn_id = ? ORDER BY seq ASC LIMIT 40",
-        [lastTurn.id],
-      );
-      for (const ev of events) {
-        const text = summarizeLiveEvent(ev.kind, parseLivePayload(ev.payload));
-        if (text) liveWork.push(text);
-      }
-    }
     let pageUrl = "";
     try {
       const display = await ctx.engine.runnerFor(s.accountId).display();
@@ -1292,7 +1355,7 @@ export function createApp(cfg: HomeConfig): {
         timezone,
         requireHuman ? 1 : 0,
         lastTurn?.id ?? null,
-        thread.id,
+        sourceThreadId,
         captureSummary,
         CAL_MIN_INTERVAL_MS,
         t,
@@ -1314,11 +1377,10 @@ export function createApp(cfg: HomeConfig): {
       return { status: 400 as const, json: { error: "confirm", message: "Type DELETE to permanently delete" } };
     }
     const bot = db.get<{ id: string; status: string; role: string | null }>(
-      "SELECT id, status, role FROM bots WHERE id = ? AND account_id = ?",
+      "SELECT id, status, role FROM bots WHERE id = ? AND account_id = ? AND IFNULL(role, 'desk') = 'desk'",
       [c.req.param("id"), accountId],
     );
     if (!bot) return { status: 404 as const, json: { error: "not_found" } };
-    if (isGatewayRole(bot.role)) return { status: 409 as const, json: { error: "gateway_protected" } };
     if (bot.status !== "archived") return { status: 409 as const, json: { error: "archive_first" } };
     await ctx.engine.runnerFor(accountId).kill(bot.id);
     deleteBotPermanently(db, bot.id);
@@ -1344,7 +1406,10 @@ export function createApp(cfg: HomeConfig): {
 
   app.get("/v1/bots/:id", (c) => {
     const s = requireSession(c);
-    const bot = db.get("SELECT * FROM bots WHERE id = ? AND account_id = ?", [c.req.param("id"), s.accountId]);
+    const bot = db.get(
+      "SELECT * FROM bots WHERE id = ? AND account_id = ? AND IFNULL(role, 'desk') = 'desk'",
+      [c.req.param("id"), s.accountId],
+    );
     if (!bot) return c.json({ error: "not_found" }, 404);
     return c.json({ bot, compute: healthPayload(ctx, s.accountId) });
   });
@@ -1353,13 +1418,13 @@ export function createApp(cfg: HomeConfig): {
     const s = requireSession(c);
     const body = await c.req.json();
     const bot = db.get<{ id: string; role: string | null }>(
-      "SELECT id, role FROM bots WHERE id = ? AND account_id = ?",
+      "SELECT id, role FROM bots WHERE id = ? AND account_id = ? AND IFNULL(role, 'desk') = 'desk'",
       [c.req.param("id"), s.accountId],
     );
     if (!bot) return c.json({ error: "not_found" }, 404);
     if (isGatewayRole(bot.role) && body.name) return c.json({ error: "gateway_protected" }, 409);
-    if (body.name) db.run("UPDATE bots SET name = ? WHERE id = ?", [String(body.name), bot.id]);
-    if (body.description != null) db.run("UPDATE bots SET description = ? WHERE id = ?", [String(body.description), bot.id]);
+    if (body.name) db.run("UPDATE bots SET name = ?, updated_at = ? WHERE id = ?", [String(body.name), now(), bot.id]);
+    if (body.description != null) db.run("UPDATE bots SET description = ?, updated_at = ? WHERE id = ?", [String(body.description), now(), bot.id]);
     return c.json({ ok: true });
   });
 
@@ -1371,7 +1436,7 @@ export function createApp(cfg: HomeConfig): {
       model: string | null;
       reasoning_effort: string | null;
       role: string | null;
-    }>("SELECT id, model, reasoning_effort, role FROM bots WHERE id = ? AND account_id = ?", [
+    }>("SELECT id, model, reasoning_effort, role FROM bots WHERE id = ? AND account_id = ? AND IFNULL(role, 'desk') = 'desk'", [
       c.req.param("id"),
       s.accountId,
     ]);
@@ -1398,9 +1463,11 @@ export function createApp(cfg: HomeConfig): {
         (body.reasoningEffort ?? body.reasoning_effort ?? bot.reasoning_effort) as string | undefined,
       );
       const changed = inference.model !== model || inference.reasoningEffort !== reasoningEffort;
-      db.run("UPDATE bots SET model = ?, reasoning_effort = ? WHERE id = ?", [
+      db.run("UPDATE bots SET model = ?, reasoning_effort = ?, provider_id = 'grok', runtime_config_json = ?, updated_at = ? WHERE id = ?", [
         inference.model,
         inference.reasoningEffort,
+        JSON.stringify({ providerId: "grok", modelId: inference.model, options: { reasoningEffort: inference.reasoningEffort } }),
+        now(),
         bot.id,
       ]);
       model = inference.model;
@@ -1505,7 +1572,7 @@ export function createApp(cfg: HomeConfig): {
   app.get("/v1/bots/:id/memory", (c) => {
     const s = requireSession(c);
     const bot = db.get<{ id: string; name: string }>(
-      "SELECT id, name FROM bots WHERE id = ? AND account_id = ?",
+      "SELECT id, name FROM bots WHERE id = ? AND account_id = ? AND IFNULL(role, 'desk') = 'desk'",
       [c.req.param("id"), s.accountId],
     );
     if (!bot) return c.json({ error: "not_found" }, 404);
@@ -1524,7 +1591,7 @@ export function createApp(cfg: HomeConfig): {
   app.patch("/v1/bots/:id/memory", async (c) => {
     const s = requireSession(c);
     const bot = db.get<{ id: string; role: string | null }>(
-      "SELECT id, role FROM bots WHERE id = ? AND account_id = ?",
+      "SELECT id, role FROM bots WHERE id = ? AND account_id = ? AND IFNULL(role, 'desk') = 'desk'",
       [c.req.param("id"), s.accountId],
     );
     if (!bot) return c.json({ error: "not_found" }, 404);
@@ -1603,7 +1670,7 @@ export function createApp(cfg: HomeConfig): {
       if (seen.has(botId)) continue;
       seen.add(botId);
       const bot = db.get<{ id: string; name: string; status: string }>(
-        "SELECT id, name, status FROM bots WHERE id = ? AND account_id = ?",
+        "SELECT id, name, status FROM bots WHERE id = ? AND account_id = ? AND IFNULL(role, 'desk') = 'desk'",
         [botId, s.accountId],
       );
       if (!bot || bot.status !== "active") continue;
@@ -1652,7 +1719,13 @@ export function createApp(cfg: HomeConfig): {
     if (kind === "a2a") {
       const threads = db.all(
         `SELECT * FROM threads WHERE account_id = ? AND kind = 'a2a'
-         AND (bot_id = ? OR peer_bot_id = ?) ORDER BY created_at DESC`,
+         AND (bot_id = ? OR peer_bot_id = ?)
+         AND NOT EXISTS (
+           SELECT 1 FROM bots internal
+           WHERE IFNULL(internal.role, 'desk') = 'gateway'
+             AND (internal.id = threads.bot_id OR internal.id = threads.peer_bot_id)
+         )
+         ORDER BY created_at DESC`,
         [s.accountId, botId ?? "", botId ?? ""],
       );
       return c.json({ threads });
@@ -1666,7 +1739,10 @@ export function createApp(cfg: HomeConfig): {
     }
     const thread = botId
       ? db.get(
-          "SELECT * FROM threads WHERE account_id = ? AND bot_id = ? AND IFNULL(kind,'human') = 'human'",
+          `SELECT t.* FROM threads t
+           JOIN bots b ON b.id = t.bot_id
+           WHERE t.account_id = ? AND t.bot_id = ? AND IFNULL(t.kind,'human') = 'human'
+             AND IFNULL(b.role, 'desk') = 'desk'`,
           [s.accountId, botId],
         )
       : db.get(
@@ -1694,6 +1770,20 @@ export function createApp(cfg: HomeConfig): {
       s.accountId,
     ]);
     if (!thread) return c.json({ error: "not_found" }, 404);
+    if (
+      ["human", "a2a"].includes((thread as { kind?: string }).kind ?? "human") &&
+      db.get(
+        "SELECT id FROM bots WHERE id = ? AND account_id = ? AND IFNULL(role, 'desk') = 'gateway'",
+        [(thread as { bot_id: string }).bot_id, s.accountId],
+      )
+    ) return c.json({ error: "not_found" }, 404);
+    if (
+      (thread as { kind?: string }).kind === "a2a" &&
+      db.get(
+        "SELECT id FROM bots WHERE id = ? AND account_id = ? AND IFNULL(role, 'desk') = 'gateway'",
+        [(thread as { peer_bot_id?: string }).peer_bot_id ?? "", s.accountId],
+      )
+    ) return c.json({ error: "not_found" }, 404);
     const messages = db.all(VISIBLE_MESSAGES_SQL, [c.req.param("id")]);
     const latestTurn = db.get<{ id: string }>(
       "SELECT id FROM turns WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1",
@@ -1767,7 +1857,7 @@ export function createApp(cfg: HomeConfig): {
       return c.json({ ok: true, participant: { id: participantId, kind: "human", userId, botId: null } });
     }
     const bot = db.get<{ id: string; status: string }>(
-      "SELECT id, status FROM bots WHERE id = ? AND account_id = ?",
+      "SELECT id, status FROM bots WHERE id = ? AND account_id = ? AND IFNULL(role, 'desk') = 'desk'",
       [botId!, s.accountId],
     );
     if (!bot || bot.status !== "active") return c.json({ error: "not_found" }, 404);
@@ -1822,6 +1912,13 @@ export function createApp(cfg: HomeConfig): {
       [c.req.param("id"), s.accountId],
     );
     if (!thread) return c.json({ error: "not_found" }, 404);
+    if (
+      thread.kind === "human" &&
+      db.get(
+        "SELECT id FROM bots WHERE id = ? AND account_id = ? AND IFNULL(role, 'desk') = 'gateway'",
+        [thread.bot_id, s.accountId],
+      )
+    ) return c.json({ error: "not_found" }, 404);
     switch (thread.kind) {
       case "a2a":
         return c.json({ error: "a2a_readonly" }, 403);
@@ -1928,10 +2025,6 @@ export function createApp(cfg: HomeConfig): {
     }
     if (cancelled) {
       reconcileCalendarInstance(db, turn.id);
-      const bot = db.get<{ role: string | null }>("SELECT role FROM bots WHERE id = ?", [turn.bot_id]);
-      if (isGatewayRole(bot?.role) && federationEffective(currentOrgMeta(db))) {
-        ctx.engine.maybeKickGatewayDrain(turn.bot_id);
-      }
     }
     return c.json({ ok: true });
   });
@@ -1952,10 +2045,9 @@ export function createApp(cfg: HomeConfig): {
 
   app.post("/v1/messages/:id/approve", (c) => {
     const s = requireSession(c);
-    const ok = approveMessage(db, s.accountId, c.req.param("id"));
+    const ok = approveMessage(db, s.accountId, c.req.param("id"), mcpHooks());
     if (!ok) return c.json({ error: "not_pending" }, 409);
     const msg = db.get("SELECT * FROM messages WHERE id = ?", [c.req.param("id")]);
-    onPush(s.accountId, { type: "message.created", message: msg });
     return c.json({ ok: true, message: msg });
   });
 
@@ -1963,8 +2055,14 @@ export function createApp(cfg: HomeConfig): {
     const s = requireSession(c);
     const ok = rejectMessage(db, s.accountId, c.req.param("id"));
     if (!ok) return c.json({ error: "not_pending" }, 409);
-    const msg = db.get("SELECT * FROM messages WHERE id = ?", [c.req.param("id")]);
-    onPush(s.accountId, { type: "message.created", message: msg });
+    const msg = db.get<{ from_bot_id: string | null } & Record<string, unknown>>(
+      "SELECT * FROM messages WHERE id = ?",
+      [c.req.param("id")],
+    );
+    if (msg?.from_bot_id) onPush(s.accountId, {
+      type: "agent.conversation.updated",
+      agentId: msg.from_bot_id,
+    });
     return c.json({ ok: true, message: msg });
   });
 
@@ -2100,7 +2198,12 @@ export function createApp(cfg: HomeConfig): {
     return c.json({ ok: true });
   });
 
-  app.all("/mcp/v1", async (c) => {
+  // Private legacy dialect used only by the current Grok provider adapter.
+  app.all("/internal/runtime/mcp", async (c) => {
+    const host = (c.req.header("host") ?? "").toLowerCase();
+    if (!/^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/.test(host)) {
+      return c.notFound();
+    }
     if (c.req.method === "GET") {
       const encoder = new TextEncoder();
       const stream = new ReadableStream({
@@ -2540,6 +2643,7 @@ export function createApp(cfg: HomeConfig): {
 }
 
 function stopApp(ctx: AppContext): void {
+  void ctx.protocols.close();
   if (ctx.maintenanceTimer == null) return;
   clearInterval(ctx.maintenanceTimer);
   ctx.maintenanceTimer = undefined;
@@ -2897,6 +3001,78 @@ function wsBinary(data: unknown): Uint8Array | null {
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
   if (typeof Buffer !== "undefined" && Buffer.isBuffer(data)) return data;
   return null;
+}
+
+function httpRequestId(candidate: string | undefined): string {
+  if (candidate && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(candidate)) return candidate;
+  return crypto.randomUUID();
+}
+
+export function openbotRequestIdleTimeoutSeconds(request: Request): number | undefined {
+  const { pathname } = new URL(request.url);
+  const method = request.method.toUpperCase();
+  if (method === "GET" && pathname === "/internal/runtime/mcp") return 0;
+  if (method === "POST" && (pathname === "/internal/runtime/mcp" || pathname === "/mcp")) return 30;
+  if (method === "POST" && pathname === "/ag-ui/v1/run") return 30;
+  if (method === "GET" && /^\/ag-ui\/v1\/runs\/[^/]+\/events$/.test(pathname)) return 30;
+  if (method === "POST" && pathname === "/a2a/v1") return 125;
+  if (method === "POST" && ["/v1/chat/completions", "/openai/v1/chat/completions"].includes(pathname)) return 125;
+  if (method === "POST" && pathname === "/v1/compute/takeover") return 30;
+  return undefined;
+}
+
+type BunRequestTimeoutServer = {
+  timeout(request: Request, seconds: number): void;
+};
+
+export function openbotFetch(app: Hono) {
+  return async (request: Request, server: BunRequestTimeoutServer): Promise<Response> => {
+    const seconds = openbotRequestIdleTimeoutSeconds(request);
+    if (seconds !== undefined) server.timeout(request, seconds);
+    const response = await app.fetch(request, server as never);
+    if (response.headers.get("content-type")?.includes("text/event-stream")) {
+      server.timeout(request, 0);
+    }
+    return response;
+  };
+}
+
+function loggedStreamResponse(
+  response: Response,
+  lifecycle: { closed(reason: "completed" | "cancelled" | "failed"): void },
+): Response {
+  const reader = response.body!.getReader();
+  let closed = false;
+  const finish = (reason: "completed" | "cancelled" | "failed"): void => {
+    if (closed) return;
+    closed = true;
+    lifecycle.closed(reason);
+  };
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const next = await reader.read();
+        if (next.done) {
+          finish("completed");
+          controller.close();
+          return;
+        }
+        controller.enqueue(next.value);
+      } catch (error) {
+        finish("failed");
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      finish("cancelled");
+      await reader.cancel(reason).catch(() => undefined);
+    },
+  });
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
 }
 
 export { websocketOf };

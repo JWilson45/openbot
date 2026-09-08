@@ -187,7 +187,7 @@ describe("calendar api", () => {
     const learned = await fetch(`${origin}/v1/calendar/learn`, {
       method: "POST",
       headers,
-      body: JSON.stringify({ threadId: ada.threadId }),
+      body: JSON.stringify({ agentId: ada.bot.id }),
     });
     expect(learned.status).toBe(201);
     const proposed = ((await learned.json()) as { series: Series }).series;

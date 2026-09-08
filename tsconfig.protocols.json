@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.base.json",
+  "include": [
+    "packages/core/**/*",
+    "packages/application/**/*",
+    "packages/protocol-mcp/**/*",
+    "packages/protocol-a2a/**/*",
+    "packages/protocol-ag-ui/**/*",
+    "tests/protocol-mcp.test.ts",
+    "tests/protocol-a2a.test.ts",
+    "tests/protocol-ag-ui.test.ts",
+    "tests/a2a-network.test.ts"
+  ]
+}

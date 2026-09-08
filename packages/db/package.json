@@ -3,6 +3,8 @@
   "version": "0.1.0",
   "type": "module",
   "dependencies": {
+    "@openbot/application": "workspace:*",
+    "@openbot/core": "workspace:*",
     "@openbot/calendar": "workspace:*"
   },
   "exports": {

@@ -79,7 +79,7 @@ function resolveBot(db: OpenbotDb, accountId: string, model: string): BotRow | u
   if (!requested) return undefined;
   const rest = requested.replace(/^openbot\//i, "");
   const active = db.all<BotRow>(
-    "SELECT id, account_id, name, created_at FROM bots WHERE account_id = ? AND status = 'active'",
+    "SELECT id, account_id, name, created_at FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'desk'",
     [accountId],
   );
   const lower = rest.toLowerCase();
@@ -212,9 +212,8 @@ async function handleModels(c: Context, ctx: OpenAiCtx) {
   applyCors(c);
   try {
     const s = requireOpenAiAuth(c, ctx.db);
-    // GET /v1/bots hides Gateway in a sidecar; models must still list every active bot.
     const bots = ctx.db.all<BotRow>(
-      "SELECT id, account_id, name, created_at FROM bots WHERE account_id = ? AND status = 'active' ORDER BY created_at",
+      "SELECT id, account_id, name, created_at FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'desk' ORDER BY created_at",
       [s.accountId],
     );
     const data = bots.flatMap((b) => {

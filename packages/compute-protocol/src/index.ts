@@ -43,7 +43,6 @@ export interface ComputeDriver {
 
 export type OverlayRoster = {
   desks: Array<{ name: string; description: string }>;
-  gateway?: { name: string; description: string } | null;
 };
 
 export type EnsureHarnessRequest = {

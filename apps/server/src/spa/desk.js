@@ -1,6 +1,6 @@
   const state = {
-    me:null, bots:[], gateway:null, groups:[], org:null, archived:[], archiveTtlMs: 30*24*60*60*1000, bot:null, thread:null, messages:[], live:[], compute:null, liveRaw: localStorage.getItem('openbot-live-raw') === '1', railCollapsed: localStorage.getItem('openbot-rail') === '1', sideCollapsed: localStorage.getItem('openbot-side') === '1',
-    turn:null, a2a:[], view:'human', auth:{}, harness:{}, ws:'down', sending:false, activity:[], calendar:{ series:[], instances:[], timezone:'UTC' }, calMode:'agenda', calMonth:null, models:[], sideW: Number(localStorage.getItem('openbot-side-w') || 320),
+    me:null, bots:[], a2aGateway:null, groups:[], org:null, archived:[], archiveTtlMs: 30*24*60*60*1000, bot:null, thread:null, messages:[], live:[], compute:null, railCollapsed: localStorage.getItem('openbot-rail') === '1', sideCollapsed: localStorage.getItem('openbot-side') === '1',
+    turn:null, a2a:[], view:'human', auth:{}, harness:{}, ws:'down', sending:false, activity:[], calendar:{ series:[], instances:[], timezone:'UTC' }, calMode:'agenda', calMonth:null, models:[], sideW: Number(localStorage.getItem('openbot-side-w') || 320), agUiContext:null, agUiRun:null, agUiAbort:null, agUiMessages:{}, agUiRetry:null,
     debug: false
   };
   try { state.debug = localStorage.getItem('openbot-debug') === '1'; } catch {}
@@ -19,12 +19,270 @@
     return json;
   }
 
-  function h(html) { const d = document.createElement('div'); d.innerHTML = html.trim(); return d.firstElementChild; }
-  function parsePayload(raw) {
-    if (raw && typeof raw === 'object') return raw;
-    if (typeof raw !== 'string' || !raw.trim()) return {};
-    try { return JSON.parse(raw); } catch { return { truncated: true }; }
+  function newAgUiRunState(threadId, runId) {
+    return {
+      threadId, runId, phase:'idle', blocks:[], messages:{}, openMessages:{}, tools:{},
+      reasoningSpan:null, reasoningMessage:null, activities:{}, interrupts:[],
+      outcome:null, error:null, lastSeq:0
+    };
   }
+
+  // A deliberately small, strict reducer for the pinned AG-UI BaseEvent subset the
+  // desk renders. Invalid boundaries fail closed instead of guessing at provider data.
+  function reduceAgUiEvent(current, event) {
+    const fail = message => { throw new Error('Invalid AG-UI stream: ' + message); };
+    const record = value => value && typeof value === 'object' && !Array.isArray(value);
+    const text = (value, field, max=1048576) => {
+      if (typeof value !== 'string' || !value || value.length > max) fail(field + ' is invalid');
+      return value;
+    };
+    if (!record(current) || !record(event)) fail('event must be an object');
+    if (event.type === 'RAW' || Object.prototype.hasOwnProperty.call(event, 'rawEvent')) fail('raw events are forbidden');
+    const type = text(event.type, 'type', 128);
+    const next = {
+      ...current,
+      blocks: (current.blocks || []).map(block => ({ ...block })),
+      messages: { ...(current.messages || {}) },
+      openMessages: { ...(current.openMessages || {}) },
+      tools: Object.fromEntries(Object.entries(current.tools || {}).map(([id, tool]) => [id, { ...tool }])),
+      activities: { ...(current.activities || {}) },
+      interrupts: [...(current.interrupts || [])],
+    };
+    const seq = event.metadata && event.metadata.openbot && event.metadata.openbot.seq;
+    if (seq !== undefined) {
+      if (!Number.isSafeInteger(seq) || seq < 0 || seq < (next.lastSeq || 0)) fail('event sequence moved backwards');
+      next.lastSeq = Math.max(next.lastSeq || 0, seq);
+    }
+    const add = block => {
+      if (next.blocks.length >= 512) fail('too many rendered blocks');
+      next.blocks.push(block);
+      return next.blocks.length - 1;
+    };
+    const active = () => {
+      if (next.phase !== 'active') fail(type + ' occurred outside an active run');
+    };
+    const sameRun = () => {
+      if (event.runId !== next.runId || event.threadId !== next.threadId) fail('run identity changed');
+    };
+
+    if (type === 'RUN_STARTED') {
+      if (next.phase !== 'idle') fail('run started twice');
+      sameRun();
+      next.phase = 'active';
+      return next;
+    }
+    if (type === 'RUN_ERROR') {
+      if (next.phase !== 'idle' && next.phase !== 'active') fail('RUN_ERROR occurred after a terminal event');
+    } else {
+      active();
+    }
+
+    if (type === 'TEXT_MESSAGE_START') {
+      const id = text(event.messageId, 'messageId', 512);
+      if (event.role !== 'assistant' || next.messages[id] !== undefined) fail('invalid message start');
+      const index = add({ type:'write', id, text:'', status:'streaming' });
+      next.messages[id] = index;
+      next.openMessages[id] = index;
+      return next;
+    }
+    if (type === 'TEXT_MESSAGE_CONTENT') {
+      const id = text(event.messageId, 'messageId', 512);
+      const index = next.openMessages[id];
+      if (index === undefined || typeof event.delta !== 'string') fail('message delta has no open message');
+      const value = (next.blocks[index].text || '') + event.delta;
+      if (value.length > 1048576) fail('message is too large');
+      next.blocks[index].text = value;
+      return next;
+    }
+    if (type === 'TEXT_MESSAGE_END') {
+      const id = text(event.messageId, 'messageId', 512);
+      const index = next.openMessages[id];
+      if (index === undefined) fail('message ended without a start');
+      next.blocks[index].status = 'completed';
+      delete next.openMessages[id];
+      return next;
+    }
+    if (type === 'TOOL_CALL_START') {
+      const id = text(event.toolCallId, 'toolCallId', 512);
+      if (next.tools[id]) fail('tool call started twice');
+      const title = text(event.toolCallName, 'toolCallName', 512);
+      next.tools[id] = { index:add({ type:'tool', id, title, status:'running', input:'', output:null }), open:true, result:false };
+      return next;
+    }
+    if (type === 'TOOL_CALL_ARGS') {
+      const id = text(event.toolCallId, 'toolCallId', 512);
+      const tool = next.tools[id];
+      if (!tool || !tool.open || typeof event.delta !== 'string') fail('tool arguments have no open call');
+      const value = (next.blocks[tool.index].input || '') + event.delta;
+      if (value.length > 1048576) fail('tool arguments are too large');
+      next.blocks[tool.index].input = value;
+      return next;
+    }
+    if (type === 'TOOL_CALL_END') {
+      const id = text(event.toolCallId, 'toolCallId', 512);
+      const tool = next.tools[id];
+      if (!tool || !tool.open) fail('tool ended without a start');
+      try {
+        const value = JSON.parse(next.blocks[tool.index].input || '{}');
+        if (!record(value)) fail('tool arguments are not a JSON object');
+      } catch (error) {
+        if (String(error && error.message || error).startsWith('Invalid AG-UI stream:')) throw error;
+        fail('tool arguments are not valid JSON');
+      }
+      tool.open = false;
+      next.blocks[tool.index].status = 'finished';
+      return next;
+    }
+    if (type === 'TOOL_CALL_RESULT') {
+      const id = text(event.toolCallId, 'toolCallId', 512);
+      text(event.messageId, 'tool result messageId', 512);
+      const tool = next.tools[id];
+      if (!tool || tool.open || tool.result || event.role !== 'tool' || typeof event.content !== 'string') fail('invalid tool result');
+      if (event.content.length > 1048576) fail('tool result is too large');
+      tool.result = true;
+      next.blocks[tool.index].output = event.content;
+      const outcome = event.metadata && event.metadata.outcome;
+      next.blocks[tool.index].status = typeof outcome === 'string' && /^[a-z_-]{1,32}$/i.test(outcome) ? outcome : 'completed';
+      return next;
+    }
+    if (type === 'REASONING_START') {
+      if (next.reasoningSpan) fail('reasoning started twice');
+      next.reasoningSpan = text(event.messageId, 'reasoning span id', 512);
+      return next;
+    }
+    if (type === 'REASONING_MESSAGE_START') {
+      if (!next.reasoningSpan || next.reasoningMessage || event.role !== 'reasoning') fail('invalid reasoning message start');
+      const id = text(event.messageId, 'reasoning message id', 512);
+      next.reasoningMessage = { id, index:add({ type:'thought', id, text:'', status:'streaming' }) };
+      return next;
+    }
+    if (type === 'REASONING_MESSAGE_CONTENT') {
+      if (!next.reasoningMessage || event.messageId !== next.reasoningMessage.id || typeof event.delta !== 'string') fail('reasoning delta has no open message');
+      const block = next.blocks[next.reasoningMessage.index];
+      const value = (block.text || '') + event.delta;
+      if (value.length > 1048576) fail('reasoning summary is too large');
+      block.text = value;
+      return next;
+    }
+    if (type === 'REASONING_MESSAGE_END') {
+      if (!next.reasoningMessage || event.messageId !== next.reasoningMessage.id) fail('reasoning message ended without a start');
+      next.blocks[next.reasoningMessage.index].status = 'completed';
+      next.reasoningMessage = null;
+      return next;
+    }
+    if (type === 'REASONING_END') {
+      if (!next.reasoningSpan || next.reasoningMessage || event.messageId !== next.reasoningSpan) fail('reasoning ended without a matching start');
+      next.reasoningSpan = null;
+      return next;
+    }
+    if (type === 'ACTIVITY_SNAPSHOT') {
+      const id = text(event.messageId, 'activity message id', 512);
+      if (event.activityType !== 'openbot.run.activity' || !record(event.content)) return next;
+      const label = text(event.content.label, 'activity label', 2000);
+      const progress = event.content.progress;
+      if (progress !== undefined && (typeof progress !== 'number' || !Number.isFinite(progress) || progress < 0 || progress > 1)) fail('activity progress is invalid');
+      const prior = next.activities[id];
+      const block = { type:'status', id, text:label, ...(progress === undefined ? {} : { progress }) };
+      if (prior === undefined) next.activities[id] = add(block);
+      else next.blocks[prior] = block;
+      return next;
+    }
+    if (type === 'CUSTOM') {
+      // OpenBot custom events carry public rich parts/artifacts. The current desk has
+      // no registered renderer for them, so retain the protocol boundary and ignore.
+      text(event.name, 'custom event name', 512);
+      return next;
+    }
+    if (type === 'RUN_FINISHED') {
+      sameRun();
+      if (Object.keys(next.openMessages).length || Object.values(next.tools).some(tool => tool.open) || next.reasoningSpan || next.reasoningMessage) fail('run finished with an open stream');
+      const outcome = event.outcome;
+      if (!record(outcome) || (outcome.type !== 'success' && outcome.type !== 'interrupt')) fail('run outcome is invalid');
+      if (outcome.type === 'interrupt') {
+        if (!Array.isArray(outcome.interrupts) || !outcome.interrupts.length) fail('interrupt outcome is empty');
+        next.interrupts = outcome.interrupts.map(item => {
+          if (!record(item)) fail('interrupt is invalid');
+          const interrupt = {
+            id:text(item.id, 'interrupt id', 512),
+            reason:text(item.reason, 'interrupt reason', 512),
+            message:typeof item.message === 'string' ? item.message.slice(0, 4000) : '',
+            responseSchema:record(item.responseSchema) ? item.responseSchema : null,
+            toolCallId:typeof item.toolCallId === 'string' ? item.toolCallId : null,
+          };
+          const tool = interrupt.toolCallId && next.tools[interrupt.toolCallId];
+          if (tool) next.blocks[tool.index].status = 'needs permission';
+          return interrupt;
+        });
+        add({ type:'status', id:'interrupt:' + next.runId, text:'Needs permission' });
+        next.phase = 'interrupted';
+      } else {
+        add({ type:'status', id:'finished:' + next.runId, text:'Turn finished' });
+        next.phase = 'completed';
+      }
+      next.outcome = outcome.type;
+      return next;
+    }
+    if (type === 'RUN_ERROR') {
+      if (Object.keys(next.openMessages).length || Object.values(next.tools).some(tool => tool.open) || next.reasoningSpan || next.reasoningMessage) fail('run failed with an open stream');
+      const message = text(event.message, 'run error', 4000);
+      next.phase = event.code === 'cancelled' ? 'cancelled' : 'failed';
+      next.error = { code:typeof event.code === 'string' ? event.code : 'run_failed', message };
+      add({ type:'status', id:'error:' + next.runId, text:message });
+      return next;
+    }
+    fail('unsupported event type ' + type);
+  }
+
+  function parseAgUiSseFrames(buffer, flush=false) {
+    if (typeof buffer !== 'string' || buffer.length > 2097152) throw new Error('Invalid AG-UI SSE stream: frame buffer is too large');
+    const events = [];
+    let rest = buffer;
+    while (true) {
+      const match = /\r\n\r\n|\n\n|\r\r/.exec(rest);
+      if (!match) break;
+      const frame = rest.slice(0, match.index);
+      rest = rest.slice(match.index + match[0].length);
+      parseFrame(frame);
+    }
+    if (flush && rest.trim()) { parseFrame(rest); rest = ''; }
+    function parseFrame(frame) {
+      const lines = frame.split(/\r\n|\n|\r/);
+      const data = [];
+      for (const line of lines) {
+        if (!line || line.startsWith(':')) continue;
+        if (line === 'data') data.push('');
+        else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+      }
+      if (!data.length) return;
+      const payload = data.join('\n');
+      if (!payload || payload === '[DONE]') throw new Error('Invalid AG-UI SSE stream: empty or sentinel event');
+      let parsed;
+      try { parsed = JSON.parse(payload); }
+      catch { throw new Error('Invalid AG-UI SSE stream: event is not JSON'); }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Invalid AG-UI SSE stream: event is not an object');
+      events.push(parsed);
+    }
+    return { events, rest };
+  }
+
+  async function readAgUiSse(response, onEvent) {
+    const media = String(response.headers.get('content-type') || '').toLowerCase();
+    if (!media.startsWith('text/event-stream') || !response.body) throw new Error('AG-UI response is not an SSE stream');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const chunk = await reader.read();
+      buffer += decoder.decode(chunk.value || new Uint8Array(), { stream:!chunk.done });
+      const parsed = parseAgUiSseFrames(buffer, chunk.done);
+      buffer = parsed.rest;
+      for (const event of parsed.events) await onEvent(event);
+      if (chunk.done) break;
+    }
+    if (buffer.trim()) throw new Error('Invalid AG-UI SSE stream: unterminated event');
+  }
+
+  function h(html) { const d = document.createElement('div'); d.innerHTML = html.trim(); return d.firstElementChild; }
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
@@ -75,43 +333,8 @@
     saveOrgBookmarks(list);
     return '';
   }
-  async function copyText(text, btn, doneMsg) {
-    const label = btn ? btn.textContent : '';
-    try {
-      await navigator.clipboard.writeText(String(text || ''));
-      if (btn) {
-        btn.textContent = 'Copied';
-        setTimeout(() => { btn.textContent = label; }, 1200);
-      }
-      announce(doneMsg || 'Copied');
-    } catch {
-      if (btn) btn.textContent = 'Copy failed';
-    }
-  }
   function thisOrgName() {
     return (state.org && (state.org.name || state.org.slug)) || location.host || 'this instance';
-  }
-  function solicitNotices(json) {
-    if (!json || typeof json !== 'object') return [];
-    const out = [];
-    const seen = new Set();
-    function emit(row, force) {
-      if (!row || typeof row !== 'object') return;
-      const kind = String(row.kind || row.type || row.reason || row.status || '');
-      const body = String(row.body || row.text || row.message || '');
-      const looks = force || row.solicit === true || /solicit|untrusted|unknown_peer|tried to send/i.test(kind + ' ' + body);
-      if (!looks) return;
-      const who = row.name || row.slug || row.fromOrg || row.orgName || row.host || row.from_org || 'unknown';
-      const line = 'Org ' + who + ' tried to send mail';
-      if (seen.has(line)) return;
-      seen.add(line);
-      out.push(line);
-    }
-    if (Array.isArray(json.solicitations)) for (const row of json.solicitations) emit(row, true);
-    if (Array.isArray(json.inbox)) for (const row of json.inbox) emit(row, false);
-    if (Array.isArray(json.rows)) for (const row of json.rows) emit(row, false);
-    if (Array.isArray(json.items)) for (const row of json.items) emit(row, false);
-    return out;
   }
   function initials(name) {
     const p = String(name||'?').trim().split(/\s+/).slice(0,2);
@@ -260,7 +483,7 @@
   function paintLiveChip() {
     const chip = document.getElementById('live-chip');
     if (!chip) return;
-    const harness = state.compute && state.compute.harness;
+    const harness = state.view === 'human' ? undefined : state.compute && state.compute.harness;
     const text = deskChipText(typeof buildLiveBlocks === 'function' ? buildLiveBlocks(state.live) : [], harness);
     if (!text) {
       chip.hidden = true;
@@ -273,7 +496,7 @@
     }
   }
   function messagesFingerprint() {
-    return state.messages.map(m => m.id + ':' + m.origin + ':' + (m._pending || '') + ':' + (m._failed || '')).join('|') + '|' + waitingKind();
+    return state.messages.map(m => m.id + ':' + m.origin + ':' + (m._pending || '') + ':' + (m._failed || '') + ':' + (m._agUi ? (m.body || '') : '')).join('|') + '|' + waitingKind();
   }
   function snapshotFocus() {
     const a = document.activeElement;
@@ -284,7 +507,7 @@
     if (bot) return { area: 'rail', botId: bot.getAttribute('data-id') };
     const g = a.closest('button.bot[data-group]');
     if (g) return { area: 'rail-group', groupId: g.getAttribute('data-group') };
-    const lib = a.closest('#open-activity, #open-archive, #open-calendar, #open-gateway, #newbot, #new-group');
+    const lib = a.closest('#open-activity, #open-archive, #open-calendar, #open-a2a-status, #newbot, #new-group');
     if (lib) return { area: 'id', id: lib.id };
     const msgBtn = a.closest('#msgs button');
     if (msgBtn) {
@@ -355,18 +578,16 @@
     try { state.models = (await api('/v1/inference-models')).models || []; } catch { state.models = []; }
     try {
       const bots = await api('/v1/bots');
-      // Desk roster only — Gateway is the sidecar, never a Team row.
       state.bots = bots.bots || (bots.bot ? [bots.bot] : []);
-      state.gateway = bots.gateway || null;
+      state.a2aGateway = bots.a2aGateway || null;
       state.archived = bots.archived || [];
       if (bots.archiveTtlMs) state.archiveTtlMs = bots.archiveTtlMs;
       const last = localStorage.getItem('openbot-last-bot');
       state.bot = state.bots.find(b => b.id === last)
-        || (state.gateway && last === state.gateway.id ? state.gateway : null)
         || state.bots[0]
         || null;
     } catch {}
-    // Onboard until a desk bot exists; Gateway must not skip that screen.
+    // Onboard until a desk teammate exists; protocol infrastructure does not skip it.
     if (!state.bots.length && !state.archived.length) return renderOnboard();
     try { state.groups = (await api('/v1/threads?kind=group')).threads || []; } catch { state.groups = []; }
     try { state.org = await api('/v1/org'); } catch { state.org = null; }
@@ -446,21 +667,171 @@
     } catch (e) { if (err) err.textContent = e.message; }
   }
 
-  function isGatewayBot(b) {
-    return Boolean(b && state.gateway && b.id === state.gateway.id);
-  }
   function visibleMessages(list) {
     return (list || []).filter(m => m.origin !== 'prompt' && m.origin !== 'calendar');
   }
   function principalById(botId) {
-    if (state.gateway && state.gateway.id === botId) return state.gateway;
     return state.bots.find(b => b.id === botId) || null;
+  }
+
+  function newAgUiId(kind) {
+    if (!globalThis.crypto || typeof globalThis.crypto.randomUUID !== 'function') {
+      throw new Error('This browser cannot create secure AG-UI identifiers');
+    }
+    return 'desk-' + kind + '-' + globalThis.crypto.randomUUID();
+  }
+
+  function agUiContextKey(botId, legacyThreadId) {
+    return 'openbot-ag-ui-v1:' + encodeURIComponent(botId) + ':' + encodeURIComponent(legacyThreadId);
+  }
+
+  function saveAgUiContext(context) {
+    if (!context || !context.storageKey) return;
+    try {
+      localStorage.setItem(context.storageKey, JSON.stringify({
+        version:2,
+        threadId:context.threadId,
+        taskId:context.taskId || null,
+        started:Boolean(context.started),
+        active:Boolean(context.active),
+        interrupted:Boolean(context.interrupted),
+        lastRunId:context.lastRunId || null,
+        lastSeq:Number.isSafeInteger(context.lastSeq) ? context.lastSeq : 0,
+      }));
+    } catch {}
+  }
+
+  function loadAgUiContext(botId, legacyThreadId) {
+    const storageKey = agUiContextKey(botId, legacyThreadId);
+    try {
+      const value = JSON.parse(localStorage.getItem(storageKey) || 'null');
+      if (value && value.version === 2 && typeof value.threadId === 'string' && value.threadId && value.threadId.length <= 512 && (value.taskId === null || value.taskId === undefined || (typeof value.taskId === 'string' && value.taskId && value.taskId.length <= 512))) {
+        return {
+          storageKey, botId, legacyThreadId,
+          threadId:value.threadId,
+          taskId:value.taskId || null,
+          started:Boolean(value.started),
+          active:Boolean(value.active),
+          interrupted:Boolean(value.interrupted),
+          lastRunId:typeof value.lastRunId === 'string' && value.lastRunId ? value.lastRunId : null,
+          lastSeq:Number.isSafeInteger(value.lastSeq) && value.lastSeq >= 0 ? value.lastSeq : 0,
+        };
+      }
+    } catch {}
+    const context = {
+      storageKey, botId, legacyThreadId,
+      threadId:newAgUiId('thread'), taskId:null,
+      started:false, active:false, interrupted:false, lastRunId:null, lastSeq:0,
+    };
+    saveAgUiContext(context);
+    return context;
+  }
+
+  function adoptAgUiConversation(context, conversation) {
+    const validId = value => typeof value === 'string' && value.length > 0 && value.length <= 512;
+    if (conversation === null) {
+      if (context.lastRunId || context.started || context.active || context.interrupted) {
+        context.threadId = newAgUiId('thread');
+        context.taskId = null;
+        context.started = false;
+        context.active = false;
+        context.interrupted = false;
+        context.lastRunId = null;
+        context.lastSeq = 0;
+      }
+      saveAgUiContext(context);
+      return [];
+    }
+    if (!conversation || typeof conversation !== 'object' || !validId(conversation.threadId) || !Array.isArray(conversation.messages)) {
+      throw new Error('Invalid canonical conversation response');
+    }
+    context.threadId = conversation.threadId;
+    const active = conversation.active;
+    if (active === null || active === undefined) {
+      context.taskId = null;
+      context.started = false;
+      context.active = false;
+      context.interrupted = false;
+      context.lastRunId = null;
+      context.lastSeq = 0;
+    } else {
+      if (!active || typeof active !== 'object' || !validId(active.taskId) || !validId(active.runId) || !['submitted', 'working', 'input_required', 'auth_required'].includes(active.status)) {
+        throw new Error('Invalid canonical active-run response');
+      }
+      context.taskId = active.taskId;
+      context.started = true;
+      context.active = active.status === 'submitted' || active.status === 'working';
+      context.interrupted = active.status === 'input_required' || active.status === 'auth_required';
+      context.lastRunId = active.runId;
+      context.lastSeq = Number.isSafeInteger(active.lastSeq) && active.lastSeq >= 0 ? active.lastSeq : 0;
+    }
+    const messages = [];
+    for (const message of conversation.messages) {
+      if (!message || typeof message !== 'object' || !validId(message.id) || !['user', 'assistant', 'tool'].includes(message.role) || typeof message.body !== 'string' || message.body.length > 1048576 || !Number.isFinite(message.createdAt)) {
+        throw new Error('Invalid canonical conversation message');
+      }
+      messages.push({
+        id:message.id,
+        role:message.role === 'user' ? 'user' : 'assistant',
+        origin:message.role === 'user' ? 'user' : 'ag-ui',
+        body:message.body,
+        created_at:message.createdAt,
+        _agUi:true,
+      });
+    }
+    const pending = conversation.pendingNotifications === undefined ? [] : conversation.pendingNotifications;
+    if (!Array.isArray(pending)) throw new Error('Invalid pending notification response');
+    for (const message of pending) {
+      if (!message || typeof message !== 'object' || !validId(message.id) || typeof message.body !== 'string' || message.body.length > 1048576 || !Number.isFinite(message.createdAt)) {
+        throw new Error('Invalid pending notification');
+      }
+      if (!messages.some(candidate => candidate.id === message.id)) messages.push({
+        id:message.id,
+        role:'assistant',
+        origin:'pending_approval',
+        body:message.body,
+        created_at:message.createdAt,
+      });
+    }
+    saveAgUiContext(context);
+    return messages;
+  }
+
+  async function fetchAgUiConversation(botId) {
+    const result = await api('/v1/agents/' + encodeURIComponent(botId) + '/conversation');
+    if (!result || !Object.prototype.hasOwnProperty.call(result, 'conversation')) throw new Error('Invalid canonical conversation response');
+    return result.conversation;
+  }
+
+  function rememberAgUiMessages() {
+    if (state.view !== 'human' || !state.agUiContext) return;
+    state.agUiMessages[state.agUiContext.storageKey] = state.messages
+      .filter(message => message._agUi)
+      .map(message => ({ ...message }));
+  }
+
+  function mergeAgUiMessages(messages, context, onlyUncommitted=false) {
+    const merged = [...messages];
+    const cached = state.agUiMessages[context.storageKey] || [];
+    for (const message of cached) {
+      if (onlyUncommitted && !message._pending && !message._failed) continue;
+      if (!merged.some(candidate => candidate.id === message.id)) merged.push({ ...message });
+    }
+    return merged.sort((left, right) => Number(left.created_at || 0) - Number(right.created_at || 0));
+  }
+
+  function detachAgUiStream() {
+    const controller = state.agUiAbort;
+    state.agUiAbort = null;
+    if (controller) controller.abort();
+    state.sending = false;
   }
 
   async function selectBot(botId, threadId) {
     saveDraft();
+    rememberAgUiMessages();
+    detachAgUiStream();
     const principal = principalById(botId);
-    // Gateway is not in state.bots; never keep the previous desk bot here.
     if (!principal) return;
     state.bot = principal;
     try { localStorage.setItem('openbot-last-bot', state.bot.id); } catch {}
@@ -469,7 +840,23 @@
       ? await api('/v1/threads/' + threadId)
       : await api('/v1/threads?botId=' + encodeURIComponent(botId));
     state.thread = t.thread;
-    state.messages = visibleMessages(t.messages);
+    if (state.view === 'human') {
+      state.agUiContext = loadAgUiContext(botId, state.thread.id);
+      state.agUiRun = null;
+      state.live = [];
+      try {
+        const conversation = await fetchAgUiConversation(botId);
+        state.messages = mergeAgUiMessages(adoptAgUiConversation(state.agUiContext, conversation), state.agUiContext, true);
+      } catch {
+        // Local memory/storage is only a continuity cache when canonical bootstrap is unavailable.
+        state.messages = mergeAgUiMessages([], state.agUiContext);
+      }
+    } else {
+      state.agUiContext = null;
+      state.agUiRun = null;
+      state.live = [];
+      state.messages = visibleMessages(t.messages);
+    }
     try {
       const a2a = await api('/v1/threads?kind=a2a&botId=' + encodeURIComponent(botId));
       state.a2a = a2a.threads || [];
@@ -478,8 +865,10 @@
     renderApp();
     const latestTurnId = t.latestTurnId || [...(state.messages || [])].reverse().find(m => m.turn_id)?.turn_id;
     state.turn = latestTurnId;
-    await catchUpLive(latestTurnId);
     loadDraft();
+    if (state.view === 'human' && (state.agUiContext.active || state.agUiContext.interrupted) && state.agUiContext.lastRunId) {
+      void replayAgUiRun(state.agUiContext);
+    }
   }
 
   async function refreshGroups() {
@@ -492,7 +881,12 @@
   async function selectGroup(threadId) {
     if (!threadId) return;
     saveDraft();
+    rememberAgUiMessages();
+    detachAgUiStream();
     state.view = 'group';
+    state.agUiContext = null;
+    state.agUiRun = null;
+    state.live = [];
     const t = await api('/v1/threads/' + threadId);
     state.thread = t.thread;
     state.messages = visibleMessages(t.messages);
@@ -500,23 +894,31 @@
     renderApp();
     const latestTurnId = t.latestTurnId || [...(state.messages || [])].reverse().find(m => m.turn_id)?.turn_id;
     state.turn = latestTurnId;
-    await catchUpLive(latestTurnId);
     loadDraft();
+  }
+
+  function openA2aStatus() {
+    saveDraft();
+    rememberAgUiMessages();
+    detachAgUiStream();
+    state.view = 'a2a-status';
+    state.thread = null;
+    state.messages = [];
+    state.live = [];
+    state.a2a = [];
+    renderApp();
   }
 
   function openNewGroup() {
     const botChecks = state.bots.map(b =>
       '<label><input type="checkbox" data-bot="' + b.id + '" /> ' + escapeHtml(b.name) + '</label>'
     ).join('');
-    const gwCheck = state.gateway
-      ? '<label><input type="checkbox" data-bot="' + state.gateway.id + '" /> ' + escapeHtml(state.gateway.name) + '</label>'
-      : '';
     const overlay = h(`<div class="overlay"><div class="modal">
       <h2 id="grp-title">New group</h2>
       <label for="grp-name">Title</label>
       <input id="grp-name" name="title" value="New thread" />
       <p class="muted">Pick at least two teammates. You are included.</p>
-      <div id="grp-bots" style="display:flex;flex-direction:column;gap:6px">${botChecks}${gwCheck}</div>
+      <div id="grp-bots" style="display:flex;flex-direction:column;gap:6px">${botChecks}</div>
       <p class="err" id="grp-err" hidden></p>
       <div class="modal-actions">
         <button class="primary" type="button" id="grp-go">Create</button>
@@ -557,7 +959,6 @@
   }
 
   function botName(id) {
-    if (state.gateway && state.gateway.id === id) return state.gateway.name;
     const b = state.bots.find(x => x.id === id) || state.archived.find(x => x.id === id);
     return b ? b.name : (id || 'bot').slice(0, 8);
   }
@@ -603,12 +1004,10 @@
         body: JSON.stringify({ model, reasoningEffort: effort })
       });
       const bot = state.bots.find(b => b.id === state.bot.id)
-        || (isGatewayBot(state.bot) ? state.gateway : null)
         || state.bot;
       bot.model = res.model;
       bot.reasoning_effort = res.reasoningEffort;
       state.bot = bot;
-      if (isGatewayBot(bot)) state.gateway = bot;
       announce('Next turn uses ' + res.model + ' · ' + res.reasoningEffort);
     } catch (e) { announce(e.message); }
   }
@@ -636,11 +1035,11 @@
     const inActivity = state.view === 'activity';
     const inCalendar = state.view === 'calendar';
     const inGroup = state.view === 'group';
-    const gwSelected = isGatewayBot(state.bot) && state.view === 'human';
-    const heading = inArchive ? 'Archive' : inActivity ? 'Activity' : inCalendar ? 'Calendar' : inGroup ? (state.thread?.title || 'Group') : (state.bot?.name || 'OpenBot');
+    const inA2aStatus = state.view === 'a2a-status';
+    const heading = inArchive ? 'Archive' : inActivity ? 'Activity' : inCalendar ? 'Calendar' : inA2aStatus ? 'A2A connection' : inGroup ? (state.thread?.title || 'Group') : (state.bot?.name || 'OpenBot');
     document.title = heading + ' · OpenBot';
     const railBots = state.bots.map(b => {
-      const active = state.bot && b.id === state.bot.id && state.view === 'human' && !gwSelected;
+      const active = state.bot && b.id === state.bot.id && state.view === 'human';
       const pres = presenceOf(b);
       const collapsedLabel = state.railCollapsed ? ' aria-label="' + escapeHtml(b.name + ', ' + pres.label) + '"' : '';
       return '<button type="button" class="bot' + (active ? ' active' : '') + '" id="bot-' + b.id + '" data-id="' + b.id + '" aria-current="' + (active ? 'page' : 'false') + '"' + collapsedLabel + '>' +
@@ -648,11 +1047,10 @@
         '<span class="avatar" aria-hidden="true">' + escapeHtml(initials(b.name)) + '</span>' +
         '<span class="bot-meta"><strong>' + escapeHtml(b.name) + '</strong><span class="muted presence">' + escapeHtml(pres.label) + '</span></span></button>';
     }).join('');
-    const gwEnabled = Boolean(state.gateway && state.gateway.enabled);
-    const gatewayPin = state.gateway
-      ? '<button type="button" class="bot folder' + (gwSelected ? ' active' : '') + '" id="open-gateway" data-id="' + state.gateway.id + '" aria-current="' + (gwSelected ? 'page' : 'false') + '">' +
-        '<span class="avatar" aria-hidden="true">' + escapeHtml(initials(state.gateway.name)) + '</span>' +
-        '<span class="bot-meta"><strong>' + escapeHtml(state.gateway.name) + '</strong><span class="muted presence">' + (gwEnabled ? 'Federation on' : 'Federation off') + '</span></span></button>'
+    const a2aPin = state.a2aGateway
+      ? '<button type="button" class="bot folder' + (inA2aStatus ? ' active' : '') + '" id="open-a2a-status" aria-current="' + (inA2aStatus ? 'page' : 'false') + '">' +
+        '<span class="avatar" aria-hidden="true">↔</span>' +
+        '<span class="bot-meta"><strong>A2A connection</strong><span class="muted presence">Protocol status</span></span></button>'
       : '';
     const railGroups = (state.groups || []).map(t => {
       const active = inGroup && state.thread && t.id === state.thread.id;
@@ -664,7 +1062,7 @@
       '<div><button type="button" data-a2a="' + t.id + '">' + escapeHtml(handoffLabel(t)) + '</button></div>'
     ).join('') || '<p class="muted">No A2A threads yet. Bots use SendToAgent.</p>';
     const readonly = state.view === 'a2a';
-    const composer = inArchive || inActivity || inCalendar
+    const composer = inArchive || inActivity || inCalendar || inA2aStatus
       ? ''
       : readonly
       ? '<p class="muted" id="draft-help">This handoff log is read-only. Message the bot from their human thread.</p>'
@@ -689,6 +1087,8 @@
       ? '<ul class="act-list" id="activity-board"></ul>'
       : inCalendar
       ? '<div class="cal-board" id="calendar-board"><div class="cal-toolbar"><div class="cal-tools"><div class="seg" role="group" aria-label="Calendar view"><button type="button" id="cal-agenda" aria-pressed="' + (state.calMode !== 'month' ? 'true' : 'false') + '">Agenda</button><button type="button" id="cal-month" aria-pressed="' + (state.calMode === 'month' ? 'true' : 'false') + '">Month</button></div></div><button type="button" class="primary" id="cal-new">New event</button></div><p class="muted" style="padding:8px 16px 0">The calendar runs only while <code>openbot server</code> runs. A closed laptop means the 9am did not happen.</p><div class="cal-body" id="cal-body"></div></div>'
+      : inA2aStatus
+      ? '<section class="card" aria-labelledby="a2a-status-title"><h2 id="a2a-status-title">Agent-to-agent connection</h2><p>This is the protocol edge for authenticated external agent requests. It is infrastructure, not a teammate or chat recipient.</p><dl><dt>Status</dt><dd>' + (state.a2aGateway?.available ? 'Available' : 'Unavailable') + '</dd><dt>Agent Card</dt><dd><a href="/.well-known/agent-card.json"><code>/.well-known/agent-card.json</code></a></dd><dt>JSON-RPC endpoint</dt><dd><code>/a2a/v1</code></dd></dl><p class="muted">Desk bots are the only entries in Team, groups, AG-UI chat, and OpenAI-compatible models.</p></section>'
       : '<ol class="msgs" id="msgs" tabindex="0"></ol><div class="composer-wrap">' + composer + '</div><p class="muted" style="padding:0 16px 12px">Closing this tab does not stop teammates. Stopping <code>openbot server</code> does.</p>';
 
     const orgName = thisOrgName();
@@ -707,8 +1107,8 @@
         <button type="button" class="ghost" id="takeover">Desk browser</button>
         <button type="button" id="open-orgs" aria-haspopup="dialog">Orgs</button>
         <button type="button" class="side-toggle" id="live-toggle" aria-expanded="false">Live work</button>
-        ${!inArchive && !inActivity && !inCalendar && !inGroup && state.bot && !gwSelected ? '<button type="button" id="archive-bot">Archive</button>' : ''}
-        ${((state.view === 'human' && !gwSelected) || inGroup) && state.thread ? '<button type="button" id="learn-this">Learn this</button>' : ''}
+        ${!inArchive && !inActivity && !inCalendar && !inA2aStatus && !inGroup && state.bot ? '<button type="button" id="archive-bot">Archive</button>' : ''}
+        ${(state.view === 'human' || inGroup) && state.thread ? '<button type="button" id="learn-this">Learn this</button>' : ''}
         <button type="button" id="help" aria-haspopup="dialog">Help</button>
         <button type="button" id="settings">Settings</button>
       </div>
@@ -734,13 +1134,13 @@
           <span class="avatar" aria-hidden="true">📅</span>
           <span class="bot-meta"><strong>Calendar</strong><span class="muted">Schedules</span></span>
         </button>
-        ${gatewayPin}
+        ${a2aPin}
         <h2>Groups</h2>
         ${railGroups}
         <button type="button" id="new-group">New group</button>
         <p class="muted desk-note">Shared desk · one Chromium, a tab per bot · SendToAgent is how bots talk.</p>
       </nav>
-      <main class="thread" id="thread" aria-label="${inArchive ? 'Archive' : inActivity ? 'Activity' : inCalendar ? 'Calendar' : inGroup ? 'Group' : 'Conversation'}">
+      <main class="thread" id="thread" aria-label="${inArchive ? 'Archive' : inActivity ? 'Activity' : inCalendar ? 'Calendar' : inA2aStatus ? 'A2A connection status' : inGroup ? 'Group' : 'Conversation'}">
         ${mainInner}
       </main>
       <div class="resize-side" id="resize-side" role="separator" aria-orientation="vertical" aria-label="Resize live work" tabindex="0"></div>
@@ -751,10 +1151,7 @@
         </div>
         <div class="side-body">
           <p class="muted" id="live-summary">Quiet</p>
-          <div class="seg" role="group" aria-label="Live work format">
-            <button type="button" id="live-human" aria-pressed="${!state.liveRaw}">Readable</button>
-            <button type="button" id="live-raw" aria-pressed="${state.liveRaw}">Raw</button>
-          </div>
+          <p class="muted">Canonical AG-UI activity</p>
           <div id="live" class="live" aria-live="off"></div>
           <h2>Handoffs</h2>
           <div id="handoffs">${handoffs}</div>
@@ -785,6 +1182,7 @@
     bind('#open-archive', openArchiveFolder);
     bind('#open-activity', openActivity);
     bind('#open-calendar', openCalendar);
+    bind('#open-a2a-status', openA2aStatus);
     bind('#cal-agenda', () => setCalMode('agenda'));
     bind('#cal-month', () => setCalMode('month'));
     bind('#cal-new', openNewEvent);
@@ -792,8 +1190,6 @@
     bind('#archive-bot', archiveCurrentBot);
     bind('#collapse-rail', () => togglePane('rail'));
     bind('#collapse-side', () => togglePane('side'));
-    bind('#live-human', () => setLiveRaw(false));
-    bind('#live-raw', () => setLiveRaw(true));
     bind('#live-toggle', () => {
       const side = document.getElementById('side');
       const btn = document.getElementById('live-toggle');
@@ -843,7 +1239,7 @@
     const count = document.getElementById('count');
     if (!draft || !send) return;
     const n = draft.value.length;
-    send.disabled = !draft.value.trim() || state.sending;
+    send.disabled = !draft.value.trim() || state.sending || (state.view === 'human' && ((state.agUiRun && state.agUiRun.phase === 'interrupted') || (state.agUiContext && state.agUiContext.interrupted)));
     if (count) count.textContent = n > 28000 ? (32000 - n) + ' left' : '';
   }
 
@@ -855,20 +1251,12 @@
     if (jump) jump.hidden = stickBottom;
   }
 
-  function dropFinishedTurn(turnId, status) {
-    if (!turnId) return;
-    if (status !== 'completed' && status !== 'failed' && status !== 'cancelled') return;
-    for (const m of state.messages) {
-      if (!Array.isArray(m._turnIds) || !m._turnIds.length) continue;
-      m._turnIds = m._turnIds.filter(id => id !== turnId);
-    }
-    if (state.turn === turnId) {
-      const still = [...state.messages].reverse().find(m => Array.isArray(m._turnIds) && m._turnIds.length);
-      state.turn = still ? still._turnIds[0] : null;
-    }
-  }
-
   function waitingKind() {
+    if (state.view === 'human') {
+      if (state.sending && (!state.agUiRun || state.agUiRun.phase === 'idle')) return 'starting';
+      if (state.agUiRun && state.agUiRun.phase === 'active') return 'working';
+      return '';
+    }
     const last = state.messages[state.messages.length - 1];
     if (!last || last.role !== 'user' || last.origin === 'agent') return '';
     if (last._failed) return '';
@@ -886,7 +1274,6 @@
     if (m.role === 'user' && (m.origin === 'user' || !m.origin)) return 'You';
     if (m.origin === 'agent') return botName(m.from_bot_id) || 'Bot';
     if (m.origin === 'system') return 'System';
-    if (m.origin === 'federation') return m.remote_actor_name || 'Org';
     if (m.from_bot_id) return botName(m.from_bot_id);
     // Group fallback has no from_bot_id; do not pin it to the last selected DM.
     if (m.origin === 'fallback' && state.view === 'group') return 'Teammate';
@@ -947,12 +1334,6 @@
         badge.textContent = 'Pending your approval';
         li.append(badge);
       }
-      if (m.origin === 'federation' || m.remote_org_id) {
-        const badge = document.createElement('div');
-        badge.className = 'badge';
-        badge.textContent = m.remote_actor_name ? ('From ' + m.remote_actor_name) : 'Federation';
-        li.append(badge);
-      }
       const body = document.createElement('div');
       body.className = 'body';
       body.innerHTML = renderBody(m.body || '');
@@ -999,14 +1380,22 @@
       const li = document.createElement('li');
       li.className = 'msg system';
       li.setAttribute('aria-live', 'polite');
-      const labels = { starting:'Starting Grok…', working:'Teammate is working…', crashed:'Harness crashed. Send again or open Settings.', waiting:'Waiting for teammate…' };
+      const labels = { starting:'Starting teammate…', working:'Teammate is working…', crashed:'Harness crashed. Send again or open Settings.', waiting:'Waiting for teammate…' };
       li.textContent = labels[wait] || 'Waiting…';
-      if (state.turn && wait !== 'crashed') {
+      const canCancel = state.view === 'human'
+        ? Boolean(state.agUiRun && state.agUiRun.phase === 'active')
+        : Boolean(state.turn);
+      if (canCancel && wait !== 'crashed') {
         const cancel = document.createElement('button');
         cancel.type = 'button';
         cancel.className = 'linkish';
         cancel.textContent = 'Cancel turn';
-        cancel.onclick = async () => { try { await api('/v1/turns/' + state.turn + '/cancel', { method:'POST', body:'{}' }); } catch {} };
+        cancel.onclick = async () => {
+          try {
+            if (state.view === 'human') await cancelAgUiRun();
+            else await api('/v1/turns/' + state.turn + '/cancel', { method:'POST', body:'{}' });
+          } catch {}
+        };
         li.append(document.createTextNode(' '));
         li.append(cancel);
       }
@@ -1029,14 +1418,182 @@
     if (msgSnap && msgSnap.area === 'msgs-action') restoreFocus(msgSnap);
   }
 
+  function currentAgUiOwner(context) {
+    return Boolean(
+      context && state.view === 'human' && state.bot && state.thread && state.agUiContext &&
+      state.bot.id === context.botId && state.thread.id === context.legacyThreadId &&
+      state.agUiContext.storageKey === context.storageKey
+    );
+  }
+
+  function syncAgUiView(context, run) {
+    if (!currentAgUiOwner(context)) return;
+    state.agUiRun = run;
+    state.live = run.blocks;
+    for (const block of run.blocks) {
+      if (block.type !== 'write') continue;
+      let message = state.messages.find(candidate => candidate._agUi && candidate.id === block.id);
+      if (!message) {
+        message = { id:block.id, role:'assistant', origin:'ag-ui', body:'', created_at:Date.now(), _agUi:true };
+        state.messages.push(message);
+      }
+      message.body = block.text || '';
+    }
+    rememberAgUiMessages();
+    paintMessages();
+    paintLive();
+    syncSend();
+  }
+
+  function agUiRequestInput(context, runId, parentRunId, message, resume, taskId) {
+    const input = {
+      threadId:context.threadId,
+      runId,
+      state:{},
+      messages:message ? [{ id:message.id, role:'user', content:message.body }] : [],
+      tools:[],
+      context:[],
+    };
+    if (parentRunId) input.parentRunId = parentRunId;
+    if (taskId) input.forwardedProps = { openbot:{ taskId } };
+    if (resume && resume.length) input.resume = resume;
+    return input;
+  }
+
+  function applyAgUiContextEvent(context, run, event) {
+    if (event.type === 'RUN_STARTED') {
+      context.started = true;
+      context.interrupted = false;
+    }
+    context.lastSeq = run.lastSeq;
+    if (run.phase === 'completed' || run.phase === 'failed' || run.phase === 'cancelled') {
+      context.active = false;
+      context.started = false;
+      context.interrupted = false;
+      context.taskId = null;
+    } else if (run.phase === 'interrupted') {
+      context.active = false;
+      context.interrupted = true;
+    }
+    return context;
+  }
+
+  async function agUiHttpError(response) {
+    const body = (await response.text()).slice(0, 8000);
+    try {
+      const parsed = JSON.parse(body);
+      return new Error(parsed && parsed.error && (parsed.error.message || parsed.error.code) || parsed.message || response.statusText || 'AG-UI request failed');
+    } catch {
+      return new Error(body || response.statusText || 'AG-UI request failed');
+    }
+  }
+
+  function agUiClientFailure(run, error) {
+    const failed = {
+      ...run,
+      phase:'failed',
+      error:{ code:'client_stream_error', message:String(error && error.message || error) },
+      blocks:run.blocks.map(block => ({ ...block })),
+    };
+    failed.blocks.push({ type:'status', id:'client-error:' + run.runId, text:failed.error.message });
+    return failed;
+  }
+
+  async function consumeAgUiResponse(response, context, initialRun) {
+    if (!response.ok) throw await agUiHttpError(response);
+    let run = initialRun;
+    await readAgUiSse(response, event => {
+      run = reduceAgUiEvent(run, event);
+      applyAgUiContextEvent(context, run, event);
+      saveAgUiContext(context);
+      syncAgUiView(context, run);
+    });
+    if (run.phase === 'idle' || run.phase === 'active') throw new Error('AG-UI stream ended without a terminal event');
+    return run;
+  }
+
+  async function postAgUiRun(context, input, run) {
+    const controller = new AbortController();
+    if (currentAgUiOwner(context)) state.agUiAbort = controller;
+    try {
+      const response = await fetch('/ag-ui/v1/run', {
+        method:'POST',
+        credentials:'same-origin',
+        signal:controller.signal,
+        headers:{
+          'content-type':'application/json',
+          'accept':'text/event-stream',
+          'X-OpenBot-Agent-ID':context.botId,
+        },
+        body:JSON.stringify(input),
+      });
+      return await consumeAgUiResponse(response, context, run);
+    } finally {
+      if (state.agUiAbort === controller) state.agUiAbort = null;
+    }
+  }
+
+  async function replayAgUiRun(context) {
+    if (!context || !context.lastRunId || !currentAgUiOwner(context)) return;
+    state.sending = true;
+    let run = newAgUiRunState(context.threadId, context.lastRunId);
+    syncAgUiView(context, run);
+    const controller = new AbortController();
+    state.agUiAbort = controller;
+    try {
+      const response = await fetch('/ag-ui/v1/runs/' + encodeURIComponent(context.lastRunId) + '/events?after=0', {
+        credentials:'same-origin',
+        signal:controller.signal,
+        headers:{ 'accept':'text/event-stream', 'X-OpenBot-Agent-ID':context.botId },
+      });
+      run = await consumeAgUiResponse(response, context, run);
+      if (currentAgUiOwner(context) && run.phase === 'interrupted') showAgUiInterrupt(context, run);
+    } catch (error) {
+      if (error && error.name === 'AbortError') return;
+      context.active = false;
+      saveAgUiContext(context);
+      run = agUiClientFailure(run, error);
+      syncAgUiView(context, run);
+      announce('Could not reconnect to the AG-UI run');
+    } finally {
+      if (state.agUiAbort === controller) state.agUiAbort = null;
+      if (currentAgUiOwner(context)) {
+        state.sending = false;
+        paintMessages();
+        syncSend();
+      }
+    }
+  }
+
+  async function cancelAgUiRun() {
+    const context = state.agUiContext;
+    const run = state.agUiRun;
+    if (!context || !run || (run.phase !== 'idle' && run.phase !== 'active')) return;
+    const response = await fetch('/ag-ui/v1/runs/' + encodeURIComponent(run.runId), {
+      method:'DELETE',
+      credentials:'same-origin',
+      headers:{ 'accept':'application/json', 'X-OpenBot-Agent-ID':context.botId },
+    });
+    if (!response.ok) throw await agUiHttpError(response);
+    announce('Cancellation requested');
+  }
+
   async function sendMsg() {
     const draft = document.getElementById('draft');
     if (!draft || !state.thread || state.view === 'a2a') return;
     const body = draft.value.trim();
     if (!body || state.sending) return;
+    const isHuman = state.view === 'human';
+    if (isHuman && (!state.agUiContext || state.agUiContext.active || state.agUiContext.interrupted || (state.agUiRun && state.agUiRun.phase === 'interrupted'))) return;
     state.sending = true;
     syncSend();
-    const tmp = { id: 'tmp-' + Date.now(), role:'user', origin:'user', body, created_at: Date.now(), _pending:true };
+    const retry = isHuman ? state.agUiRetry : null;
+    state.agUiRetry = null;
+    const context = state.agUiContext;
+    const parentRunId = null;
+    const runId = isHuman ? (retry && retry.runId || newAgUiId('run')) : null;
+    const messageId = isHuman ? (retry && retry.messageId || newAgUiId('message')) : 'tmp-' + Date.now();
+    const tmp = { id:messageId, role:'user', origin:'user', body, created_at:Date.now(), _pending:true, ...(isHuman ? { _agUi:true, _runId:runId, _parentRunId:parentRunId } : {}) };
     state.messages.push(tmp);
     draft.value = '';
     try { sessionStorage.removeItem(draftKey()); } catch {}
@@ -1044,6 +1601,27 @@
     paintMessages();
     announce('Sending message');
     try {
+      if (isHuman) {
+        context.taskId = runId;
+        context.started = false;
+        context.interrupted = false;
+        context.lastRunId = runId;
+        context.active = true;
+        saveAgUiContext(context);
+        let run = newAgUiRunState(context.threadId, runId);
+        syncAgUiView(context, run);
+        // A normal message is a fresh task/run on the existing AG-UI thread.
+        // The private task extension is reserved for an interrupted task resume.
+        const input = agUiRequestInput(context, runId, null, { id:messageId, body }, null, null);
+        run = await postAgUiRun(context, input, run);
+        const live = state.messages.find(candidate => candidate.id === messageId) || tmp;
+        live._pending = false;
+        rememberAgUiMessages();
+        if (run.phase === 'interrupted' && currentAgUiOwner(context)) showAgUiInterrupt(context, run);
+        paintMessages();
+        announce(run.phase === 'completed' ? 'Message sent' : run.phase === 'interrupted' ? 'Permission needed' : 'Run ended');
+        return;
+      }
       const res = await api('/v1/threads/' + state.thread.id + '/messages', { method:'POST', body: JSON.stringify({ body }) });
       // WS may already have replaced tmp; stamp the in-array row, not the detached object.
       const live = state.messages.find(x =>
@@ -1061,20 +1639,31 @@
       paintMessages();
       announce('Message sent');
     } catch (e) {
+      if (e && e.name === 'AbortError') return;
       const live = state.messages.find(x => x.id === tmp.id || x === tmp) || tmp;
       live._pending = false;
       live._failed = true;
       live.error = e.message;
+      if (isHuman) {
+        context.active = false;
+        saveAgUiContext(context);
+        const current = state.agUiRun || newAgUiRunState(context.threadId, runId);
+        syncAgUiView(context, agUiClientFailure(current, e));
+        rememberAgUiMessages();
+      }
       paintMessages();
       announce('Send failed');
     } finally {
-      state.sending = false;
-      syncSend();
-      draft.focus();
+      if (!isHuman || currentAgUiOwner(context)) {
+        state.sending = false;
+        syncSend();
+        draft.focus();
+      }
     }
   }
 
   async function retryMsg(m) {
+    if (state.view === 'human' && m._agUi) state.agUiRetry = { messageId:m.id, runId:m._runId };
     state.messages = state.messages.filter(x => x !== m);
     const draft = document.getElementById('draft');
     if (draft) draft.value = m.body || '';
@@ -1148,6 +1737,8 @@
   }
 
   async function openActivity() {
+    rememberAgUiMessages();
+    detachAgUiStream();
     state.view = 'activity';
     renderApp();
     await paintActivity();
@@ -1368,12 +1959,14 @@
   }
 
   async function openCalendar() {
+    rememberAgUiMessages();
+    detachAgUiStream();
     state.view = 'calendar';
     renderApp();
     await paintCalendar();
   }
   async function learnThis() {
-    if (!state.thread || (state.view !== 'human' && state.view !== 'group')) return;
+    if (!state.thread || (state.view !== 'human' && state.view !== 'group') || (state.view === 'human' && !state.bot)) return;
     const ok = await askConfirm({
       title: 'Learn this',
       body: 'This saves a prompt you can edit, not a recording of clicks. OpenBot will not replay the browser session.',
@@ -1381,7 +1974,10 @@
     });
     if (!ok) return;
     try {
-      const res = await api('/v1/calendar/learn', { method:'POST', body: JSON.stringify({ threadId: state.thread.id }) });
+      const source = state.view === 'human'
+        ? { agentId:state.bot.id }
+        : { threadId:state.thread.id };
+      const res = await api('/v1/calendar/learn', { method:'POST', body: JSON.stringify(source) });
       state.calMode = 'agenda';
       state.view = 'calendar';
       renderApp();
@@ -1654,7 +2250,7 @@
 
   function openEventForm(series) {
     const tzDefault = (series && series.timezone) || orgTimezone();
-    const botDefault = (series && series.assignee_bot_id) || (state.bot && !isGatewayBot(state.bot) ? state.bot.id : null) || (state.bots[0] && state.bots[0].id) || '';
+    const botDefault = (series && series.assignee_bot_id) || state.bot?.id || (state.bots[0] && state.bots[0].id) || '';
     const localDefault = series ? toLocalInput(series.dtstart_utc, tzDefault) : (function() {
       const p = tzParts(Date.now() + 86400000, tzDefault);
       return p.year + '-' + pad2(p.month) + '-' + pad2(p.day) + 'T09:00';
@@ -1738,7 +2334,7 @@
     async function finishCalForm() {
       close();
       if (state.view === 'calendar') await paintCalendar();
-      else { state.view = 'calendar'; renderApp(); }
+      else await openCalendar();
     }
     overlay.querySelector('#cal-save').onclick = async () => {
       if (await submitCalForm(false)) await finishCalForm();
@@ -1747,16 +2343,6 @@
     if (confirmBtn) confirmBtn.onclick = async () => {
       if (await submitCalForm(true)) await finishCalForm();
     };
-  }
-
-  function setLiveRaw(raw) {
-    state.liveRaw = raw;
-    try { localStorage.setItem('openbot-live-raw', raw ? '1' : '0'); } catch {}
-    const human = document.getElementById('live-human');
-    const rawBtn = document.getElementById('live-raw');
-    if (human) human.setAttribute('aria-pressed', raw ? 'false' : 'true');
-    if (rawBtn) rawBtn.setAttribute('aria-pressed', raw ? 'true' : 'false');
-    paintLive();
   }
 
   async function refreshCompute() {
@@ -1791,17 +2377,6 @@
     } catch {}
   }
 
-  function liveUpdate(ev) {
-    const p = ev.payload || {};
-    return p.update || p;
-  }
-  function contentText(c) {
-    if (!c) return '';
-    if (typeof c === 'string') return c;
-    if (Array.isArray(c)) return c.map(contentText).join('');
-    if (typeof c === 'object' && c.text) return String(c.text);
-    return '';
-  }
   function prettyVal(v) {
     if (v == null || v === '') return '';
     if (typeof v === 'string') {
@@ -1816,53 +2391,10 @@
   function toolTitle(s) {
     return String(s || 'Tool').replace(/^openbot__/, '').replace(/^use_tool$/i, 'Tool').replaceAll('_', ' ');
   }
-  function toolIdOf(u) {
-    return u.toolCallId || (u.toolCall && u.toolCall.toolCallId) || '';
-  }
 
-  function buildLiveBlocks(events) {
-    const blocks = [];
-    const tools = new Map();
-    const working = state.compute && (state.compute.harness === 'in_turn' || state.compute.harness === 'starting');
-    for (const ev of events) {
-      const u = liveUpdate(ev);
-      const kind = ev.kind || u.sessionUpdate || '';
-      if (kind === 'agent_thought_chunk') {
-        const t = contentText(u.content);
-        const last = blocks[blocks.length - 1];
-        if (last && last.type === 'thought') last.text += t;
-        else blocks.push({ type: 'thought', id: 'th-' + blocks.length, text: t });
-      } else if (kind === 'agent_message_chunk') {
-        const t = contentText(u.content);
-        const last = blocks[blocks.length - 1];
-        if (last && last.type === 'write') last.text += t;
-        else blocks.push({ type: 'write', id: 'wr-' + blocks.length, text: t });
-      } else if (kind === 'tool_call' || kind === 'tool_call_update') {
-        const id = toolIdOf(u) || ('tool-' + blocks.length);
-        let b = tools.get(id);
-        if (!b) {
-          b = { type: 'tool', id: id, title: toolTitle(u.title || u.kind), status: u.status || 'running', input: u.rawInput || u.input, output: null };
-          tools.set(id, b);
-          blocks.push(b);
-        }
-        if (u.title) b.title = toolTitle(u.title);
-        if (u.status) b.status = u.status;
-        if (u.rawInput != null) b.input = u.rawInput;
-        if (u.input != null) b.input = u.input;
-        if (u.rawOutput != null) b.output = u.rawOutput;
-        if (u.result != null) b.output = u.result;
-        if (kind === 'tool_call_update' && u.content != null) b.output = u.content;
-      } else if (kind === 'user_message_chunk') {
-        const last = blocks[blocks.length - 1];
-        if (!(last && last.type === 'status' && last.text === 'Reading your message')) {
-          blocks.push({ type: 'status', id: 'st-' + blocks.length, text: 'Reading your message' });
-        }
-      } else if (kind === 'permission_request') {
-        blocks.push({ type: 'status', id: 'st-' + blocks.length, text: 'Needs permission' });
-      } else if (kind === 'acp_notify' && String((ev.payload || {}).method || '').indexOf('prompt_complete') >= 0) {
-        blocks.push({ type: 'status', id: 'st-' + blocks.length, text: 'Turn finished' });
-      }
-    }
+  function buildLiveBlocks(canonicalBlocks) {
+    const working = state.agUiRun && state.agUiRun.phase === 'active';
+    const blocks = (canonicalBlocks || []).map(block => ({ ...block }));
     const last = blocks[blocks.length - 1];
     for (const b of blocks) {
       if (b.type === 'thought') b.openDefault = working && last === b;
@@ -1872,20 +2404,10 @@
     return blocks;
   }
 
-  function liveHumanLine(ev) {
-    const blocks = buildLiveBlocks([ev]);
-    const last = blocks[blocks.length - 1];
-    if (!last) return null;
-    if (last.type === 'thought') return 'Thinking';
-    if (last.type === 'write') return 'Writing';
-    if (last.type === 'tool') return (last.status === 'completed' ? 'Finished ' : 'Using ') + last.title;
-    return last.text || null;
-  }
-
   function liveSummary() {
     const blocks = buildLiveBlocks(state.live);
     const last = [...blocks].reverse().find(b => b.type !== 'status' || b.text === 'Needs permission' || b.text === 'Turn finished');
-    if (!last) return state.compute && state.compute.harness === 'in_turn' ? 'Working' : 'Quiet';
+    if (!last) return state.agUiRun && state.agUiRun.phase === 'active' ? 'Working' : 'Quiet';
     if (last.type === 'thought') return 'Thinking';
     if (last.type === 'write') return 'Writing';
     if (last.type === 'tool') return (last.status === 'running' ? 'Using ' : last.status === 'completed' ? 'Finished ' : '') + last.title;
@@ -1899,11 +2421,6 @@
     paintLiveChip();
     if (!live) return;
     const openIds = new Set([...live.querySelectorAll('details[open]')].map(d => d.getAttribute('data-id')));
-    if (state.liveRaw) {
-      live.className = 'live';
-      live.textContent = state.live.slice(-40).map(e => e.kind).join('\n') || 'No events yet';
-      return;
-    }
     live.className = 'live-log';
     live.innerHTML = '';
     const blocks = buildLiveBlocks(state.live);
@@ -1915,7 +2432,7 @@
       if (b.type === 'status') {
         const div = document.createElement('div');
         div.className = 'live-status';
-        div.textContent = b.text;
+        div.textContent = b.text + (typeof b.progress === 'number' ? ' · ' + Math.round(b.progress * 100) + '%' : '');
         live.append(div);
         continue;
       }
@@ -1967,38 +2484,27 @@
     }
   }
 
-  function upsertMessage(m) {
-    if (!m || !m.id) return;
-    // Per-turn @mention clones are not transcript bubbles.
-    if (m.origin === 'prompt' || m.origin === 'calendar') return;
-    const tid = m.thread_id || m.threadId;
-    const sameThread = Boolean(state.thread && tid === state.thread.id);
-    // Other threads' system/fallback must not land in this transcript.
-    if (!sameThread) return;
-    const idx = state.messages.findIndex(x => x.id === m.id || (x.id && String(x.id).startsWith('tmp-') && x.body === m.body && x.role === m.role));
-    const wasNew = idx < 0;
-    if (idx >= 0) {
-      const prev = state.messages[idx];
-      state.messages[idx] = {
-        ...prev,
-        ...m,
-        // Keep tmp pending until sendMsg stamps _turnIds; WS can replace the object first.
-        _pending: Boolean(prev._pending && m.origin === 'user'),
-        _failed: false,
-        _turnIds: Array.isArray(prev._turnIds) ? prev._turnIds : m._turnIds,
-      };
-    } else {
-      state.messages.push(m);
-    }
-    paintMessages();
-    if (wasNew && m.origin === 'pending_approval') announce('Pending your approval');
-    else if (wasNew && m.role !== 'user') announce(senderLabel(m) + ' replied');
-  }
-
   async function reloadThread() {
     if (state.view === 'activity') { void paintActivity(); return; }
     if (state.view === 'calendar') { void paintCalendar(); return; }
     if (state.view === 'archive') return;
+    if (state.view === 'human') {
+      if (state.sending || !state.bot || !state.thread || !state.agUiContext) return;
+      const botId = state.bot.id;
+      const legacyThreadId = state.thread.id;
+      const context = state.agUiContext;
+      try {
+        const conversation = await fetchAgUiConversation(botId);
+        if (state.view !== 'human' || !state.bot || !state.thread || state.bot.id !== botId || state.thread.id !== legacyThreadId) return;
+        state.messages = mergeAgUiMessages(adoptAgUiConversation(context, conversation), context, true);
+        rememberAgUiMessages();
+        paintMessages();
+        const needsReplay = (context.active || context.interrupted) && context.lastRunId;
+        const hasRun = state.agUiRun && state.agUiRun.runId === context.lastRunId && ['idle', 'active', 'interrupted'].includes(state.agUiRun.phase);
+        if (needsReplay && !hasRun && !state.agUiAbort) void replayAgUiRun(context);
+      } catch {}
+      return;
+    }
     try {
       let t;
       if ((state.view === 'a2a' || state.view === 'group') && state.thread) {
@@ -2019,24 +2525,9 @@
       for (const f of keepFailed) {
         if (!state.messages.some(m => m.body === f.body && m.role === 'user')) state.messages.push(f);
       }
+      state.messages.sort((left, right) => Number(left.created_at || 0) - Number(right.created_at || 0));
       paintMessages();
-      await catchUpLive(t.latestTurnId);
     } catch {}
-  }
-
-  async function catchUpLive(turnId) {
-    if (!turnId) return;
-    try {
-      const lw = await api('/v1/turns/' + turnId + '/live-work');
-      state.live = (lw.events || []).map(e => ({
-        kind: e.kind,
-        payload: parsePayload(e.payload)
-      }));
-      paintLive();
-    } catch {
-      state.live = [];
-      paintLive();
-    }
   }
 
   function connectPush() {
@@ -2050,21 +2541,15 @@
       pushTimer = setTimeout(connectPush, 1500);
     };
     ws.onmessage = (ev) => {
-      const msg = JSON.parse(ev.data);
-      if (msg.type === 'message.created' && msg.message && msg.message.origin !== 'prompt' && msg.message.origin !== 'calendar') upsertMessage(msg.message);
-      if (msg.type === 'turn.updated') {
-        dropFinishedTurn(msg.turnId, msg.status);
-        void reloadThread();
-      }
-      if (msg.type === 'live_work') {
-        if (msg.turnId) state.turn = msg.turnId;
-        state.live.push(msg.event);
-        paintLive();
-        paintMessages();
-      }
-      if (msg.type === 'permission_request') showPerm(msg);
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      // The push socket is only an invalidation channel for non-run resources.
+      // Human run state is owned by the AG-UI SSE stream; groups are refreshed by polling.
       if (msg.type === 'bots.updated') {
         void refreshRoster().then(() => renderApp());
+      }
+      if (msg.type === 'agent.conversation.updated' && state.view === 'human' && state.bot && msg.agentId === state.bot.id) {
+        void reloadThread();
       }
       if (msg.type === 'calendar.updated' || msg.type === 'calendar.proposed' || msg.type === 'calendar.fire') {
         if (state.view === 'calendar') void paintCalendar();
@@ -2152,47 +2637,102 @@
     });
   }
 
-  function showPerm(msg) {
-    const overlay = h(`<div class="overlay"><div class="modal">
-      <h2 id="perm-title">Permission</h2>
-      <pre class="live">${escapeHtml(JSON.stringify(msg.payload || msg, null, 2))}</pre>
-      <div class="modal-actions">
-        <button class="primary" type="button" id="allow">Allow</button>
-        <button type="button" id="deny">Deny</button>
-      </div>
+  async function resumeAgUiInterrupt(context, interruptedRun, responses) {
+    if (!currentAgUiOwner(context) || context.active || !context.taskId) return;
+    const runId = newAgUiId('run');
+    const input = agUiRequestInput(context, runId, interruptedRun.runId, null, responses, context.taskId);
+    context.lastRunId = runId;
+    context.active = true;
+    context.interrupted = false;
+    saveAgUiContext(context);
+    state.sending = true;
+    let run = newAgUiRunState(context.threadId, runId);
+    syncAgUiView(context, run);
+    try {
+      run = await postAgUiRun(context, input, run);
+      if (run.phase === 'interrupted' && currentAgUiOwner(context)) showAgUiInterrupt(context, run);
+      announce(run.phase === 'completed' ? 'Permission response sent' : 'Run ended');
+    } catch (error) {
+      if (error && error.name === 'AbortError') return;
+      context.active = false;
+      context.interrupted = true;
+      context.lastRunId = interruptedRun.runId;
+      saveAgUiContext(context);
+      run = agUiClientFailure(run, error);
+      syncAgUiView(context, run);
+      announce('Could not send the permission response');
+    } finally {
+      if (currentAgUiOwner(context)) {
+        state.sending = false;
+        paintMessages();
+        syncSend();
+      }
+    }
+  }
+
+  function showAgUiInterrupt(context, run, index=0, responses=[]) {
+    const interrupt = run && run.interrupts && run.interrupts[index];
+    if (!interrupt || !currentAgUiOwner(context) || document.querySelector('[data-ag-ui-interrupt]')) return;
+    const booleanResponse = interrupt.responseSchema && interrupt.responseSchema.type === 'boolean';
+    const controls = booleanResponse
+      ? `<button class="primary" type="button" id="allow">Allow</button><button type="button" id="deny">Deny</button>`
+      : `<label for="interrupt-response">Response (JSON)</label><textarea id="interrupt-response" rows="4"></textarea><button class="primary" type="button" id="resolve-interrupt">Continue</button><button type="button" id="cancel-interrupt">Cancel request</button>`;
+    const overlay = h(`<div class="overlay" data-ag-ui-interrupt="${escapeHtml(interrupt.id)}"><div class="modal">
+      <h2 id="perm-title">${booleanResponse ? 'Permission' : 'Input needed'}${run.interrupts.length > 1 ? ' (' + (index + 1) + ' of ' + run.interrupts.length + ')' : ''}</h2>
+      <p>${escapeHtml(interrupt.message || interrupt.reason)}</p>
+      <div class="modal-actions">${controls}</div>
+      <p class="err" id="interrupt-error" hidden></p>
     </div></div>`);
     overlay.querySelector('.modal').setAttribute('aria-labelledby', 'perm-title');
     const close = openOverlay(overlay);
-    overlay.querySelector('#allow').onclick = async () => {
-      await api('/v1/turns/' + msg.turnId + '/permissions/' + (msg.reqId || 'x'), { method:'POST', body: JSON.stringify({ allow:true }) });
+    const submit = response => {
       close();
+      const all = [...responses, response];
+      if (index + 1 < run.interrupts.length) showAgUiInterrupt(context, run, index + 1, all);
+      else void resumeAgUiInterrupt(context, run, all);
     };
-    overlay.querySelector('#deny').onclick = async () => {
-      await api('/v1/turns/' + msg.turnId + '/permissions/' + (msg.reqId || 'x'), { method:'POST', body: JSON.stringify({ allow:false }) });
-      close();
+    const allow = overlay.querySelector('#allow');
+    const deny = overlay.querySelector('#deny');
+    if (allow) allow.onclick = () => submit({ interruptId:interrupt.id, status:'resolved', payload:true });
+    if (deny) deny.onclick = () => submit({ interruptId:interrupt.id, status:'resolved', payload:false });
+    const resolve = overlay.querySelector('#resolve-interrupt');
+    if (resolve) resolve.onclick = () => {
+      const raw = overlay.querySelector('#interrupt-response').value.trim();
+      let payload;
+      try { payload = raw ? JSON.parse(raw) : null; }
+      catch {
+        const error = overlay.querySelector('#interrupt-error');
+        error.hidden = false;
+        error.textContent = 'Enter a valid JSON response.';
+        return;
+      }
+      submit({ interruptId:interrupt.id, status:'resolved', payload });
     };
+    const cancel = overlay.querySelector('#cancel-interrupt');
+    if (cancel) cancel.onclick = () => submit({ interruptId:interrupt.id, status:'cancelled' });
   }
 
   async function refreshRoster() {
     const bots = await api('/v1/bots');
     state.bots = bots.bots || [];
-    state.gateway = bots.gateway || null;
+    state.a2aGateway = bots.a2aGateway || null;
     state.archived = bots.archived || [];
     if (bots.archiveTtlMs) state.archiveTtlMs = bots.archiveTtlMs;
     if (state.bot) {
-      state.bot = state.bots.find(b => b.id === state.bot.id)
-        || (state.gateway && state.gateway.id === state.bot.id ? state.gateway : state.bot);
+      state.bot = state.bots.find(b => b.id === state.bot.id) || state.bots[0] || null;
     }
   }
 
   async function openArchiveFolder() {
     try { await refreshRoster(); } catch {}
+    rememberAgUiMessages();
+    detachAgUiStream();
     state.view = 'archive';
     renderApp();
   }
 
   async function archiveCurrentBot() {
-    if (!state.bot || isGatewayBot(state.bot)) return;
+    if (!state.bot) return;
     const name = state.bot.name;
     const id = state.bot.id;
     const ok = await askConfirm({
@@ -2264,7 +2804,7 @@
   function openOrgs() {
     const overlay = h(`<div class="overlay"><div class="modal">
       <h2 id="orgs-title">Orgs</h2>
-      <p class="muted">Where this browser can open a desk. Not the Gateway peer allowlist — that lives in Settings.</p>
+      <p class="muted">Local bookmarks for desks this browser can open. They are stored only in this browser.</p>
       <p><strong>This instance</strong> · ${escapeHtml(thisOrgName())} · <span class="mono">${escapeHtml(location.origin)}</span></p>
       <ul id="org-list"></ul>
       <label for="org-add-name">Name (optional)</label>
@@ -2355,14 +2895,6 @@
 
   async function openSettings() {
     try { state.org = await api('/v1/org'); } catch { state.org = state.org || {}; }
-    const fedOn = Boolean(state.org && state.org.federationEnabled);
-    let orgPub = '';
-    let orgId = (state.org && state.org.orgId) || '';
-    try {
-      const info = await api('/fed/v1/info');
-      if (info && info.pubkey) orgPub = String(info.pubkey);
-      if (!orgId && info && info.orgId) orgId = String(info.orgId);
-    } catch {}
     const curTz = (state.org && state.org.timezone) || 'UTC';
     const overlay = h(`<div class="overlay"><div class="modal">
       <h2 id="set-title">Settings</h2>
@@ -2374,45 +2906,11 @@
         <option value="light">Light</option>
       </select>
       <p id="set-theme-help" class="muted">Match system follows this device. Dark is ink; Light is paper.</p>
-      <h2 style="margin-top:8px;font-size:1rem">Federation</h2>
-      <p class="muted" id="fed-state">${fedOn ? 'Federation is on. Gateway may send and receive org mail.' : 'Federation is off. Gateway will not talk to other orgs.'}</p>
-      <div class="seg" role="group" aria-label="Federation">
-        <button type="button" id="fed-on" aria-pressed="${fedOn ? 'true' : 'false'}">On</button>
-        <button type="button" id="fed-off" aria-pressed="${fedOn ? 'false' : 'true'}">Off</button>
-      </div>
-      <p class="err" id="fed-err" hidden></p>
       <h2 style="margin-top:16px;font-size:1rem">Timezone</h2>
       <p class="muted">Used when you type 9am. Existing events keep their own zone. Defaults to UTC until you pick one.</p>
       <label for="org-tz">IANA timezone</label>
       ${zoneSelectHtml('org-tz', curTz)}
       <p class="err" id="tz-err" hidden></p>
-      <h2 style="margin-top:16px;font-size:1rem">This org</h2>
-      <p class="muted">Share org id and pubkey with the other operator. Never the private key.</p>
-      <label for="org-id">Org id</label>
-      <input id="org-id" class="mono" readonly value="${escapeHtml(orgId)}" />
-      <button type="button" id="copy-org-id">Copy org id</button>
-      <label for="org-pub">Pubkey</label>
-      <input id="org-pub" class="mono" readonly value="${escapeHtml(orgPub)}" />
-      <button type="button" id="copy-org-pub">Copy pubkey</button>
-      <h2 style="margin-top:16px;font-size:1rem">Peers</h2>
-      <p class="muted">Who Gateway may talk to. Separate from Orgs bookmarks.</p>
-      <ul id="peer-list"></ul>
-      <p class="err" id="peer-err" hidden></p>
-      <label for="peer-url">Peer base URL</label>
-      <input id="peer-url" placeholder="https://beta.example.com" autocomplete="off" />
-      <button type="button" id="peer-from-info">Preview from-info</button>
-      <div id="peer-preview-box" hidden>
-        <label for="peer-slug">Slug</label>
-        <input id="peer-slug" autocomplete="off" />
-        <label for="peer-name">Name</label>
-        <input id="peer-name" autocomplete="off" />
-        <p class="muted mono" id="peer-preview-meta"></p>
-        <button type="button" class="primary" id="peer-add">Add peer</button>
-      </div>
-      <div id="solicit-wrap" hidden>
-        <h2 style="margin-top:16px;font-size:1rem">Solicitations</h2>
-        <ul id="solicit-list"></ul>
-      </div>
       <label for="set-key">API key override (optional)</label>
       <input id="set-key" type="password" autocomplete="off" placeholder="leave blank to use grok login" />
       ${inferenceFields('set-model', 'set-effort')}
@@ -2441,7 +2939,7 @@
       <p class="err" id="mem-err" hidden></p>
       <h2 style="margin-top:16px;font-size:1rem">OpenAI-compatible keys</h2>
       <p class="muted">For Open WebUI or any OpenAI client. Base URL <code>${location.origin}/v1</code>, model <code>openbot/${escapeHtml(state.bot?.name || 'Ada')}</code>.</p>
-      <p class="muted">Each OpenBot process is one org. Switch org in Open WebUI by adding another connection (that VM’s base URL + a <code>sk-ob_…</code> key minted there). There is no OpenAI organization field. Models include <code>openbot/Gateway</code> when present. Federation is off until you turn it on.</p>
+      <p class="muted">Each OpenBot process is one org. Switch org in Open WebUI by adding another connection (that VM’s base URL + a <code>sk-ob_…</code> key minted there). There is no OpenAI organization field. Models are active desk teammates.</p>
       <ul id="key-list" class="muted"></ul>
       <p class="err" id="key-err" hidden></p>
       <button type="button" id="mint">Create API key</button>
@@ -2469,14 +2967,7 @@
       themeEl.value = readStoredTheme();
       themeEl.onchange = () => applyTheme(themeEl.value);
     }
-    const gwView = isGatewayBot(state.bot);
-    if (gwView) {
-      const desk = overlay.querySelector('#desk-controls');
-      if (desk) desk.hidden = true;
-      const arch = overlay.querySelector('#archive');
-      if (arch) arch.hidden = true;
-    }
-    if (state.bot && !gwView) {
+    if (state.bot) {
       overlay.querySelector('#mode').value = state.bot.permission_mode || 'auto';
       overlay.querySelector('#approve').checked = Boolean(Number(state.bot.require_human_approval));
       overlay.querySelector('#mem-approve').checked = Boolean(Number(state.bot.require_memory_approval));
@@ -2525,36 +3016,6 @@
       }
     };
     void loadStandingNotes();
-    function paintFedState() {
-      const on = Boolean(state.org && state.org.federationEnabled);
-      overlay.querySelector('#fed-on').setAttribute('aria-pressed', on ? 'true' : 'false');
-      overlay.querySelector('#fed-off').setAttribute('aria-pressed', on ? 'false' : 'true');
-      overlay.querySelector('#fed-state').textContent = on
-        ? 'Federation is on. Gateway may send and receive org mail.'
-        : 'Federation is off. Gateway will not talk to other orgs.';
-      const lab = document.querySelector('#open-gateway .presence');
-      if (lab && state.gateway) lab.textContent = state.gateway.enabled ? 'Federation on' : 'Federation off';
-    }
-    async function setFederation(on) {
-      const err = overlay.querySelector('#fed-err');
-      try {
-        const res = await api('/v1/org', { method:'PATCH', body: JSON.stringify({ federationEnabled: on }) });
-        state.org = res;
-        if (state.gateway) state.gateway.enabled = Boolean(res.federationEnabled);
-        paintFedState();
-        if (on && !res.federationEnabled) {
-          err.hidden = false;
-          err.textContent = 'Federation stayed off. OPENBOT_FEDERATION=0 overrides the toggle.';
-        } else {
-          err.hidden = true;
-        }
-      } catch (e) {
-        err.hidden = false;
-        err.textContent = e.message || 'Could not update federation';
-      }
-    }
-    overlay.querySelector('#fed-on').onclick = () => setFederation(true);
-    overlay.querySelector('#fed-off').onclick = () => setFederation(false);
     async function saveTimezone() {
       const err = overlay.querySelector('#tz-err');
       const tz = (overlay.querySelector('#org-tz').value || '').trim();
@@ -2572,136 +3033,6 @@
       }
     }
     overlay.querySelector('#org-tz').onchange = () => { void saveTimezone(); };
-    overlay.querySelector('#copy-org-id').onclick = (e) => copyText(overlay.querySelector('#org-id').value, e.currentTarget, 'Copied org id');
-    overlay.querySelector('#copy-org-pub').onclick = (e) => copyText(overlay.querySelector('#org-pub').value, e.currentTarget, 'Copied pubkey');
-    let peerPreview = null;
-    async function refreshPeers() {
-      const list = overlay.querySelector('#peer-list');
-      const err = overlay.querySelector('#peer-err');
-      try {
-        const res = await api('/v1/org/peers');
-        const peers = res.peers || [];
-        list.innerHTML = peers.length
-          ? peers.map(p => '<li class="peer-row"><div><strong>' + escapeHtml(p.slug) + '</strong> ' + escapeHtml(p.name || '') +
-            '<div class="muted">' + escapeHtml(p.baseUrl || '') + ' · ' + escapeHtml(p.status || '') + '</div></div>' +
-            '<div class="msg-actions">' +
-            '<button type="button" class="linkish" data-copy-pub="' + escapeHtml(p.pubkey || '') + '">Copy pubkey</button>' +
-            (p.status === 'allowed' ? '<button type="button" data-disable="' + escapeHtml(p.orgId) + '">Disable</button>' : '') +
-            '<button type="button" data-del="' + escapeHtml(p.orgId) + '">Remove</button></div></li>').join('')
-          : '<li class="muted">No peers yet. Preview a URL, then add.</li>';
-        list.querySelectorAll('[data-copy-pub]').forEach(btn => {
-          btn.onclick = () => copyText(btn.getAttribute('data-copy-pub'), btn, 'Copied pubkey');
-        });
-        list.querySelectorAll('[data-disable]').forEach(btn => {
-          btn.onclick = async () => {
-            try {
-              await api('/v1/org/peers/' + encodeURIComponent(btn.getAttribute('data-disable')) + '/disable', { method:'POST', body: '{}' });
-              err.hidden = true;
-              refreshPeers();
-            } catch (e) { err.hidden = false; err.textContent = e.message || 'Could not disable peer'; }
-          };
-        });
-        list.querySelectorAll('[data-del]').forEach(btn => {
-          btn.onclick = async () => {
-            try {
-              await api('/v1/org/peers/' + encodeURIComponent(btn.getAttribute('data-del')), { method:'DELETE' });
-              err.hidden = true;
-              refreshPeers();
-            } catch (e) { err.hidden = false; err.textContent = e.message || 'Could not remove peer'; }
-          };
-        });
-        err.hidden = true;
-      } catch (e) {
-        list.innerHTML = '';
-        err.hidden = false;
-        err.textContent = e.message || 'Could not load peers';
-      }
-    }
-    overlay.querySelector('#peer-from-info').onclick = async () => {
-      const err = overlay.querySelector('#peer-err');
-      const box = overlay.querySelector('#peer-preview-box');
-      const url = parseHttpUrl(overlay.querySelector('#peer-url').value);
-      if (!url) { err.hidden = false; err.textContent = 'Only http and https peer URLs are allowed'; box.hidden = true; peerPreview = null; return; }
-      const origin = url.origin;
-      try {
-        const info = await api('/v1/org/peers/from-info', { method:'POST', body: JSON.stringify({ baseUrl: origin }) });
-        peerPreview = {
-          orgId: info.orgId,
-          pubkey: info.pubkey,
-          slug: info.slug,
-          name: info.name,
-          baseUrl: origin,
-        };
-        overlay.querySelector('#peer-url').value = origin;
-        overlay.querySelector('#peer-slug').value = peerPreview.slug || '';
-        overlay.querySelector('#peer-name').value = peerPreview.name || '';
-        overlay.querySelector('#peer-preview-meta').textContent =
-          (peerPreview.orgId || '') + ' · ' + (peerPreview.pubkey || '') + ' · ' + origin;
-        box.hidden = false;
-        err.hidden = true;
-      } catch (e) {
-        peerPreview = null;
-        box.hidden = true;
-        err.hidden = false;
-        err.textContent = e.message || 'from-info failed';
-      }
-    };
-    overlay.querySelector('#peer-add').onclick = async () => {
-      const err = overlay.querySelector('#peer-err');
-      if (!peerPreview) { err.hidden = false; err.textContent = 'Preview from-info first'; return; }
-      try {
-        await api('/v1/org/peers', { method:'POST', body: JSON.stringify({
-          slug: overlay.querySelector('#peer-slug').value,
-          name: overlay.querySelector('#peer-name').value,
-          orgId: peerPreview.orgId,
-          pubkey: peerPreview.pubkey,
-          baseUrl: peerPreview.baseUrl,
-        }) });
-        overlay.querySelector('#peer-preview-box').hidden = true;
-        peerPreview = null;
-        err.hidden = true;
-        announce('Peer added');
-        refreshPeers();
-      } catch (e) {
-        err.hidden = false;
-        err.textContent = e.message || 'Could not add peer';
-      }
-    };
-    async function refreshSolicits() {
-      const wrap = overlay.querySelector('#solicit-wrap');
-      const box = overlay.querySelector('#solicit-list');
-      const lines = [];
-      const seen = new Set();
-      function addLines(arr) {
-        for (const line of arr) {
-          if (seen.has(line)) continue;
-          seen.add(line);
-          lines.push(line);
-        }
-      }
-      try {
-        // Untrusted solicitations may live on inbox; skip if that route is not shipped yet.
-        const res = await fetch('/v1/org/inbox', { credentials:'same-origin', headers: { 'content-type':'application/json' } });
-        if (res.status !== 404 && res.ok) addLines(solicitNotices(await res.json()));
-      } catch {}
-      try {
-        if (state.gateway && state.gateway.id) {
-          const t = await api('/v1/threads?botId=' + encodeURIComponent(state.gateway.id));
-          for (const m of t.messages || []) {
-            if (m.origin !== 'system') continue;
-            const text = String(m.body || '');
-            const named = /Org (.+) tried to send mail/i.exec(text);
-            if (named) addLines(['Org ' + named[1] + ' tried to send mail']);
-            else if (/solicit|untrusted|tried to send/i.test(text) && text.trim()) addLines([text.trim()]);
-          }
-        }
-      } catch {}
-      if (!lines.length) { wrap.hidden = true; return; }
-      wrap.hidden = false;
-      box.innerHTML = lines.map(s => '<li>' + escapeHtml(s) + '</li>').join('');
-    }
-    void refreshPeers();
-    void refreshSolicits();
     bindInferenceSelects(overlay, '#set-model', '#set-effort');
     overlay.querySelector('#save').onclick = async () => {
       const tzOk = await saveTimezone();
@@ -2713,19 +3044,14 @@
           model: overlay.querySelector('#set-model')?.value,
           reasoningEffort: overlay.querySelector('#set-effort')?.value,
         };
-        if (!isGatewayBot(state.bot)) {
-          payload.permissionMode = overlay.querySelector('#mode').value;
-          payload.requireHumanApproval = overlay.querySelector('#approve').checked;
-          payload.requireMemoryApproval = overlay.querySelector('#mem-approve').checked;
-        }
+        payload.permissionMode = overlay.querySelector('#mode').value;
+        payload.requireHumanApproval = overlay.querySelector('#approve').checked;
+        payload.requireMemoryApproval = overlay.querySelector('#mem-approve').checked;
         await api('/v1/bots/' + state.bot.id + '/settings', { method:'PATCH', body: JSON.stringify(payload) });
         await api('/v1/memory', { method:'PATCH', body: JSON.stringify({ org: overlay.querySelector('#org-notes').value }) });
-        if (!isGatewayBot(state.bot)) {
-          await api('/v1/bots/' + state.bot.id + '/memory', { method:'PATCH', body: JSON.stringify({ body: overlay.querySelector('#bot-notes').value }) });
-        }
+        await api('/v1/bots/' + state.bot.id + '/memory', { method:'PATCH', body: JSON.stringify({ body: overlay.querySelector('#bot-notes').value }) });
         state.bot.model = payload.model || state.bot.model;
         state.bot.reasoning_effort = payload.reasoningEffort || state.bot.reasoning_effort;
-        if (isGatewayBot(state.bot)) state.gateway = state.bot;
       }
       close();
     };
@@ -2950,7 +3276,7 @@
 
   boot().catch(err => {
     if (el.querySelector('.shell') || el.querySelector('.card')) return;
-    el.innerHTML = '<main class="card"><h1>OpenBot</h1><p class="err"></p><p class="muted">Reload the tab. If this persists, the last live-work log may be corrupt.</p><p><button type="button" class="primary" onclick="location.reload()">Reload</button></p></main>';
+    el.innerHTML = '<main class="card"><h1>OpenBot</h1><p class="err"></p><p class="muted">Reload the tab. If this persists, the last event stream or cached view may be invalid.</p><p><button type="button" class="primary" onclick="location.reload()">Reload</button></p></main>';
     const p = el.querySelector('.err');
     if (p) p.textContent = err && err.message ? err.message : String(err);
   });

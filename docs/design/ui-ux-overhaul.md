@@ -1,5 +1,7 @@
 # OpenBot web UI/UX overhaul — accessible, progressive, beautiful chat
 
+> Contract update: the former selectable Gateway bot described below is superseded. The current UI exposes a read-only **A2A connection** status surface (`#open-a2a-status`) with the Agent Card and JSON-RPC endpoint; it has no bot ID, chat composer, model settings, group membership, or teammate semantics.
+
 | Field | Value |
 | --- | --- |
 | **Title** | OpenBot web UI/UX overhaul: accessible, progressive, beautiful chat |

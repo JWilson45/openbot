@@ -267,7 +267,9 @@ export function listAccountMemory(
 } {
   const org = ensureOrgNotes(db, accountId);
   const bots = db.all<{ id: string; name: string }>(
-    `SELECT id, name FROM bots WHERE account_id = ? AND status = 'active' ORDER BY created_at`,
+    `SELECT id, name FROM bots
+     WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'desk'
+     ORDER BY created_at`,
     [accountId],
   );
   const rows: Array<MemoryNoteRow & { name: string }> = [];

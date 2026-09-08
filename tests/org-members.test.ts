@@ -135,7 +135,7 @@ describe("org members + one account per instance", () => {
     }
   });
 
-  test("GET /v1/me includes org fields and no private key", async () => {
+  test("GET /v1/me includes org fields without federation key material", async () => {
     const { ctx, server, origin } = startTestServer({ home: tempHome() });
     try {
       const { cookie, session } = loginCookie({ ctx }, "alice");
@@ -149,9 +149,8 @@ describe("org members + one account per instance", () => {
       expect(json.orgId).toBe(org.org_id);
       expect(json.orgSlug).toBe(org.slug);
       expect(json.orgName).toBe(org.name);
-      expect(typeof json.pubkey).toBe("string");
-      expect(Buffer.from(String(json.pubkey), "base64").length).toBe(32);
       expect(json.role).toBe("member");
+      expect(json).not.toHaveProperty("pubkey");
       expect(json).not.toHaveProperty("privateKey");
       expect(JSON.stringify(json)).not.toContain("BEGIN");
     } finally {

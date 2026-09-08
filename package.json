@@ -2,7 +2,7 @@
   "name": "openbot",
   "private": true,
   "type": "module",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "bin": {
     "openbot": "./apps/server/src/cli.ts"
   },
@@ -12,6 +12,13 @@
   ],
   "scripts": {
     "test": "bun test",
+    "check:types": "tsc --noEmit",
+    "check:contracts": "tsc --noEmit -p tsconfig.contracts.json && bun test tests/core-contracts.test.ts tests/event-contracts.test.ts tests/application-contracts.test.ts tests/application-service.test.ts",
+    "check:persistence": "tsc --noEmit -p tsconfig.persistence.json && bun test tests/db-task-store.test.ts tests/schema.test.ts",
+    "check:protocols": "tsc --noEmit -p tsconfig.protocols.json && bun test tests/protocol-mcp.test.ts tests/protocol-a2a.test.ts tests/protocol-ag-ui.test.ts tests/a2a-network.test.ts tests/protocol-stack.test.ts",
+    "check:runtime": "tsc --noEmit -p tsconfig.runtime.json && bun test tests/runtime-coordinator.test.ts tests/runtime-grok.test.ts tests/runtime-host.test.ts tests/application-db-integration.test.ts tests/protocol-runtime-integration.test.ts",
+    "check:boundaries": "bun run scripts/check-boundaries.ts",
+    "check": "bun run check:boundaries && bun run check:contracts && bun run check:persistence && bun run check:protocols && bun run check:runtime && bun test",
     "start": "bun run apps/server/src/cli.ts server",
     "openbot": "bun run apps/server/src/cli.ts",
     "build:binary": "bun run scripts/build-binary.ts --current",
@@ -22,22 +29,33 @@
   },
   "dependencies": {
     "@openbot/acp-grok": "workspace:*",
+    "@openbot/application": "workspace:*",
+    "@openbot/attachments": "workspace:*",
     "@openbot/api-types": "workspace:*",
     "@openbot/auth": "workspace:*",
     "@openbot/calendar": "workspace:*",
     "@openbot/compute-protocol": "workspace:*",
+    "@openbot/core": "workspace:*",
     "@openbot/db": "workspace:*",
     "@openbot/federation": "workspace:*",
     "@openbot/live-work": "workspace:*",
     "@openbot/mcp-send-message": "workspace:*",
+    "@openbot/protocol-a2a": "workspace:*",
+    "@openbot/protocol-ag-ui": "workspace:*",
+    "@openbot/protocol-mcp": "workspace:*",
     "@openbot/runner": "workspace:*",
+    "@openbot/runtime-grok": "workspace:*",
     "@openbot/server": "workspace:*",
     "@openbot/vault": "workspace:*",
     "hono": "^4.7.7",
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@a2a-js/sdk": "1.1.0",
+    "@ag-ui/client": "0.0.59",
+    "@modelcontextprotocol/client": "2.0.0",
     "@types/bun": "^1.2.5",
-    "playwright-core": "^1.52.0"
+    "playwright-core": "^1.52.0",
+    "typescript": "5.9.3"
   }
 }

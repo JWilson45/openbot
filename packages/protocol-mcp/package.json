@@ -1,0 +1,13 @@
+{
+  "name": "@openbot/protocol-mcp",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0",
+    "@openbot/application": "workspace:*",
+    "@openbot/core": "workspace:*"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

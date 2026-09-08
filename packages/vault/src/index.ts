@@ -31,6 +31,10 @@ export class RedactingLogger {
     this.emit("info", msg, extra);
   }
 
+  warn(msg: string, extra?: Record<string, unknown>): void {
+    this.emit("warn", msg, extra);
+  }
+
   error(msg: string, extra?: Record<string, unknown>): void {
     this.emit("error", msg, extra);
   }

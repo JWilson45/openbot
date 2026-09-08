@@ -384,11 +384,11 @@ describe("standing notes overlay freeze + skip-resume", () => {
     }
   });
 
-  test("human PATCH rejects injection; Gateway settings hide requireMemoryApproval", async () => {
+  test("human PATCH rejects injection; Gateway settings are not a human surface", async () => {
     process.env.OPENBOT_ACP_COMMAND = fakeAgentCommand();
     const { ctx, server, origin } = startTestServer({ home: tempHome() });
     try {
-      const { cookie } = loginCookie({ ctx }, "alice");
+      const { cookie, session } = loginCookie({ ctx }, "alice");
       const headers = { cookie, "content-type": "application/json" };
       const ada = (await fetch(`${origin}/v1/bots`, {
         method: "POST",
@@ -404,15 +404,23 @@ describe("standing notes overlay freeze + skip-resume", () => {
       expect(((await bad.json()) as { error: string }).error).toBe("unsafe_memory");
 
       const bots = (await fetch(`${origin}/v1/bots`, { headers }).then((r) => r.json())) as {
-        gateway: { id: string };
+        a2aGateway: { available: boolean } | null;
+        gateway?: unknown;
       };
-      const gw = await fetch(`${origin}/v1/bots/${bots.gateway.id}/settings`, {
+      expect(bots).not.toHaveProperty("gateway");
+      expect(bots.a2aGateway?.available).toBe(true);
+      const gateway = ctx.db.get<{ id: string }>(
+        "SELECT id FROM bots WHERE account_id = ? AND status = 'active' AND IFNULL(role, 'desk') = 'gateway'",
+        [session.accountId],
+      );
+      expect(gateway).toBeTruthy();
+      const gw = await fetch(`${origin}/v1/bots/${gateway!.id}/settings`, {
         method: "PATCH",
         headers,
         body: JSON.stringify({ requireMemoryApproval: true }),
       });
-      expect(gw.status).toBe(409);
-      expect(((await gw.json()) as { error: string }).error).toBe("gateway_protected");
+      expect(gw.status).toBe(404);
+      expect(((await gw.json()) as { error: string }).error).toBe("not_found");
     } finally {
       server.stop(true);
     }

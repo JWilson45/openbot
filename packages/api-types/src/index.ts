@@ -24,22 +24,6 @@ export type SendToThreadInput = z.infer<typeof sendToThreadInput>;
 
 export type SendMessageInput = z.infer<typeof sendMessageInput>;
 
-export const sendToOrgInput = z.object({
-  org: z.string().min(1).max(80),
-  body: z.string().min(1).max(32_000),
-  urgency: z.enum(["normal", "needs_user"]).optional(),
-  threadId: z.string().min(1).max(64).optional(),
-});
-
-export type SendToOrgInput = z.infer<typeof sendToOrgInput>;
-
-export const inboxInput = z.object({
-  limit: z.number().int().min(1).max(100).optional(),
-  ack: z.string().min(1).max(64).optional(),
-});
-
-export type InboxInput = z.infer<typeof inboxInput>;
-
 export const createBotInput = z.object({
   name: z.string().min(1).max(80),
   description: z.string().max(4000).optional().default(""),
@@ -124,10 +108,20 @@ export const patchCalendarSeriesInput = z.object({
 
 export type PatchCalendarSeriesInput = z.infer<typeof patchCalendarSeriesInput>;
 
-export const learnRoutineInput = z.object({
-  threadId: z.string().min(1),
-  botId: z.string().min(1).optional(),
-});
+const learnRoutineId = z.string().uuid();
+
+export const learnRoutineInput = z.union([
+  z.object({
+    agentId: learnRoutineId,
+    threadId: z.never().optional(),
+    botId: z.never().optional(),
+  }).strict(),
+  z.object({
+    threadId: learnRoutineId,
+    botId: learnRoutineId.optional(),
+    agentId: z.never().optional(),
+  }).strict(),
+]);
 
 export type LearnRoutineInput = z.infer<typeof learnRoutineInput>;
 
@@ -305,13 +299,7 @@ export type McpErrorCode =
   | "target_archived"
   | "runtime_offline"
   | "unsafe_memory"
-  | "federation_off"
   | "conflict"
-  | "no_forward"
-  | "no_org_key"
-  | "timeout"
-  | "outbound_failed"
-  | "peer_error"
   | "unknown_tool"
   | "reserved_name"
   | "cap"

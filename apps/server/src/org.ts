@@ -268,7 +268,6 @@ export function orgMemberSnapshot(row: OrgMetaRow): {
   slug: string;
   name: string;
   publicOrigin: string | null;
-  federationEnabled: boolean;
   timezone: string;
 } {
   return {
@@ -276,30 +275,20 @@ export function orgMemberSnapshot(row: OrgMetaRow): {
     slug: row.slug,
     name: row.name,
     publicOrigin: row.public_origin,
-    federationEnabled: federationEffective(row),
     timezone: row.timezone || "UTC",
   };
 }
 
 export function orgCliSnapshot(
   row: OrgMetaRow,
-  gateway: { id: string; name: string } | null = null,
 ): {
   orgId: string;
   slug: string;
   name: string;
   publicOrigin: string | null;
-  pubkey: string;
-  federationEnabled: boolean;
   timezone: string;
-  gateway: { id: string; name: string } | null;
 } {
-  return {
-    ...orgMemberSnapshot(row),
-    federationEnabled: federationEffective(row),
-    pubkey: row.pubkey || "",
-    gateway,
-  };
+  return orgMemberSnapshot(row);
 }
 
 export function setOrgTimezone(db: OpenbotDb, timezone: string): OrgMetaRow {

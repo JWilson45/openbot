@@ -9,6 +9,12 @@ jobs:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2.2.0
       - run: bun install --frozen-lockfile
+      - run: bun run check:contracts
+      - run: bun run check:persistence
+      - run: bun run check:protocols
+      - run: bun run check:runtime
+      - run: bun test tests/attachments.test.ts
+      - run: bun run check:boundaries
       - run: bun test
       - run: bun run build:binary
       - run: ./dist/openbot-linux-x64 version
