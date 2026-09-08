@@ -1,0 +1,23 @@
+# For kata-deploy chart 4.1.0. Apply only after SSH/KVM preflight and review
+# of workloads affected by the worker's container-runtime restart.
+# Start with one worker; expand selection after a successful smoke test.
+k8sDistribution: k3s
+deploymentMode: job
+defaultShim:
+  amd64: qemu-runtime-rs
+  arm64: qemu-runtime-rs
+  s390x: qemu-runtime-rs
+  ppc64le: qemu-runtime-rs
+nodeSelector:
+  kubernetes.io/hostname: imac00
+job:
+  parallelism: 1
+  dispatcherNodeSelector:
+    kubernetes.io/hostname: macmini00
+shims:
+  disableAll: true
+  qemu-runtime-rs:
+    enabled: true
+runtimeClasses:
+  enabled: true
+  createDefault: false

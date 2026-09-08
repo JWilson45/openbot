@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { createBunWebSocket } from "hono/bun";
 import type { ServerWebSocket } from "bun";
 import { mkdirSync } from "node:fs";
@@ -655,10 +656,28 @@ export function createApp(cfg: HomeConfig): {
     url.searchParams.set("client_id", ctx.githubClientId);
     url.searchParams.set("redirect_uri", redirect);
     url.searchParams.set("scope", "read:user user:email");
+    const state = crypto.randomUUID();
+    const secure = ctx.publicOrigin.startsWith("https:");
+    setCookie(c, secure ? "__Host-openbot_oauth_state" : "openbot_oauth_state", state, {
+      httpOnly: true,
+      secure,
+      sameSite: "Lax",
+      path: "/",
+      maxAge: 600,
+    });
+    url.searchParams.set("state", state);
     return c.redirect(url.toString());
   });
 
   app.get("/auth/callback/github", async (c) => {
+    const secure = ctx.publicOrigin.startsWith("https:");
+    const stateCookie = secure ? "__Host-openbot_oauth_state" : "openbot_oauth_state";
+    const expectedState = getCookie(c, stateCookie);
+    deleteCookie(c, stateCookie, { path: "/", secure });
+    const state = c.req.query("state");
+    if (!state || !expectedState || state !== expectedState) {
+      return c.json({ error: "oauth_state_invalid" }, 400);
+    }
     const code = c.req.query("code");
     if (!code || !ctx.githubClientId || !ctx.githubClientSecret) {
       return c.json({ error: "oauth_failed" }, 400);
@@ -670,6 +689,7 @@ export function createApp(cfg: HomeConfig): {
         client_id: ctx.githubClientId,
         client_secret: ctx.githubClientSecret,
         code,
+        redirect_uri: `${ctx.publicOrigin}/auth/callback/github`,
       }),
     });
     const tokenJson = (await tokenRes.json()) as { access_token?: string };
@@ -686,7 +706,7 @@ export function createApp(cfg: HomeConfig): {
         email: user.email,
       });
       provisionOrgGateway(db, cfg.home);
-      c.header("Set-Cookie", cookieHeader(session.token, ctx.publicOrigin.startsWith("https")));
+      c.header("Set-Cookie", cookieHeader(session.token, ctx.publicOrigin.startsWith("https")), { append: true });
       return c.redirect("/");
     } catch (err) {
       if (err instanceof AuthDenied) return c.json({ error: "not_allowlisted", message: err.message }, 403);

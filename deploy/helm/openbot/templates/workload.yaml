@@ -1,0 +1,178 @@
+{{- $slug := required "org.slug is required" .Values.org.slug -}}
+{{- $origin := required "org.publicOrigin is required" .Values.org.publicOrigin -}}
+{{- $orgID := required "org.id must be a stable UUID" .Values.org.id -}}
+{{- $secret := required "credentialsSecret is required" .Values.credentialsSecret -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-data
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ .Values.persistence.storageClass | quote }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size | quote }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-proxy
+data:
+  default.conf: |
+    server {
+      listen 8080;
+      client_max_body_size 16m;
+      location ^~ /internal/ { return 404; }
+      location ^~ /auth/local { return 404; }
+      location ^~ /v1/runner { return 404; }
+      location / {
+        proxy_pass http://127.0.0.1:8787;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;
+        proxy_buffering off;
+      }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  serviceName: {{ .Release.Name }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+      annotations:
+        checksum/values: {{ toJson .Values | sha256sum }}
+    spec:
+      serviceAccountName: {{ .Release.Name }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      {{- with .Values.runtimeClassName }}
+      runtimeClassName: {{ . | quote }}
+      {{- end }}
+      nodeSelector: {{ .Values.nodeSelector | toJson }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{ . | toJson }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: openbot
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: HOME
+              value: /data/operator-home
+            - name: OPENBOT_ORG_ID
+              value: {{ $orgID | quote }}
+            - name: OPENBOT_ORG_SLUG
+              value: {{ $slug | quote }}
+            - name: OPENBOT_ORG_NAME
+              value: {{ default $slug .Values.org.name | quote }}
+            - name: OPENBOT_PUBLIC_ORIGIN
+              value: {{ $origin | quote }}
+            - name: OPENBOT_DEV_LOGIN
+              value: "0"
+          envFrom:
+            - secretRef:
+                name: {{ $secret }}
+          resources: {{ .Values.resources | toJson }}
+          startupProbe:
+            exec:
+              command: [curl, --fail, --silent, http://127.0.0.1:8787/v1/healthz]
+            failureThreshold: 30
+            periodSeconds: 5
+          readinessProbe:
+            exec:
+              command: [curl, --fail, --silent, http://127.0.0.1:8787/v1/readyz]
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: [curl, --fail, --silent, http://127.0.0.1:8787/v1/healthz]
+            periodSeconds: 20
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: shm
+              mountPath: /dev/shm
+            {{- if .Values.grokAuthSecret }}
+            - name: grok-auth
+              mountPath: /data/operator-home/.grok
+              readOnly: true
+            {{- end }}
+        - name: proxy
+          image: nginxinc/nginx-unprivileged:1.28-alpine
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests: {cpu: 25m, memory: 32Mi}
+            limits: {cpu: 250m, memory: 128Mi}
+          readinessProbe:
+            httpGet:
+              path: /v1/healthz
+              port: http
+          volumeMounts:
+            - name: proxy
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-data
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 512Mi
+        - name: proxy
+          configMap:
+            name: {{ .Release.Name }}-proxy
+        {{- if .Values.grokAuthSecret }}
+        - name: grok-auth
+          secret:
+            secretName: {{ .Values.grokAuthSecret }}
+            defaultMode: 0440
+        {{- end }}

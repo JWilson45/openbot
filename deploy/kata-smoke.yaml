@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openbot-validation
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kata-smoke
+  namespace: openbot-validation
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kata-smoke
+  namespace: openbot-validation
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 180
+  template:
+    spec:
+      runtimeClassName: kata-qemu-runtime-rs
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        fsGroup: 1000
+      containers:
+        - name: smoke
+          image: busybox:1.37
+          command:
+            - sh
+            - -ec
+            - |
+              uname -r
+              id
+              test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token
+              date -u > /data/kata-smoke.txt
+              cat /data/kata-smoke.txt
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: kata-smoke
