@@ -1,0 +1,12 @@
+.git
+node_modules
+dist
+.env*
+**/node_modules
+**/auth.json
+**/master.key
+**/*.sqlite*
+tests
+docs
+.codex
+.agents

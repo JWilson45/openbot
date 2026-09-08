@@ -1,0 +1,57 @@
+image:
+  repository: openbot
+  tag: kubernetes-pilot
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+org:
+  id: ""
+  slug: ""
+  name: ""
+  publicOrigin: ""
+# Reference an existing Secret; secret contents never belong in Helm values.
+# Keys: OPENBOT_GITHUB_CLIENT_ID, OPENBOT_GITHUB_CLIENT_SECRET,
+# OPENBOT_GITHUB_ALLOWLIST. Set a model API key through OpenBot Settings,
+# or mount an org-specific Grok login with grokAuthSecret below.
+credentialsSecret: ""
+# Optional Secret containing auth.json from a login performed for this org.
+grokAuthSecret: ""
+runtimeClassName: kata-qemu-runtime-rs
+quota:
+  requests.cpu: "2"
+  requests.memory: 4Gi
+  limits.cpu: "4"
+  limits.memory: 6Gi
+  requests.storage: 20Gi
+  persistentvolumeclaims: "1"
+  pods: "3"
+nodeSelector:
+  kubernetes.io/os: linux
+resources:
+  requests:
+    cpu: 500m
+    memory: 2Gi
+  limits:
+    cpu: "2"
+    memory: 4Gi
+    ephemeral-storage: 4Gi
+persistence:
+  storageClass: longhorn
+  size: 20Gi
+ingress:
+  enabled: false
+  className: tailscale
+  host: ""
+  annotations: {}
+networkPolicy:
+  enabled: true
+  # Ingress is accepted only from the selected controller namespaces.
+  ingressNamespaces: [tailscale]
+  # Internet HTTPS/HTTP permitted; private networks, nodes and tailnet excluded.
+  # Adapt to the cluster's routing before exposing additional destinations.
+  excludedCidrs:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 100.64.0.0/10
+    - 127.0.0.0/8
+    - 169.254.0.0/16
